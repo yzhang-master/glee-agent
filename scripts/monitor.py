@@ -501,7 +501,10 @@ def _run_once(agent: str, no_api: bool) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="GLEE agent status monitor (read-only)")
-    parser.add_argument("--agent", default="main", choices=["main", "test_a", "test_b"])
+    parser.add_argument(
+        "--agent", default="main",
+        choices=["main", "test_a", "test_b", "test_c", "test_d"],
+    )
     parser.add_argument("--watch", type=float, default=None, metavar="SECONDS")
     parser.add_argument("--no-api", action="store_true", help="skip the live stats() call")
     args = parser.parse_args()

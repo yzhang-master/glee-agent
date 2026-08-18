@@ -102,6 +102,8 @@ def load_settings(agent_label: str = "main") -> Settings:
         "main": "GLEE_API_KEY_MAIN",
         "test_a": "GLEE_API_KEY_TEST_A",
         "test_b": "GLEE_API_KEY_TEST_B",
+        "test_c": "GLEE_API_KEY_TEST_C",
+        "test_d": "GLEE_API_KEY_TEST_D",
     }.get(agent_label)
     if key_env is None:
         raise ValueError(f"Unknown agent label: {agent_label!r}")

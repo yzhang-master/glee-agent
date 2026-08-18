@@ -61,7 +61,10 @@ def acquire_instance_lock(agent_label: str):
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--agent", default="main", choices=["main", "test_a", "test_b"])
+    parser.add_argument(
+        "--agent", default="main",
+        choices=["main", "test_a", "test_b", "test_c", "test_d"],
+    )
     parser.add_argument("--concurrency", type=int, default=None)
     parser.add_argument("--max-games", type=int, default=None)
     parser.add_argument("--max-time", type=float, default=None)
