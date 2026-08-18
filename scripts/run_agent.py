@@ -16,6 +16,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from glee_sdk import GleeClient  # noqa: E402
 
+from glee_agent.capture import (  # noqa: E402
+    LoggingGleeClient,
+    start_leaderboard_thread,
+    start_snapshot_thread,
+)
 from glee_agent.config import load_settings  # noqa: E402
 from glee_agent.dispatcher import build_strategy  # noqa: E402
 
@@ -40,9 +45,18 @@ def main() -> None:
     concurrency = args.concurrency or settings.concurrency
     families = args.families.split(",") if args.families else None
 
-    client = GleeClient(api_key=settings.glee_api_key)
+    client = LoggingGleeClient(
+        api_key=settings.glee_api_key, agent_label=settings.agent_label
+    )
     stats = client.stats()
     logger.info("Agent %s (%s): %s", settings.agent_label, stats.get("agent_name"), stats)
+
+    # Telemetry gets its own client: requests.Session is not thread-safe, and
+    # the game loop's session must never be shared across threads.
+    start_snapshot_thread(
+        GleeClient(api_key=settings.glee_api_key), settings.agent_label
+    )
+    start_leaderboard_thread(stats.get("agent_id"))
 
     strategy = build_strategy(settings)
     client.run(

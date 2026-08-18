@@ -6,6 +6,7 @@ http_keys.json
 # Data & runtime artifacts
 data/glee_raw/
 logs/
+dashboard/
 *.db
 *.db-wal
 *.db-shm
