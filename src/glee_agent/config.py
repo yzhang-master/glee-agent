@@ -50,6 +50,8 @@ class Knobs:
     neg_max_planned_rounds: int = 12     # concession schedule length for long/unlimited games
     neg_min_margin_frac: float = 0.02    # final margin above reservation (fraction of value)
     neg_accept_pct: float = 0.70         # accept when payoff percentile vs pool >= this
+    neg_accept_factor: float = 0.9       # accept when payoff >= this x my planned counter's payoff
+    neg_anchor_markup_buyer: float | None = None  # buyer-side markup override (None = symmetric)
 
     # Persuasion
     pers_kg_haircut: float = 0.8         # multiply KG x* by this (seller lying rate safety)

@@ -38,7 +38,12 @@ def _anchor_and_floor(n, knobs: Knobs) -> tuple[float, float]:
     margin = max(v * knobs.neg_min_margin_frac, 0.01)
     if n.my_role == "seller":
         return v * (1.0 + knobs.neg_anchor_markup), v + margin
-    return v * (1.0 - knobs.neg_anchor_markup), max(v - margin, 0.0)
+    markup = (
+        knobs.neg_anchor_markup_buyer
+        if knobs.neg_anchor_markup_buyer is not None
+        else knobs.neg_anchor_markup
+    )
+    return v * (1.0 - markup), max(v - margin, 0.0)
 
 
 def _target_price(view: GameView, n, knobs: Knobs) -> float:
@@ -243,7 +248,7 @@ def decide(view: GameView, knobs: Knobs) -> dict:
     # (they met or beat our own trajectory).
     my_next = _target_price(view, n, knobs)
     counter_payoff = _my_payoff(n.my_role, value, my_next)
-    if payoff > 0 and payoff >= counter_payoff * 0.9:
+    if payoff > 0 and payoff >= counter_payoff * knobs.neg_accept_factor:
         return {"decision": "AcceptOffer"}
 
     if _should_walk_away(view, n, knobs):
