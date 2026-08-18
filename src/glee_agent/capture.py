@@ -24,11 +24,55 @@ LEADERBOARD_URL = "https://glee-competition.com/api/leaderboard"
 
 class LoggingGleeClient(GleeClient):
     """GleeClient that logs every move response (or transport error) as a
-    "result" record before handing it back unchanged."""
+    "result" record before handing it back unchanged, and tracks the games
+    it has seen so the reaper thread can back-fill results for games that
+    end on the OPPONENT's move (the server only pushes a result payload when
+    our own move ends the game — without the reaper, every game where the
+    opponent accepted our offer would have no recorded payoff)."""
 
     def __init__(self, api_key: str, agent_label: str, **kwargs) -> None:
         super().__init__(api_key, **kwargs)
         self.agent_label = agent_label
+        self._tracked_lock = threading.Lock()
+        # game_id -> {"last_seen": ts, "resolved": bool}
+        self._tracked: dict[str, dict] = {}
+
+    def pending_games(self) -> list[dict]:
+        games = super().pending_games()
+        try:
+            now = time.time()
+            with self._tracked_lock:
+                for g in games:
+                    gid = g.get("game_id")
+                    if gid:
+                        entry = self._tracked.setdefault(
+                            gid, {"last_seen": now, "resolved": False}
+                        )
+                        entry["last_seen"] = now
+        except Exception:  # noqa: BLE001 — tracking must never disturb play
+            pass
+        return games
+
+    def unresolved_games(self, idle_for: float = 180.0, max_age: float = 86400.0) -> list[str]:
+        """Game ids not seen in pending for >= idle_for seconds and without a
+        recorded end. Entries older than max_age are dropped."""
+        now = time.time()
+        out: list[str] = []
+        with self._tracked_lock:
+            for gid in list(self._tracked):
+                entry = self._tracked[gid]
+                if now - entry["last_seen"] > max_age:
+                    del self._tracked[gid]
+                    continue
+                if not entry["resolved"] and now - entry["last_seen"] >= idle_for:
+                    out.append(gid)
+        return out
+
+    def mark_resolved(self, game_id: str) -> None:
+        with self._tracked_lock:
+            entry = self._tracked.get(game_id)
+            if entry is not None:
+                entry["resolved"] = True
 
     def move(self, game_id: str, action: dict) -> dict:
         try:
@@ -44,6 +88,8 @@ class LoggingGleeClient(GleeClient):
             log_result(self.agent_label, game_id, None, error=error_text)
             raise
         log_result(self.agent_label, game_id, response)
+        if isinstance(response, dict) and response.get("game_over"):
+            self.mark_resolved(game_id)
         return response
 
 
@@ -66,6 +112,52 @@ def start_snapshot_thread(
             time.sleep(max(interval * random.uniform(0.8, 1.2), 1.0))
 
     thread = threading.Thread(target=_loop, name="glee-snapshot", daemon=True)
+    thread.start()
+    return thread
+
+
+def start_reaper_thread(
+    game_client: LoggingGleeClient,
+    telemetry_client: GleeClient,
+    interval: float = 120.0,
+    per_cycle: int = 10,
+) -> threading.Thread:
+    """Back-fill results for games that ended on the opponent's move.
+
+    Every ~interval seconds, take up to per_cycle idle unresolved games and
+    fetch their full state via GET /games/{id} on the DEDICATED telemetry
+    client (never the game session). A finished game's result is logged as a
+    synthetic game-over "result" record so the store's rollup completes it."""
+
+    def _loop() -> None:
+        while True:
+            time.sleep(max(interval * random.uniform(0.8, 1.2), 1.0))
+            try:
+                for gid in game_client.unresolved_games()[:per_cycle]:
+                    try:
+                        data = telemetry_client.game_state(gid)
+                    except Exception as e:  # noqa: BLE001 — skip; retry next cycle
+                        logger.warning("Reaper fetch failed for %s: %s", gid, e)
+                        continue
+                    if not isinstance(data, dict):
+                        continue
+                    status = data.get("status")
+                    if status in ("completed", "no_deal"):
+                        result = data.get("result")
+                        log_result(
+                            game_client.agent_label,
+                            gid,
+                            {"valid": None, "game_over": True, "result": result,
+                             "reaped": True},
+                        )
+                        game_client.mark_resolved(gid)
+                    elif status is None and data.get("detail"):
+                        # Unknown game (404-ish body): stop tracking it.
+                        game_client.mark_resolved(gid)
+            except Exception as e:  # noqa: BLE001 — telemetry must never die
+                logger.warning("Reaper cycle failed: %s", e)
+
+    thread = threading.Thread(target=_loop, name="glee-reaper", daemon=True)
     thread.start()
     return thread
 

@@ -20,6 +20,7 @@ from glee_sdk import GleeClient  # noqa: E402
 from glee_agent.capture import (  # noqa: E402
     LoggingGleeClient,
     start_leaderboard_thread,
+    start_reaper_thread,
     start_snapshot_thread,
 )
 from glee_agent.config import load_settings  # noqa: E402
@@ -84,10 +85,10 @@ def main() -> None:
 
     # Telemetry gets its own client: requests.Session is not thread-safe, and
     # the game loop's session must never be shared across threads.
-    start_snapshot_thread(
-        GleeClient(api_key=settings.glee_api_key), settings.agent_label
-    )
+    telemetry = GleeClient(api_key=settings.glee_api_key)
+    start_snapshot_thread(telemetry, settings.agent_label)
     start_leaderboard_thread(stats.get("agent_id"))
+    start_reaper_thread(client, GleeClient(api_key=settings.glee_api_key))
 
     strategy = build_strategy(settings)
     client.run(
