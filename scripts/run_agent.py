@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -28,6 +29,35 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname
 logger = logging.getLogger("run_agent")
 
 
+def acquire_instance_lock(agent_label: str):
+    """Refuse to start when another process is already playing this agent.
+
+    Two processes sharing one API key poll the same pending games and race
+    each other's moves — the server rejects the loser with "It is not your
+    turn", burning attempts and rate budget. flock releases automatically on
+    process death, so a crashed run never wedges the lock."""
+    import fcntl
+
+    lock_dir = Path(__file__).resolve().parents[1] / "logs"
+    lock_dir.mkdir(exist_ok=True)
+    lock_file = (lock_dir / f".agent-{agent_label}.lock").open("w")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        logger.error(
+            "Another process is already running agent %r (probably the tmux "
+            "session 'glee-main'). Two copies on one API key race each "
+            "other's moves and burn attempts. For manual experiments, stop "
+            "the session first (tmux send-keys -t glee-main C-c) or use a "
+            "test agent key (--agent test_a).",
+            agent_label,
+        )
+        raise SystemExit(1)
+    lock_file.write(f"{os.getpid()}\n")
+    lock_file.flush()
+    return lock_file  # keep the handle alive for the process lifetime
+
+
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--agent", default="main", choices=["main", "test_a", "test_b"])
@@ -42,6 +72,7 @@ def main() -> None:
     args = parser.parse_args()
 
     settings = load_settings(args.agent)
+    _lock = acquire_instance_lock(settings.agent_label)  # noqa: F841 — held for process lifetime
     concurrency = args.concurrency or settings.concurrency
     families = args.families.split(",") if args.families else None
 

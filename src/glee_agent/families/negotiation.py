@@ -123,6 +123,23 @@ def decide(view: GameView, knobs: Knobs) -> dict:
         # walkaway; reject is the safer enum.
         return {"decision": "RejectOffer"}
 
+    # Unlimited-horizon stalemate exit: once both concession schedules are
+    # exhausted, an endless reject/counter loop just blocks a concurrency
+    # slot (observed live: games running past round 79). Take any profit on
+    # the table; if the opponent has NEVER crossed our reservation by deep
+    # into the marathon, walk and free the slot.
+    if view.max_rounds is None:
+        stall = knobs.neg_max_planned_rounds + 4
+        if view.round >= stall and payoff > 0:
+            return {"decision": "AcceptOffer"}
+        if view.round >= stall + 8:
+            best = _opponent_best_price(view, n)
+            best_payoff = (
+                _my_payoff(n.my_role, value, best) if best is not None else None
+            )
+            if best_payoff is None or best_payoff <= 0:
+                return {"decision": "WalkAway"}
+
     # Accept when the offer already beats the price we planned to counter at
     # (they met or beat our own trajectory).
     my_next = _target_price(view, n, knobs)

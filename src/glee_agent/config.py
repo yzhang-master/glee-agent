@@ -53,6 +53,7 @@ class Knobs:
     pers_kg_haircut: float = 0.8         # multiply KG x* by this (seller lying rate safety)
     pers_kg_haircut_human: float = 0.4   # vs disclosed human buyers
     pers_explore_frac: float = 0.33      # fraction of rounds with UCB exploration (buyer)
+    pers_buy_margin: float = 0.02        # required edge: buy iff P(high)*v > price*(1+margin)
 
     # LLM layer
     llm_enabled: bool = True

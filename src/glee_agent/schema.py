@@ -179,6 +179,7 @@ class PersuasionState:
     current_quality: str | None = None  # seller only
     seller_message: str | None = None
     binary_mode: bool = False
+    my_total_payoff: float = 0.0
 
 
 def parse_persuasion(view: GameView) -> PersuasionState:
@@ -199,4 +200,6 @@ def parse_persuasion(view: GameView) -> PersuasionState:
     elif isinstance(sm, dict):
         ps.seller_message = _text(sm.get("message")) or _text(sm.get("decision")) or None
     ps.binary_mode = _text(s.get("seller_message_type"), "text") == "binary"
+    key = "seller_total_payoff" if ps.i_am_seller else "buyer_total_payoff"
+    ps.my_total_payoff = _num(s.get(key), 0.0) or 0.0
     return ps

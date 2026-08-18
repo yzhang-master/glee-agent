@@ -160,12 +160,31 @@ def _buyer_decide(view: GameView, ps, knobs: Knobs) -> dict:
     else:
         p_high = p  # uninformative message: prior
 
+    # Exploratory (UCB) buying pays for information with expected losses, so
+    # it must be affordable: skip it on thin margins (v/price close to 1
+    # needs near-perfect honesty to profit), stop after the game has already
+    # lost money, and never sink more than ~2 speculative buys per game.
     total = ps.total_rounds or 10
-    exploring = view.round <= max(1, int(total * knobs.pers_explore_frac))
-    if exploring and polarity != "neg":
-        p_high = rec.ucb(c=1.0) if polarity == "pos" else max(p_high, p)
+    thin_margin = (v - price) / price < 0.35 if price > 0 else True
+    explore_buys = sum(
+        1
+        for e in view.history
+        if isinstance(e, dict) and e.get("bought") and e.get("quality") == "low"
+    )
+    exploring = (
+        view.round <= max(1, int(total * knobs.pers_explore_frac))
+        and not thin_margin
+        and ps.my_total_payoff >= 0
+        and explore_buys < 2
+    )
+    if exploring and polarity == "pos":
+        p_high = rec.ucb(c=1.0)
 
-    return {"decision": "yes" if p_high * v >= price else "no"}
+    # Strict profit margin: the KG-honest prior sits EXACTLY at indifference
+    # (posterior * v == price), so buying at ">=" has zero expected edge and
+    # loses against any seller who lies more than the KG rate. Demand a real
+    # edge before paying.
+    return {"decision": "yes" if p_high * v > price * (1.0 + knobs.pers_buy_margin) else "no"}
 
 
 # ----------------------------------------------------------------- dispatch

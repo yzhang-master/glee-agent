@@ -178,3 +178,59 @@ class TestPersuasion:
         action = run(persuasion, game)
         msg = action["message"].lower()
         assert "pass" in msg or "don't" in msg or "not" in msg
+
+
+class TestPersuasionStopLoss:
+    def _thin_game(self, **state):
+        # v=12000, price=10000: needs >83% honesty to profit — thin margin.
+        from fixtures import persuasion_game
+        base = {"p": 0.5, "v": 12000.0, "product_price": 10000.0,
+                "total_rounds": 20, "round": 3}
+        base.update(state)
+        return persuasion_game(actor="buyer", game_state=base)
+
+    def test_no_explore_buy_on_thin_margin(self):
+        # Prior EV = 0.5*12000 = 6000 < 10000; thin margin forbids UCB buys.
+        game = self._thin_game()
+        action = run(persuasion, game)
+        assert action["decision"] == "no"
+
+    def test_no_explore_after_losses(self):
+        # Wide margin but game already under water: exploration off.
+        game = self._thin_game(v=30000.0, p=0.2, buyer_total_payoff=-10000.0)
+        history = [{"round": 1, "seller_message": "Great!", "buyer_decision": "yes",
+                    "bought": True, "quality": "low", "buyer_payoff": -10000}]
+        game["game_state"]["history"] = history
+        action = run(persuasion, game)
+        # p=0.2 prior EV=6000 < 10000, and stop-loss blocks the UCB boost.
+        assert action["decision"] == "no"
+
+    def test_profitable_prior_still_buys(self):
+        game = self._thin_game(v=25000.0, p=0.5)  # EV 12500 > 10000
+        action = run(persuasion, game)
+        assert action["decision"] == "yes"
+
+
+class TestNegotiationStalemate:
+    def _marathon(self, offer_price, rnd):
+        from fixtures import negotiation_decision
+        game = negotiation_decision(role="buyer", offer_price=offer_price)
+        del game["game_state"]["max_rounds"]
+        game["game_state"]["horizon_known"] = False
+        game["game_state"]["round"] = rnd
+        return game
+
+    def test_accepts_profit_in_marathon(self):
+        # Buyer value 100, offered 95 at round 20: take the profit, end it.
+        action = run(negotiation, self._marathon(95.0, 20))
+        assert action["decision"] == "AcceptOffer"
+
+    def test_walks_away_from_hopeless_marathon(self):
+        # Offered 150 (> value 100) at round 30, no better offer ever: walk.
+        action = run(negotiation, self._marathon(150.0, 30))
+        assert action["decision"] == "WalkAway"
+
+    def test_keeps_countering_before_stall(self):
+        # Round 5: too early for stalemate logic, keep negotiating.
+        action = run(negotiation, self._marathon(150.0, 5))
+        assert action["decision"] == "RejectOffer"
