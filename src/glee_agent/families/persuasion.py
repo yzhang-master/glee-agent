@@ -11,6 +11,8 @@ from __future__ import annotations
 import hashlib
 
 from ..config import Knobs
+from ..llm import client as llm_client
+from ..llm import messages as llm_messages
 from ..schema import GameView, parse_persuasion
 from ..theory.bayes import BetaTracker, kg_lie_rate, posterior_high_given_rec
 
@@ -111,6 +113,22 @@ def _seller_wants_to_recommend(view: GameView, ps, knobs: Knobs) -> bool:
     return _det_coin(view, x)
 
 
+def _history_summary(view: GameView) -> str:
+    """Compact last-3-rounds digest for the LLM prompt, e.g.
+    "r5:rec/buy-hi". Quality is encoded hi/lo so the prompt never carries
+    the word "low"."""
+    entries = [e for e in view.history if isinstance(e, dict)]
+    start = len(entries) - len(entries[-3:]) + 1
+    parts = []
+    for i, entry in enumerate(entries[-3:], start=start):
+        pol = _msg_polarity(str(entry.get("seller_message", "")))
+        rec = {"pos": "rec", "neg": "norec"}.get(pol, "neut")
+        buy = "buy" if entry.get("bought") else "pass"
+        q = {"high": "hi", "low": "lo"}.get(entry.get("quality"), "?")
+        parts.append(f"r{i}:{rec}/{buy}-{q}")
+    return " ".join(parts)
+
+
 def _seller_message(recommend: bool, quality: str | None) -> str:
     if recommend:
         if quality == "high":
@@ -203,6 +221,16 @@ def decide(view: GameView, knobs: Knobs) -> dict:
 
     if view.action_type == "seller_message":
         recommend = _seller_wants_to_recommend(view, ps, knobs)
+        if llm_client.llm_available(knobs):
+            text = llm_messages.persuasion_seller_message(
+                recommend, ps.current_quality == "high", view.round, _history_summary(view)
+            )
+            # The generated pitch must READ as the intended signal under the
+            # same keyword heuristics opponents (and our own lie accounting)
+            # use — sales English is full of "don't miss out", which
+            # classifies as an anti-recommendation. Mismatch -> template.
+            if text and _msg_polarity(text) == ("pos" if recommend else "neg"):
+                return {"message": text}
         return {"message": _seller_message(recommend, ps.current_quality)}
 
     if view.action_type == "seller_recommendation":

@@ -64,7 +64,7 @@ class Knobs:
 
     # LLM layer
     llm_enabled: bool = True
-    llm_timeout_s: float = 15.0
+    llm_timeout_s: float = 8.0           # llm/client.py enforces this budget
     llm_breaker_failures: int = 3        # consecutive failures to trip the circuit breaker
     llm_breaker_cooldown_s: float = 600.0
 

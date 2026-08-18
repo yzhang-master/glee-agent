@@ -7,6 +7,8 @@ Share convention: fraction of the CURRENT pot that goes to me.
 from __future__ import annotations
 
 from ..config import Knobs
+from ..llm import client as llm_client
+from ..llm import messages as llm_messages
 from ..schema import GameView, parse_bargaining
 from ..theory.concession import boulware
 from ..theory.rubinstein import finite_spe_share, infinite_spe_share
@@ -192,7 +194,15 @@ def decide(view: GameView, knobs: Knobs) -> dict:
         if view.opponent_type == "human" and pot >= 100:
             my_gain = round(my_gain / 10) * 10
         my_gain = min(max(my_gain, 0.0), pot)
-        return {mine_key: my_gain, opp_key: pot - my_gain}
+        out = {mine_key: my_gain, opp_key: pot - my_gain}
+        if view.messages_allowed and llm_client.llm_available(knobs):
+            share_pct = int(round(100.0 * my_gain / pot)) if pot > 0 else 50
+            msg = llm_messages.bargaining_offer_message(
+                share_pct, view.round, view.opponent_type == "human"
+            )
+            if msg:
+                out["message"] = msg
+        return out
 
     # Decision phase.
     offered = b.last_offer_my_gain

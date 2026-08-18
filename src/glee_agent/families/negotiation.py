@@ -7,6 +7,8 @@ Prices are absolute; my payoff = price - value (seller) or value - price (buyer)
 from __future__ import annotations
 
 from ..config import Knobs
+from ..llm import client as llm_client
+from ..llm import messages as llm_messages
 from ..schema import GameView, parse_negotiation
 from ..theory.concession import boulware
 from ..theory.targets import config_key_negotiation, get_targets
@@ -192,7 +194,14 @@ def decide(view: GameView, knobs: Knobs) -> dict:
         optimized = _optimized_price(view, n, knobs, price)
         if optimized is not None:
             price = optimized
-        return {"product_price": round(max(price, 0.0), 2)}
+        out = {"product_price": round(max(price, 0.0), 2)}
+        if view.messages_allowed and llm_client.llm_available(knobs):
+            msg = llm_messages.negotiation_offer_message(
+                n.my_role, out["product_price"], view.round
+            )
+            if msg:
+                out["message"] = msg
+        return out
 
     # Decision phase.
     offer = n.last_offer_price
@@ -259,4 +268,11 @@ def decide(view: GameView, knobs: Knobs) -> dict:
     counter = _optimized_price(view, n, knobs, my_next)
     if counter is None:
         counter = my_next
-    return {"decision": "RejectOffer", "product_price": round(max(counter, 0.0), 2)}
+    out = {"decision": "RejectOffer", "product_price": round(max(counter, 0.0), 2)}
+    if view.messages_allowed and llm_client.llm_available(knobs):
+        msg = llm_messages.negotiation_offer_message(
+            n.my_role, out["product_price"], view.round
+        )
+        if msg:
+            out["message"] = msg
+    return out
