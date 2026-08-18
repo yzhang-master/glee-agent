@@ -75,6 +75,12 @@ def _seller_wants_to_recommend(view: GameView, ps, knobs: Knobs) -> bool:
         # Buying is ex-ante profitable for the buyer: recommendations stay
         # credible even when uninformative; recommending always maximizes sales.
         return True
+    if v is None:
+        # Blind seller (buyer's valuation hidden): the KG rate is
+        # uncomputable, and the dataset field simply pools (recommends
+        # everything) — its sellers earn the pool median doing so. Guessing
+        # a rate under-sells against that pool.
+        return True
 
     haircut = (
         knobs.pers_kg_haircut_human
@@ -180,11 +186,14 @@ def _buyer_decide(view: GameView, ps, knobs: Knobs) -> dict:
     if exploring and polarity == "pos":
         p_high = rec.ucb(c=1.0)
 
-    # Strict profit margin: the KG-honest prior sits EXACTLY at indifference
-    # (posterior * v == price), so buying at ">=" has zero expected edge and
-    # loses against any seller who lies more than the KG rate. Demand a real
-    # edge before paying.
-    return {"decision": "yes" if p_high * v > price * (1.0 + knobs.pers_buy_margin) else "no"}
+    # Side-dependent margin. THIN configs: the KG-honest prior sits exactly
+    # at indifference, so demand a real edge — any extra seller lying turns
+    # ">=" into guaranteed losses. WIDE configs: the field earns the pool
+    # median by buying at the knife-edge; sitting out scores ~0, below most
+    # of the pool, so tolerate slight prior slack and let evidence cut us
+    # off if the seller over-lies.
+    margin = knobs.pers_buy_margin if thin_margin else knobs.pers_buy_margin_wide
+    return {"decision": "yes" if p_high * v > price * (1.0 + margin) else "no"}
 
 
 # ----------------------------------------------------------------- dispatch
