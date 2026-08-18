@@ -1,0 +1,22 @@
+# Secrets — never commit
+.env
+*.key
+http_keys.json
+
+# Data & runtime artifacts
+data/glee_raw/
+logs/
+*.db
+*.db-wal
+*.db-shm
+
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+venv/
+dist/
+build/
+.pytest_cache/
+.ruff_cache/

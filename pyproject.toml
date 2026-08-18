@@ -1,0 +1,23 @@
+[project]
+name = "glee-agent"
+version = "0.1.0"
+description = "Competitive agent for the GLEE Competition (NeurIPS 2026)"
+requires-python = ">=3.12"
+dependencies = [
+    "glee-sdk",
+    "python-dotenv",
+]
+
+[project.optional-dependencies]
+llm = ["litellm"]
+dev = ["pytest"]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
