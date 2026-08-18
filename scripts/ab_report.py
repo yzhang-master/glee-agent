@@ -28,17 +28,37 @@ FAMILIES = ["bargaining", "negotiation", "persuasion"]
 
 
 def game_percentile(tg, row) -> float | None:
-    """Percentile of this game's payoff vs the dataset pool, or None."""
+    """Percentile of this game's payoff vs the dataset pool, or None.
+
+    The store's config_key serialization differs from the targets canonical
+    form (raw ints vs floats), so keys are rebuilt from config_json via the
+    same builders the live strategies use."""
     family = row["family"]
-    config_key = row["config_key"]
     payoff = row["my_payoff"]
-    if payoff is None or not config_key:
+    if payoff is None or not row["config_json"]:
         return None
     role = row["your_player"] or "player_1"
     try:
-        return tg.payoff_percentile(family, config_key, role, payoff)
+        config = json.loads(row["config_json"])
+        if family == "bargaining":
+            key = targets_mod.config_key_bargaining(config)
+            return tg.payoff_percentile(family, key, role, payoff)
+        if family == "persuasion":
+            key = targets_mod.config_key_persuasion(config)
+            return tg.payoff_percentile(family, key, role, payoff)
+        if family == "negotiation":
+            my_role = "seller" if role == "player_1" else "buyer"
+            my_value = config.get(f"{role}_value")
+            full_key, role_key = targets_mod.config_key_negotiation(
+                config, my_role, my_value
+            )
+            pct = tg.payoff_percentile(family, full_key, role, payoff)
+            if pct is None:
+                pct = tg.payoff_percentile(family, role_key, role, payoff)
+            return pct
     except Exception:  # noqa: BLE001 — a bad lookup must not kill the report
         return None
+    return None
 
 
 def main() -> None:
@@ -52,7 +72,7 @@ def main() -> None:
     since = time.time() - args.hours * 3600
 
     rows = conn.execute(
-        "SELECT agent, family, your_player, config_key, my_payoff, outcome "
+        "SELECT agent, family, your_player, config_json, my_payoff, outcome "
         "FROM games WHERE outcome IS NOT NULL AND last_ts >= ?",
         (since,),
     ).fetchall()

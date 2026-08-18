@@ -10,6 +10,7 @@ from ..config import Knobs
 from ..schema import GameView, parse_bargaining
 from ..theory.concession import boulware
 from ..theory.rubinstein import finite_spe_share, infinite_spe_share
+from ..theory.targets import config_key_bargaining, get_targets
 
 # Discount grid used when the opponent's delta is hidden (GLEE-style values);
 # refined from the dataset in a later version.
@@ -124,6 +125,46 @@ def _target_share_at(view: GameView, b, knobs: Knobs, round_: int) -> float:
         view.round = saved
 
 
+def _endgame_cap(view: GameView, b, knobs: Knobs) -> float | None:
+    """Near the horizon SPE is what a rational opponent holds out for; it
+    caps my share (same rule as inside _target_share)."""
+    left = _rounds_left(view)
+    if left is None or left > 4:
+        return None
+    human = view.opponent_type == "human"
+    opp_delta = b.opp_delta if b.opp_delta is not None else HIDDEN_DELTA_PESSIMISTIC
+    spe = _spe_bound(view, b.my_delta, opp_delta)
+    return max(spe, 0.45 if human else 0.25)
+
+
+def _optimized_offer_share(view: GameView, b, knobs: Knobs, boulware_share: float) -> float | None:
+    """Pick my share by maximizing EV against the empirical field accept
+    curve. Returns None when the curve is too thin or agrees with Boulware."""
+    tg = get_targets()
+    left = _rounds_left(view)
+    human = view.opponent_type == "human"
+    # Continuation if they reject: my next-round Boulware aspiration,
+    # discounted and haircut by the odds it actually lands.
+    cont = b.my_delta * boulware_share * knobs.barg_cont_realism
+    best_share = None
+    best_ev = -1.0
+    n_with_data = 0
+    for i in range(21):  # candidates 0.30 .. 0.80 step 0.025
+        share = 0.30 + 0.025 * i
+        p = tg.barg_accept_prob(1.0 - share, left, human)
+        if p is None:
+            continue
+        n_with_data += 1
+        ev = share * p + (1.0 - p) * cont
+        if ev > best_ev:
+            best_ev, best_share = ev, share
+    if best_share is None or n_with_data < 5:
+        return None
+    if abs(best_share - boulware_share) <= 0.05:
+        return None  # empirics agree with theory; keep the schedule
+    return best_share
+
+
 def decide(view: GameView, knobs: Knobs) -> dict:
     b = parse_bargaining(view)
     mine_key, opp_key = _gain_names(view)
@@ -137,6 +178,14 @@ def decide(view: GameView, knobs: Knobs) -> dict:
         left = _rounds_left(view)
         if left is not None and left <= 1:
             share = 1.0 - knobs.barg_final_round_give
+        else:
+            optimized = _optimized_offer_share(view, b, knobs, share)
+            if optimized is not None:
+                share = optimized
+                # Existing endgame SPE cap always applies AFTER optimization.
+                cap = _endgame_cap(view, b, knobs)
+                if cap is not None:
+                    share = min(share, cap)
 
         my_gain = pot * share
         # Humans accept clean numbers more readily.
@@ -162,6 +211,26 @@ def decide(view: GameView, knobs: Knobs) -> dict:
     # take the sure thing over a risky squeeze.
     if offered_share >= knobs.barg_accept_great:
         return {"decision": "accept"}
+
+    # Empirical percentile accept: my realized payoff if I accept NOW
+    # (discount included — the pool holds realized payoffs) already beats
+    # knobs.barg_accept_pct of every payoff ever scored on this exact
+    # config+role. A top-of-pool payoff in hand beats a gamble.
+    accept_payoff = offered * (b.my_delta ** max(view.round - 1, 0))
+    if accept_payoff > 0:
+        tg = get_targets()
+        key = config_key_bargaining(view.state)
+        pct = tg.payoff_percentile("bargaining", key, view.your_player, accept_payoff)
+        # q95 gate mirrors negotiation: on a zero-heavy pool a crumb can
+        # "rank" high; require a real fraction of what top games get.
+        q95 = tg.payoff_quantile("bargaining", key, view.your_player, 0.95)
+        if (
+            pct is not None
+            and pct >= knobs.barg_accept_pct
+            and q95 is not None
+            and accept_payoff >= 0.25 * q95
+        ):
+            return {"decision": "accept"}
 
     # Endgame parity: in the decision phase the current proposer is the
     # opponent, so they also propose the final round iff (max_rounds - round)

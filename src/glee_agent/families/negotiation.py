@@ -9,10 +9,17 @@ from __future__ import annotations
 from ..config import Knobs
 from ..schema import GameView, parse_negotiation
 from ..theory.concession import boulware
+from ..theory.targets import config_key_negotiation, get_targets
 
 
 def _my_payoff(role: str, value: float, price: float) -> float:
     return price - value if role == "seller" else value - price
+
+
+def _rounds_left(view: GameView) -> int | None:
+    if view.max_rounds is None:
+        return None
+    return max(view.max_rounds - view.round + 1, 1)
 
 
 def _is_final_round(view: GameView) -> bool:
@@ -94,6 +101,74 @@ def _should_walk_away(view: GameView, n, knobs: Knobs) -> bool:
     return _my_payoff(n.my_role, n.my_value, best) < 0
 
 
+def _payoff_percentile(view: GameView, n, value: float, payoff: float) -> float | None:
+    """Percentile of `payoff` vs the live scoring pool for my config+role.
+    Tries the full config key (complete info), then the role-marginal key."""
+    tg = get_targets()
+    full_key, role_key = config_key_negotiation(view.state, n.my_role, value)
+    pct = None
+    if full_key is not None:
+        pct = tg.payoff_percentile("negotiation", full_key, view.your_player, payoff)
+    if pct is None and role_key is not None:
+        pct = tg.payoff_percentile("negotiation", role_key, view.your_player, payoff)
+    return pct
+
+
+def _pool_quantile(view: GameView, n, value: float, q: float) -> float | None:
+    """Pool payoff at quantile q, same key fallback as _payoff_percentile."""
+    tg = get_targets()
+    full_key, role_key = config_key_negotiation(view.state, n.my_role, value)
+    out = None
+    if full_key is not None:
+        out = tg.payoff_quantile("negotiation", full_key, view.your_player, q)
+    if out is None and role_key is not None:
+        out = tg.payoff_quantile("negotiation", role_key, view.your_player, q)
+    return out
+
+
+def _optimized_price(view: GameView, n, knobs: Knobs, target_price: float) -> float | None:
+    """Pick my offer/counter price by maximizing EV against the empirical
+    accept curve keyed on price relative to the RESPONDER's value.
+
+    Only runs when the opponent's value is visible (their rel bucket is
+    unknowable otherwise — the pooled marginal is constant in price, so it
+    cannot rank candidates and we keep the Boulware schedule instead).
+    Returns None when the curve is too thin or agrees with the schedule."""
+    if n.opp_value is None or n.opp_value <= 0:
+        return None
+    tg = get_targets()
+    value = n.my_value if n.my_value is not None else 100.0
+    their_role = "buyer" if n.my_role == "seller" else "seller"
+    human = view.opponent_type == "human"
+    left = _rounds_left(view)
+    ultimatum = view.max_rounds == 1
+    # Continuation if they reject: roughly my scheduled counter, haircut;
+    # nothing left to continue to on the last round.
+    if ultimatum or (left is not None and left <= 1):
+        cont = 0.0
+    else:
+        cont = max(_my_payoff(n.my_role, value, target_price), 0.0) * 0.8
+    anchor, floor = _anchor_and_floor(n, knobs)
+    lo, hi = (floor, anchor) if floor <= anchor else (anchor, floor)
+    best_price = None
+    best_ev = -1.0
+    n_with_data = 0
+    for i in range(21):  # candidate prices between reservation and anchor
+        price = lo + (hi - lo) * i / 20.0
+        p_accept = tg.neg_accept_prob(price / n.opp_value, their_role, left, human)
+        if p_accept is None:
+            continue
+        n_with_data += 1
+        ev = max(_my_payoff(n.my_role, value, price), 0.0) * p_accept + (1.0 - p_accept) * cont
+        if ev > best_ev:
+            best_ev, best_price = ev, price
+    if best_price is None or n_with_data < 5:
+        return None
+    if not ultimatum and abs(best_price - target_price) <= 0.02 * max(value, 1.0):
+        return None  # empirics agree with the schedule; keep it
+    return best_price
+
+
 def decide(view: GameView, knobs: Knobs) -> dict:
     n = parse_negotiation(view)
     value = n.my_value if n.my_value is not None else 100.0
@@ -103,9 +178,15 @@ def decide(view: GameView, knobs: Knobs) -> dict:
         # Single-round ultimatum: no counteroffers exist, price to close.
         if view.max_rounds == 1:
             anchor, floor = _anchor_and_floor(n, knobs)
-            # Without the dataset CDF yet, split the difference between a
+            # Without the dataset CDF, split the difference between a
             # moderate markup and reservation — closing matters most.
             price = (anchor + floor) / 2
+        # Empirical accept-curve optimizer (ultimatum seller always prefers
+        # it when curve data exists; otherwise it overrides Boulware only
+        # when it disagrees materially).
+        optimized = _optimized_price(view, n, knobs, price)
+        if optimized is not None:
+            price = optimized
         return {"product_price": round(max(price, 0.0), 2)}
 
     # Decision phase.
@@ -122,6 +203,24 @@ def decide(view: GameView, knobs: Knobs) -> dict:
         # Losing deal on the last round: plain rejection ends at $0, same as
         # walkaway; reject is the safer enum.
         return {"decision": "RejectOffer"}
+
+    # Empirical percentile accept: this profit already beats
+    # knobs.neg_accept_pct of every payoff scored on my config+role pool.
+    # Two guards: never score a DEFAULTED value (my_value missing), and —
+    # because many pools are mostly no-deal zeros, where any epsilon profit
+    # "ranks" at the 98th percentile — demand the offer also carries a real
+    # fraction of what top games extract (q95), so we never trade a 200k
+    # surplus for a 1k crumb just because the pool is full of zeros.
+    if payoff > 0 and n.my_value is not None:
+        pct = _payoff_percentile(view, n, value, payoff)
+        q95 = _pool_quantile(view, n, value, 0.95)
+        if (
+            pct is not None
+            and pct >= knobs.neg_accept_pct
+            and q95 is not None
+            and payoff >= 0.25 * q95
+        ):
+            return {"decision": "AcceptOffer"}
 
     # Unlimited-horizon stalemate exit: once both concession schedules are
     # exhausted, an endless reject/counter loop just blocks a concurrency
@@ -150,4 +249,9 @@ def decide(view: GameView, knobs: Knobs) -> dict:
     if _should_walk_away(view, n, knobs):
         return {"decision": "WalkAway"}
 
-    return {"decision": "RejectOffer", "product_price": round(max(my_next, 0.0), 2)}
+    # Counter at the optimizer's price when the accept curve supports one
+    # (the accept test above still used the Boulware trajectory).
+    counter = _optimized_price(view, n, knobs, my_next)
+    if counter is None:
+        counter = my_next
+    return {"decision": "RejectOffer", "product_price": round(max(counter, 0.0), 2)}

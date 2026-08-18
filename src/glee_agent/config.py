@@ -42,12 +42,14 @@ class Knobs:
     barg_final_round_give: float = 0.30  # share offered to responder in final round
     barg_accept_great: float = 0.65      # grab any offer at/above this share immediately
     barg_cont_realism: float = 0.85      # P(opponent accepts my next aggressive offer)
+    barg_accept_pct: float = 0.70        # accept when payoff percentile vs pool >= this
 
     # Negotiation
     neg_anchor_markup: float = 0.9       # how far past own value we anchor (fraction of value)
     neg_beta: float = 2.5                # Boulware exponent
     neg_max_planned_rounds: int = 12     # concession schedule length for long/unlimited games
     neg_min_margin_frac: float = 0.02    # final margin above reservation (fraction of value)
+    neg_accept_pct: float = 0.70         # accept when payoff percentile vs pool >= this
 
     # Persuasion
     pers_kg_haircut: float = 0.8         # multiply KG x* by this (seller lying rate safety)
