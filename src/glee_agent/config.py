@@ -65,6 +65,9 @@ class Knobs:
     pers_buy_margin_wide: float = -0.05  # tolerance on WIDE margins (headroom >= 0.5): field
                                          # buyers profit at the knife-edge; a passive 0 sits
                                          # below the pool median, so accept slight prior slack
+    pers_thin_explore: bool = False      # allow UCB exploration on THIN margins when p >= 0.5:
+                                         # dataset sellers lie less than KG-max, so following
+                                         # credible recs there is +EV — A/B before promoting
 
     # LLM layer
     llm_enabled: bool = True

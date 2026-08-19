@@ -292,6 +292,12 @@ def do_persuasion(cfg_all, ga, rows, agg, human_p1, human_p2, m1, m2):
            "seller_message_type": str(ga["seller_message_type"])}
     key = dumps(cfg)
 
+    # In binary-message games the SELLER's yes/no recommendation is logged in
+    # the same `decision` column as the buyer's decision (there is no
+    # `message` column), so payoffs must be computed from the buyer's rows
+    # only — counting every yes row doubles both pools.
+    buyer_name = ((cfg_all.get("player_2_args") or {}).get("public_name") or "Bob").strip()
+
     worth = None
     p1 = p2 = 0.0
     yes = dec_n = 0
@@ -301,6 +307,8 @@ def do_persuasion(cfg_all, ga, rows, agg, human_p1, human_p2, m1, m2):
             w = ffloat(row.get("product_worth"))
             if w is not None:
                 worth = w
+            continue
+        if player != buyer_name:
             continue
         dec = decision_of(row)
         if dec is None:

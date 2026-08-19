@@ -380,6 +380,69 @@ class TestPersuasionStopLoss:
         assert action["decision"] == "yes"
 
 
+class TestPersuasionNeutralMessages:
+    """Regression: soft anti-recs classified 'neutral' were bought at the raw
+    prior forever (verified -15M game: 15 'Ordinary unit' lows bought)."""
+
+    def _wide_game(self, message, history=None, rnd=1):
+        from fixtures import persuasion_game
+        # p=1/3, v=4x price: prior EV positive, wide margin.
+        state = {"p": 1 / 3, "v": 4000000.0, "product_price": 1000000.0,
+                 "total_rounds": 20, "round": rnd, "seller_message": message}
+        if history is not None:
+            state["history"] = history
+        return persuasion_game(actor="buyer", game_state=state)
+
+    def test_soft_anti_rec_words_classify_negative(self):
+        from glee_agent.families.persuasion import _msg_polarity
+        assert _msg_polarity("Ordinary unit this round.") == "neg"
+        assert _msg_polarity("This is not the premium one.") == "neg"
+        assert _msg_polarity("A standard offering today.") == "neg"
+
+    def test_neutral_buys_stop_after_lows(self):
+        # Message with no keyword hits at all -> neutral; after two neutral
+        # lows the neutral tracker must cut off further buying.
+        msg = "Item #7 ships today."
+        assert __import__("glee_agent.families.persuasion", fromlist=["_msg_polarity"])._msg_polarity(msg) == "neutral"
+        history = [
+            {"round": i, "seller_message": msg, "buyer_decision": "yes",
+             "bought": True, "quality": "low", "buyer_payoff": -1000000}
+            for i in (1, 2)
+        ]
+        game = self._wide_game(msg, history=history, rnd=3)
+        action = run(persuasion, game)
+        assert action["decision"] == "no"
+
+    def test_neutral_lows_do_not_poison_rec_tracker(self):
+        # Neutral lows in history must not stop us trusting a genuinely
+        # positive recommendation afterwards.
+        neutral = "Item #7 ships today."
+        history = [
+            {"round": i, "seller_message": neutral, "buyer_decision": "yes",
+             "bought": True, "quality": "low", "buyer_payoff": -1000000}
+            for i in (1, 2)
+        ]
+        game = self._wide_game("Good unit — worth taking.", history=history, rnd=3)
+        action = run(persuasion, game)
+        assert action["decision"] == "yes"
+
+    def test_thin_explore_knob_enables_rec_following(self):
+        from fixtures import persuasion_game
+        from glee_agent.config import Knobs
+        from glee_agent.families import persuasion as pers_mod
+        from glee_agent.schema import parse_game
+        # p=0.8, v=1.25x: thin margin — default passes, knob explores the rec.
+        state = {"p": 0.8, "v": 12500.0, "product_price": 10000.0,
+                 "total_rounds": 20, "round": 2,
+                 "seller_message": "yes"}
+        game = persuasion_game(actor="buyer", game_state=state)
+        view = parse_game(game)
+        off = pers_mod.decide(view, Knobs(llm_enabled=False))
+        on = pers_mod.decide(view, Knobs(llm_enabled=False, pers_thin_explore=True))
+        assert off["decision"] == "no"
+        assert on["decision"] == "yes"
+
+
 class TestNegotiationStalemate:
     def _marathon(self, offer_price, rnd):
         from fixtures import negotiation_decision

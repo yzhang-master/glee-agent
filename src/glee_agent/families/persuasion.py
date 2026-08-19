@@ -17,7 +17,13 @@ from ..schema import GameView, parse_persuasion
 from ..theory.bayes import BetaTracker, kg_lie_rate, posterior_high_given_rec
 
 POSITIVE_WORDS = ("recommend", "great", "excellent", "worth", "quality", "buy", "good", "yes")
-NEGATIVE_WORDS = ("don't", "do not", "not recommend", "skip", "pass", "avoid", "no ", "poor", "low")
+# Soft negatives matter: honest sellers phrase anti-recommendations as
+# "ordinary unit" or "not the premium one", which must not read as neutral.
+NEGATIVE_WORDS = (
+    "don't", "do not", "not recommend", "skip", "pass", "avoid", "no ", "poor", "low",
+    "ordinary", "standard", "basic", "average", "mediocre", "nothing special",
+    "not the", "regular", "typical", "unremarkable", "isn't",
+)
 
 
 def _det_coin(view: GameView, threshold: float) -> bool:
@@ -136,7 +142,7 @@ def _seller_message(recommend: bool, quality: str | None) -> str:
                 "I can honestly say this is one of the strongest products I've "
                 "offered you — I stand behind its quality and recommend it."
             )
-        return "This product meets the standard you've seen from me. I recommend it."
+        return "This product is in line with what you've seen from me. I recommend it."
     return (
         "I'll be straight with you: I don't think this one is worth it for you. "
         "I'd rather skip a sale than lose your trust — pass on this round."
@@ -145,13 +151,18 @@ def _seller_message(recommend: bool, quality: str | None) -> str:
 
 # -------------------------------------------------------------------- buyer
 
-def _buyer_tracker(view: GameView, ps) -> tuple[BetaTracker, BetaTracker]:
-    """Rebuild (rec_tracker, neg_tracker) posteriors from history every turn —
-    stateless across calls, so concurrency and restarts are free."""
+def _buyer_tracker(view: GameView, ps) -> tuple[BetaTracker, BetaTracker, BetaTracker]:
+    """Rebuild (rec_tracker, neg_tracker, neutral_tracker) posteriors from
+    history every turn — stateless across calls, so concurrency and restarts
+    are free. Neutral messages get their own tracker: folding them into `rec`
+    poisons the recommendation posterior, and scoring them at the raw prior
+    forever means an unlisted-keyword anti-rec ("ordinary unit") gets bought
+    every round with zero learning."""
     x_star = kg_lie_rate(ps.p, ps.v if ps.v is not None else 0.0, ps.price)
     prior_rec = posterior_high_given_rec(ps.p, x_star) if ps.v else ps.p
     rec = BetaTracker(prior_mean=max(prior_rec, ps.p), prior_strength=2.0)
     neg = BetaTracker(prior_mean=min(ps.p * 0.3 + 1e-6, 1.0), prior_strength=2.0)
+    neu = BetaTracker(prior_mean=ps.p, prior_strength=2.0)
 
     for entry in view.history:
         if not isinstance(entry, dict) or not entry.get("bought"):
@@ -162,9 +173,11 @@ def _buyer_tracker(view: GameView, ps) -> tuple[BetaTracker, BetaTracker]:
         polarity = _msg_polarity(str(entry.get("seller_message", "")))
         if polarity == "neg":
             neg.update(quality == "high")
-        else:
+        elif polarity == "pos":
             rec.update(quality == "high")
-    return rec, neg
+        else:
+            neu.update(quality == "high")
+    return rec, neg, neu
 
 
 def _buyer_decide(view: GameView, ps, knobs: Knobs) -> dict:
@@ -174,7 +187,7 @@ def _buyer_decide(view: GameView, ps, knobs: Knobs) -> dict:
         return {"decision": "no"}
 
     polarity = _msg_polarity(ps.seller_message)
-    rec, neg = _buyer_tracker(view, ps)
+    rec, neg, neu = _buyer_tracker(view, ps)
 
     if polarity == "neg":
         # A seller advising against a sale forfeits revenue — highly credible.
@@ -182,7 +195,7 @@ def _buyer_decide(view: GameView, ps, knobs: Knobs) -> dict:
     elif polarity == "pos":
         p_high = rec.mean
     else:
-        p_high = p  # uninformative message: prior
+        p_high = neu.mean  # uninformative message: prior, updated by outcomes
 
     # Exploratory (UCB) buying pays for information with expected losses, so
     # it must be affordable: skip it on thin margins (v/price close to 1
@@ -195,9 +208,10 @@ def _buyer_decide(view: GameView, ps, knobs: Knobs) -> dict:
         for e in view.history
         if isinstance(e, dict) and e.get("bought") and e.get("quality") == "low"
     )
+    thin_blocks = thin_margin and not (knobs.pers_thin_explore and p >= 0.5)
     exploring = (
         view.round <= max(1, int(total * knobs.pers_explore_frac))
-        and not thin_margin
+        and not thin_blocks
         and ps.my_total_payoff >= 0
         and explore_buys < 2
     )
