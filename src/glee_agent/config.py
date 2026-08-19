@@ -56,6 +56,13 @@ class Knobs:
     neg_accept_pct: float = 0.70         # accept when payoff percentile vs pool >= this
     neg_accept_factor: float = 0.9       # accept when payoff >= this x my planned counter's payoff
     neg_anchor_markup_buyer: float | None = None  # buyer-side markup override (None = symmetric)
+    neg_ci_floor_frac: float = 0.0       # complete info only: clamp the anchor feasible (opponent
+                                         # can profitably accept) and floor concession at
+                                         # value +/- frac*surplus instead of own reservation.
+                                         # 0 = off; A/B arm runs 0.4
+    neg_traj_pct_gate: float = 0.0       # trajectory-accept additionally requires pool pct >= this
+                                         # (0 = off; A/B arm 0.45) — blocks the round-12 Boulware
+                                         # floor collapse from accepting near-reservation crumbs
 
     # Persuasion
     pers_kg_haircut: float = 0.8         # multiply KG x* by this (seller lying rate safety)

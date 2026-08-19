@@ -466,3 +466,96 @@ class TestNegotiationStalemate:
         # Round 5: too early for stalemate logic, keep negotiating.
         action = run(negotiation, self._marathon(150.0, 5))
         assert action["decision"] == "RejectOffer"
+
+
+class TestNegotiationCompleteInfo:
+    """CI feasibility clamp + surplus floor (neg_ci_floor_frac knob)."""
+
+    def _ci_offer(self, rnd=5, my_value=100.0, opp_value=200.0):
+        from fixtures import negotiation_game
+        return negotiation_game(role="seller", game_state={
+            "complete_information": True, "round": rnd,
+            "player_1_value": my_value, "player_2_value": opp_value,
+        })
+
+    def _decide(self, game, **knob_over):
+        from glee_agent.config import Knobs
+        from glee_agent.families import negotiation as neg_mod
+        from glee_agent.schema import parse_game
+        return neg_mod.decide(parse_game(game), Knobs(llm_enabled=False, **knob_over))
+
+    def test_ci_knob_keeps_offers_inside_feasible_band(self):
+        # Seller 100 vs buyer 200, S=100: ask must sit in [140, 195].
+        act = self._decide(self._ci_offer(), neg_ci_floor_frac=0.4)
+        assert 140.0 - 1e-6 <= act["product_price"] <= 195.0 + 1e-6
+
+    def test_ci_knob_off_keeps_old_anchor(self):
+        # Default markup 0.9: round-1 ask is 190 (possibly optimizer-shifted,
+        # but never floored up to 140 by the knob).
+        act = self._decide(self._ci_offer(rnd=1))
+        assert act["product_price"] <= 190.0 + 1e-6
+
+    def test_ci_floor_never_lowers_capture(self):
+        # Late round with knob: counter never drops below value + 0.4*S.
+        from fixtures import negotiation_decision
+        game = negotiation_decision(role="seller", offer_price=105.0, game_state={
+            "complete_information": True, "round": 8,
+            "player_1_value": 100.0, "player_2_value": 200.0,
+        })
+        act = self._decide(game, neg_ci_floor_frac=0.4)
+        assert act["decision"] == "RejectOffer"
+        assert act["product_price"] >= 140.0 - 1e-6
+
+
+class TestNegotiationEndgame:
+    def test_finite_endgame_prices_floor(self):
+        # Seller, T=10, round 9 (incomplete info): schedule used to leave the
+        # ask at ~1.24x value; now the last offers go out at the floor.
+        from fixtures import negotiation_game
+        game = negotiation_game(role="seller", game_state={"round": 9})
+        action = run(negotiation, game)
+        assert action["product_price"] == pytest.approx(102.0)
+
+    def test_no_finite_walkaway_counter_at_floor(self):
+        # Buyer at round 9 of 10 facing a losing offer: never walk (that
+        # forfeits our free round-10 floor offer) — reject and counter.
+        from fixtures import negotiation_decision
+        game = negotiation_decision(role="buyer", offer_price=150.0,
+                                    game_state={"round": 9})
+        action = run(negotiation, game)
+        assert action["decision"] == "RejectOffer"
+        assert action["product_price"] == pytest.approx(98.0)
+
+    def test_trajectory_gate_blocks_low_percentile_crumb(self, monkeypatch):
+        from fixtures import negotiation_decision
+        from glee_agent.config import Knobs
+        from glee_agent.families import negotiation as neg_mod
+        from glee_agent.schema import parse_game
+        # Unlimited horizon, round 12: schedule floor makes counter_payoff a
+        # crumb, so the trajectory rule fires; the gate must consult the pool.
+        game = negotiation_decision(role="seller", offer_price=103.0)
+        del game["game_state"]["max_rounds"]
+        game["game_state"]["horizon_known"] = False
+        game["game_state"]["round"] = 12
+        view = parse_game(game)
+        monkeypatch.setattr(neg_mod, "_payoff_percentile", lambda *a, **k: 0.20)
+        gated = neg_mod.decide(view, Knobs(llm_enabled=False, neg_traj_pct_gate=0.45))
+        assert gated["decision"] == "RejectOffer"
+        monkeypatch.setattr(neg_mod, "_payoff_percentile", lambda *a, **k: 0.80)
+        good = neg_mod.decide(view, Knobs(llm_enabled=False, neg_traj_pct_gate=0.45))
+        assert good["decision"] == "AcceptOffer"
+        ungated = neg_mod.decide(view, Knobs(llm_enabled=False))
+        assert ungated["decision"] == "AcceptOffer"
+
+    def test_bare_float_counteroffer_parsed(self):
+        from fixtures import negotiation_game
+        from glee_agent.families import negotiation as neg_mod
+        from glee_agent.schema import parse_game, parse_negotiation
+        game = negotiation_game(role="seller", game_state={"history": [
+            {"round": 1,
+             "offer": {"price": 120.0, "from_player": "player_1"},
+             "counteroffer": 95.0},
+        ]})
+        view = parse_game(game)
+        n = parse_negotiation(view)
+        assert neg_mod._opponent_best_price(view, n) == pytest.approx(95.0)

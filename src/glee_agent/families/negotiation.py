@@ -39,17 +39,44 @@ def _anchor_and_floor(n, knobs: Knobs) -> tuple[float, float]:
     v = n.my_value if n.my_value is not None else 100.0
     margin = max(v * knobs.neg_min_margin_frac, 0.01)
     if n.my_role == "seller":
-        return v * (1.0 + knobs.neg_anchor_markup), v + margin
-    markup = (
-        knobs.neg_anchor_markup_buyer
-        if knobs.neg_anchor_markup_buyer is not None
-        else knobs.neg_anchor_markup
-    )
-    return v * (1.0 - markup), max(v - margin, 0.0)
+        anchor, floor = v * (1.0 + knobs.neg_anchor_markup), v + margin
+    else:
+        markup = (
+            knobs.neg_anchor_markup_buyer
+            if knobs.neg_anchor_markup_buyer is not None
+            else knobs.neg_anchor_markup
+        )
+        anchor, floor = v * (1.0 - markup), max(v - margin, 0.0)
+
+    # Complete information: an ask above the buyer's value (bid below the
+    # seller's) can never be profitably accepted — those offers burn every
+    # leverage round. Clamp the anchor feasible, and floor the concession at
+    # a real share of the public surplus: with the floor at own reservation,
+    # patient opponents just wait the Boulware curve out and collect ~95% of
+    # the surplus at round T.
+    frac = knobs.neg_ci_floor_frac
+    if frac > 0 and n.opp_value is not None and n.my_value is not None:
+        surplus = (
+            n.opp_value - v if n.my_role == "seller" else v - n.opp_value
+        )
+        if surplus > 0:
+            if n.my_role == "seller":
+                anchor = min(anchor, v + 0.95 * surplus)
+                floor = max(floor, v + frac * surplus)
+            else:
+                anchor = max(anchor, v - 0.95 * surplus)
+                floor = min(floor, v - frac * surplus)
+    return anchor, floor
 
 
 def _target_price(view: GameView, n, knobs: Knobs) -> float:
     anchor, floor = _anchor_and_floor(n, knobs)
+    # Finite endgame: the schedule only reaches the floor at round T, a round
+    # where we may never place an offer (measured live: every T=10 no-deal
+    # died with our best ask still >= 1.1x value). With <= 1 round after this
+    # one, price at the floor — a closed floor deal beats certain no-deal.
+    if view.max_rounds is not None and view.round >= view.max_rounds - 1:
+        return floor
     T = _schedule_length(view, knobs)
     my_round = min(view.round, T)
     if n.my_role == "seller":
@@ -67,11 +94,20 @@ def _opponent_best_price(view: GameView, n) -> float | None:
             continue
         for key in ("offer", "counteroffer"):
             item = entry.get(key)
-            if not isinstance(item, dict):
+            if isinstance(item, dict):
+                if item.get("from_player") == view.your_player:
+                    continue
+                price = item.get("price", item.get("product_price"))
+            elif key == "counteroffer" and isinstance(item, (int, float)):
+                # Live history stores counteroffers as bare floats: the
+                # counter answers this entry's offer, so it comes from the
+                # opposite player — ours iff the offer was theirs.
+                off = entry.get("offer")
+                if not isinstance(off, dict) or off.get("from_player") != view.your_player:
+                    continue
+                price = item
+            else:
                 continue
-            if item.get("from_player") == view.your_player:
-                continue
-            price = item.get("price", item.get("product_price"))
             try:
                 price = float(price)
             except (TypeError, ValueError):
@@ -92,20 +128,12 @@ def _opponent_best_price(view: GameView, n) -> float | None:
 
 
 def _should_walk_away(view: GameView, n, knobs: Knobs) -> bool:
-    """Walk only when the horizon is nearly exhausted and the opponent's
-    trajectory cannot cross our reservation. With no round cap we keep the
-    free option open (countering costs nothing)."""
-    if view.max_rounds is None:
-        return False
-    if n.my_value is None:
-        return False
-    rounds_left = view.max_rounds - view.round
-    if rounds_left > 1:
-        return False
-    best = _opponent_best_price(view, n)
-    if best is None:
-        return False
-    return _my_payoff(n.my_role, n.my_value, best) < 0
+    """Never walk in finite games: walking pays 0, exactly what horizon
+    expiry pays, but forecloses our remaining offers — measured live, 757
+    round-9 walks each forfeited a free final floor offer the opponent
+    could still have accepted. (Unlimited-horizon walks are handled by the
+    stalemate exit in decide(), which frees the concurrency slot.)"""
+    return False
 
 
 def _payoff_percentile(view: GameView, n, value: float, payoff: float) -> float | None:
@@ -162,6 +190,12 @@ def _optimized_price(view: GameView, n, knobs: Knobs, target_price: float) -> fl
     n_with_data = 0
     for i in range(21):  # candidate prices between reservation and anchor
         price = lo + (hi - lo) * i / 20.0
+        if knobs.neg_ci_floor_frac > 0:
+            # The dataset accept curve contains irrational losing-price
+            # accepts; live opponents never take a deal that loses money.
+            responder_payoff = _my_payoff(their_role, n.opp_value, price)
+            if responder_payoff < 0:
+                continue
         p_accept = tg.neg_accept_prob(price / n.opp_value, their_role, left, human)
         if p_accept is None:
             continue
@@ -254,11 +288,21 @@ def decide(view: GameView, knobs: Knobs) -> dict:
                 return {"decision": "WalkAway"}
 
     # Accept when the offer already beats the price we planned to counter at
-    # (they met or beat our own trajectory).
+    # (they met or beat our own trajectory). Optional percentile gate: once
+    # the Boulware schedule hits its floor (round >= T), counter_payoff
+    # collapses to the margin and this rule accepts any crumb — measured
+    # live, 616 such accepts averaged pct 0.25. The gate refuses offers the
+    # scoring pool ranks poorly while still closing in no-deal-heavy pools
+    # (where a small profit genuinely ranks high).
     my_next = _target_price(view, n, knobs)
     counter_payoff = _my_payoff(n.my_role, value, my_next)
     if payoff > 0 and payoff >= counter_payoff * knobs.neg_accept_factor:
-        return {"decision": "AcceptOffer"}
+        gate = knobs.neg_traj_pct_gate
+        if gate <= 0 or n.my_value is None:
+            return {"decision": "AcceptOffer"}
+        pct = _payoff_percentile(view, n, value, payoff)
+        if pct is None or pct >= gate:
+            return {"decision": "AcceptOffer"}
 
     if _should_walk_away(view, n, knobs):
         return {"decision": "WalkAway"}
