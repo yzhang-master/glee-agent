@@ -294,11 +294,18 @@ class TestDecideIntegration:
         assert bargaining.decide(parse_game(game), KNOBS)["decision"] == "reject"
 
     def test_barg_offer_optimizer_uses_accept_curve(self, tfix):
-        # Curve says shares beyond 0.70 for me almost never get accepted;
-        # optimizer moves the round-1 anchor from 0.80 down to 0.70.
-        view = parse_game(bargaining_game())
+        # NEUTRAL regime only (equal deltas — asymmetric deltas now route to
+        # the patience regimes where the optimizer is deliberately off):
+        # curve says shares beyond 0.70 almost never get accepted; the
+        # optimizer accelerates the round-1 anchor from 0.80 down to 0.70
+        # (it may only ever move DOWN from the schedule).
+        game = bargaining_game(game_state={"delta_2": 0.95})
+        view = parse_game(game)
         action = bargaining.decide(view, KNOBS)
-        assert action["alice_gain"] == pytest.approx(700.0, abs=0.01)
+        # With continuation capped at the realized 0.46 (not the aspirational
+        # schedule), the EV argmax concedes deeper: 0.60, down from 0.80.
+        assert action["alice_gain"] == pytest.approx(600.0, abs=0.01)
+        assert action["alice_gain"] < 800.0  # only ever DOWN from the schedule
         assert action["alice_gain"] + action["bob_gain"] == pytest.approx(1000.0)
         # Without curve data: the plain Boulware anchor.
         T.set_targets(T.Targets.null())

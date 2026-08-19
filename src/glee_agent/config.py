@@ -43,6 +43,10 @@ class Knobs:
     barg_accept_great: float = 0.65      # grab any offer at/above this share immediately
     barg_cont_realism: float = 0.85      # P(opponent accepts my next aggressive offer)
     barg_accept_pct: float = 0.70        # accept when payoff percentile vs pool >= this
+    barg_patience_edge: float = 0.04     # |my_delta - opp_delta| >= this splits the regimes
+    barg_adv_hold: float = 0.75          # advantage-regime acceptance threshold cap
+    barg_dis_accept: float = 0.48        # disadvantage regime: accept any share >= this
+    barg_drip: float = 0.01              # max unreciprocated concession per offer (0 in advantage)
 
     # Negotiation
     neg_anchor_markup: float = 0.9       # how far past own value we anchor (fraction of value)

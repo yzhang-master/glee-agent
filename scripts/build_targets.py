@@ -364,6 +364,14 @@ def main():
         except Exception:
             agg.skips[fam] += 1
             continue
+        if fam == "persuasion" and ga.get("is_myopic"):
+            # Myopic games give the seller a FRESH buyer each round (armed
+            # only with aggregate sales stats) — a systematically easier
+            # selling regime. The live platform is never myopic (no
+            # is_myopic in any live game_state), so myopic games would
+            # contaminate the comparison pool: skip them (~half the split).
+            agg.skips[fam] += 1
+            continue
         t1 = conf.get("player_1_type") or ""
         t2 = conf.get("player_2_type") or ""
         m1 = model_short(conf.get("player_1_args"), t1)

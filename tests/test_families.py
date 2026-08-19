@@ -1,3 +1,6 @@
+import json
+
+import pytest
 from fixtures import (
     bargaining_decision,
     bargaining_game,
@@ -9,6 +12,7 @@ from fixtures import (
 from glee_agent.config import Knobs
 from glee_agent.families import bargaining, negotiation, persuasion
 from glee_agent.schema import parse_game
+from glee_agent.theory import targets as T
 
 KNOBS = Knobs()
 
@@ -72,6 +76,171 @@ class TestBargaining:
         game["game_state"]["proposer"] = "player_2"
         action = run(bargaining, game)
         assert action["bob_gain"] > 500  # I'm Bob now
+
+
+class TestBargainingRegimes:
+    """Patience regimes, behavior-dependent concession, final-round EV."""
+
+    @pytest.fixture(autouse=True)
+    def clean_targets(self):
+        T.set_targets(T.Targets.null())
+        yield
+        T.set_targets(None)
+
+    @staticmethod
+    def _adv_game(**state):
+        # My delta 1.0 vs their 0.8, unlimited horizon: strong patience edge.
+        game = bargaining_game()
+        del game["game_state"]["max_rounds"]
+        game["game_state"].update(
+            {"horizon_known": False, "delta_1": 1.0, "delta_2": 0.8}
+        )
+        game["game_state"].update(state)
+        return game
+
+    @staticmethod
+    def _stonewall_history(my_gain, opp_gives_me):
+        # PLATFORM SHAPE: gains nested under "offer" — exactly what live
+        # game_state.history carries (the flat shape was a fixture-only
+        # fiction that let a dead parser pass its tests).
+        pot = 1000
+
+        def entry(proposer, p1, rnd):
+            return {
+                "round": rnd, "proposer": proposer, "decision": "reject",
+                "offer": {"player_1_gain": p1, "player_2_gain": pot - p1,
+                          "message": None},
+            }
+
+        return [
+            entry("player_1", my_gain, 1),
+            entry("player_2", opp_gives_me, 2),
+            entry("player_1", my_gain, 3),
+            entry("player_2", opp_gives_me, 4),
+        ]
+
+    def test_advantage_holds_high_and_off_schedule(self):
+        # delta 1.0 vs 0.8: hold at 0.90; round 8 offer == round 2 offer —
+        # time alone must buy the opponent nothing.
+        early = self._adv_game(round=2)
+        late = self._adv_game(round=8)
+        a_early = run(bargaining, early)
+        a_late = run(bargaining, late)
+        assert a_early["alice_gain"] / 1000 >= 0.65
+        assert a_early["alice_gain"] == pytest.approx(a_late["alice_gain"])
+
+    def test_advantage_no_drip_vs_stonewaller(self):
+        # Opponent stonewalls (their offers to me never improve): my offer
+        # must not move at all — advantage drip is zero, and the rejected>=2
+        # deadlock pressure is off in the advantage regime.
+        game = self._adv_game(round=5, history=self._stonewall_history(900, 100))
+        action = run(bargaining, game)
+        assert action["alice_gain"] == pytest.approx(900.0)
+
+    def test_neutral_stonewaller_gets_drip_only(self):
+        # Equal deltas (neutral): opponent stonewalls at 0.2-to-me; despite
+        # the schedule AND deadlock pressure wanting ~0.725, my offer moves
+        # at most the 0.01 drip per own offer.
+        game = bargaining_game(game_state={
+            "round": 5, "delta_1": 0.95, "delta_2": 0.95,
+            "history": self._stonewall_history(800, 200),
+        })
+        action = run(bargaining, game)
+        assert action["alice_gain"] == pytest.approx(1000 * (0.80 - KNOBS.barg_drip))
+
+    def test_neutral_concession_follows_opponents(self):
+        # Same spot but the opponent conceded 0.05 to me between their two
+        # offers: my step may now match it (schedule wants 0.725 -> allowed).
+        history = self._stonewall_history(800, 150)
+        history[3]["offer"]["player_1_gain"] = 200
+        history[3]["offer"]["player_2_gain"] = 800
+        game = bargaining_game(game_state={
+            "round": 5, "delta_1": 0.95, "delta_2": 0.95, "history": history,
+        })
+        action = run(bargaining, game)
+        assert action["alice_gain"] == pytest.approx(750.0)  # 0.80 - 0.05 step
+
+    def test_disadvantage_anchors_low(self):
+        # delta 0.8 vs 1.0: my pot melts faster — anchor down to ~0.58.
+        game = bargaining_game(game_state={"delta_1": 0.8, "delta_2": 1.0})
+        action = run(bargaining, game)
+        assert action["alice_gain"] == pytest.approx(580.0)
+
+    def test_disadvantage_accepts_near_half_round_1(self):
+        game = bargaining_decision(
+            my_gain=480, opp_gain=520,
+            game_state={"delta_1": 0.8, "delta_2": 1.0},
+        )
+        assert run(bargaining, game)["decision"] == "accept"
+
+    def test_advantage_rejects_below_hold(self):
+        # 0.70 clears barg_accept_great, but under a strong patience edge the
+        # advantage threshold min(SPE*0.85, 0.75) = 0.75 rejects it early.
+        game = bargaining_decision(
+            my_gain=700, opp_gain=300,
+            game_state={"delta_1": 1.0, "delta_2": 0.8, "horizon_known": False},
+        )
+        del game["game_state"]["max_rounds"]
+        assert run(bargaining, game)["decision"] == "reject"
+
+    def test_final_round_ev_optimizer_uses_curve(self):
+        # Fixture curve (>=3 buckets — thinner curves fall back to the flat
+        # knob): argmax of (1-give)*P is give=0.15.
+        def k(share):
+            return json.dumps(
+                {"human": False, "rounds_left_bucket": "1", "share_bucket": share},
+                sort_keys=True, separators=(",", ":"),
+            )
+        T.set_targets(T.Targets({"barg_accept": {
+            k(0.10): [40, 20],   # p=0.5 -> ev 0.45
+            k(0.15): [40, 32],   # p=0.8 -> ev 0.68  <- argmax
+            k(0.30): [40, 34],   # p=0.85 -> ev 0.595
+        }}))
+        game = bargaining_game(game_state={"round": 10})
+        action = run(bargaining, game)
+        assert action["bob_gain"] == pytest.approx(150.0)
+        assert action["bob_gain"] < 300.0
+
+    def test_final_round_falls_back_to_flat_knob(self):
+        game = bargaining_game(game_state={"round": 10})
+        action = run(bargaining, game)
+        assert action["bob_gain"] == pytest.approx(1000 * KNOBS.barg_final_round_give)
+
+    def test_profile_shaves_final_round_give(self):
+        # Opponent known (dataset) to accept lowballs >= 20% of the time:
+        # final-round give drops by 0.05.
+        T.set_targets(T.Targets({"models": {
+            "gpt-4o": {"barg_n": 5000, "barg_accept_rate_when_offered_lt40pct": 0.25},
+        }}))
+        game = bargaining_game(
+            opponent={"type": "agent", "name": "gpt-4o"},
+            game_state={"round": 10},
+        )
+        action = run(bargaining, game)
+        assert action["bob_gain"] == pytest.approx(
+            1000 * (KNOBS.barg_final_round_give - 0.05)
+        )
+
+    def test_endgame_parity_caps_advantage_hold(self):
+        # Known horizon, 2 rounds left, responder proposes last: SPE caps my
+        # share far below the hold — the parity rule survives the regimes.
+        game = bargaining_game(game_state={
+            "round": 9, "delta_1": 1.0, "delta_2": 0.8,
+        })
+        action = run(bargaining, game)
+        assert action["alice_gain"] <= 300.0
+
+    def test_new_knobs_env_overrides(self, monkeypatch):
+        from glee_agent.config import _knobs_from_env
+        monkeypatch.setenv("GLEE_KNOB_BARG_DRIP", "0.03")
+        monkeypatch.setenv("GLEE_KNOB_BARG_ADV_HOLD", "0.8")
+        monkeypatch.setenv("GLEE_KNOB_BARG_DIS_ACCEPT", "0.5")
+        monkeypatch.setenv("GLEE_KNOB_BARG_PATIENCE_EDGE", "0.06")
+        knobs = _knobs_from_env()
+        assert knobs.barg_drip == pytest.approx(0.03)
+        assert knobs.barg_adv_hold == pytest.approx(0.8)
+        assert knobs.barg_dis_accept == pytest.approx(0.5)
+        assert knobs.barg_patience_edge == pytest.approx(0.06)
 
 
 class TestNegotiation:
