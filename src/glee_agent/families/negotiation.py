@@ -28,14 +28,24 @@ def _is_final_round(view: GameView) -> bool:
     return view.max_rounds is not None and view.round >= view.max_rounds
 
 
+def _is_ultimatum(view: GameView) -> bool:
+    """No later round exists to keep the opponent engaged in."""
+    return view.max_rounds is not None and view.round >= view.max_rounds
+
+
 def _schedule_length(view: GameView, knobs: Knobs) -> int:
     if view.max_rounds is not None:
         return max(min(view.max_rounds, knobs.neg_max_planned_rounds), 1)
     return knobs.neg_max_planned_rounds
 
 
-def _anchor_and_floor(n, knobs: Knobs) -> tuple[float, float]:
-    """(opening price, worst price I'll concede to) for my role."""
+def _anchor_and_floor(n, knobs: Knobs, ultimatum: bool = False) -> tuple[float, float]:
+    """(opening price, worst price I'll concede to) for my role.
+
+    `ultimatum` marks a take-it-or-leave-it round (T=1, or the final round of
+    a capped game): there is no later round to engage the opponent in, so the
+    anchor goes to the feasibility wall rather than leaving them room.
+    """
     v = n.my_value if n.my_value is not None else 100.0
     margin = max(v * knobs.neg_min_margin_frac, 0.01)
     if n.my_role == "seller":
@@ -55,22 +65,48 @@ def _anchor_and_floor(n, knobs: Knobs) -> tuple[float, float]:
     # patient opponents just wait the Boulware curve out and collect ~95% of
     # the surplus at round T.
     frac = knobs.neg_ci_floor_frac
-    if frac > 0 and n.opp_value is not None and n.my_value is not None:
+    if n.opp_value is not None and n.my_value is not None:
         surplus = (
             n.opp_value - v if n.my_role == "seller" else v - n.opp_value
         )
         if surplus > 0:
+            # The anchor cap is NOT knob-gated: measured live, ~58% of our
+            # complete-info offers left the opponent negative surplus and were
+            # accepted 0-0.6% of the time, while an offer leaving them ~10-20%
+            # of the surplus is accepted 22%. An offer they cannot profitably
+            # accept is not an aggressive offer, it is a wasted round.
+            cap = 0.98 if ultimatum else knobs.neg_ci_anchor_frac
             if n.my_role == "seller":
-                anchor = min(anchor, v + 0.95 * surplus)
+                anchor = min(anchor, v + cap * surplus)
                 floor = max(floor, v + frac * surplus)
             else:
-                anchor = max(anchor, v - 0.95 * surplus)
+                anchor = max(anchor, v - cap * surplus)
                 floor = min(floor, v - frac * surplus)
+            if n.my_role == "seller":
+                floor = min(floor, anchor)
+            else:
+                floor = max(floor, anchor)
     return anchor, floor
 
 
+def _feasible_price(price: float, n, eps_frac: float = 0.01) -> float:
+    """Clamp a price so a known-value opponent can still profit by accepting.
+
+    A hard invariant, independent of any knob and applied at every return
+    site: the acceptance model has a strict gate at the responder's own
+    value, so an infeasible offer has literally zero chance and merely burns
+    a round (and, late in a game, invites a walk-away).
+    """
+    if n.opp_value is None or n.opp_value <= 0:
+        return price
+    eps = max(abs(n.opp_value) * eps_frac, 1e-9)
+    if n.my_role == "seller":
+        return min(price, n.opp_value - eps)   # buyer must gain by buying
+    return max(price, n.opp_value + eps)       # seller must gain by selling
+
+
 def _target_price(view: GameView, n, knobs: Knobs) -> float:
-    anchor, floor = _anchor_and_floor(n, knobs)
+    anchor, floor = _anchor_and_floor(n, knobs, ultimatum=_is_ultimatum(view))
     # Finite endgame: the schedule only reaches the floor at round T, a round
     # where we may never place an offer (measured live: every T=10 no-deal
     # died with our best ask still >= 1.1x value). With <= 1 round after this
@@ -84,6 +120,80 @@ def _target_price(view: GameView, n, knobs: Knobs) -> float:
         return boulware(my_round, T, anchor, floor, knobs.neg_beta)
     # Buyer concedes upward: mirror the curve.
     return boulware(my_round, T, anchor, floor, knobs.neg_beta)
+
+
+def _my_offer_prices(view: GameView) -> list[float]:
+    """Chronological prices I have proposed, oldest first."""
+    out = []
+    for entry in view.history:
+        if not isinstance(entry, dict):
+            continue
+        off = entry.get("offer")
+        if isinstance(off, dict) and off.get("from_player") == view.your_player:
+            try:
+                out.append(float(off.get("price", off.get("product_price"))))
+            except (TypeError, ValueError):
+                continue
+        co = entry.get("counteroffer")
+        if isinstance(co, (int, float)) and isinstance(off, dict) \
+                and off.get("from_player") != view.your_player:
+            out.append(float(co))
+    return out
+
+
+def _opp_offer_prices(view: GameView) -> list[float]:
+    """Chronological prices the opponent has proposed, oldest first."""
+    out = []
+    for entry in view.history:
+        if not isinstance(entry, dict):
+            continue
+        off = entry.get("offer")
+        if isinstance(off, dict) and off.get("from_player") != view.your_player:
+            try:
+                out.append(float(off.get("price", off.get("product_price"))))
+            except (TypeError, ValueError):
+                continue
+        co = entry.get("counteroffer")
+        if isinstance(co, (int, float)) and isinstance(off, dict) \
+                and off.get("from_player") == view.your_player:
+            out.append(float(co))
+    return out
+
+
+def _opp_last_concession(view: GameView, n) -> float:
+    """How much their latest offer improved FOR ME over their previous one."""
+    prices = _opp_offer_prices(view)
+    if len(prices) < 2:
+        return 0.0
+    prev, last = prices[-2], prices[-1]
+    gain = (last - prev) if n.my_role == "seller" else (prev - last)
+    return max(gain, 0.0)
+
+
+def _reciprocal_cap(view: GameView, n, knobs: Knobs, target: float,
+                    anchor: float, floor: float) -> float:
+    """Never concede faster than the opponent does (MiCRO).
+
+    The validated counterpart model makes BOTH their acceptance probability
+    and their own concession size strictly decreasing in our concession
+    speed, so a purely time-based schedule pays an opponent to sit still —
+    which is what 30-45%% of our opponents do. The schedule therefore becomes
+    an upper bound on generosity: between two of my own offers I move at most
+    what they just moved, plus a token drip.
+    """
+    if not knobs.neg_reciprocal:
+        return target
+    mine = _my_offer_prices(view)
+    if not mine:
+        return target
+    my_last = mine[-1]
+    drip = abs(anchor - floor) * knobs.neg_drip
+    step = max(_opp_last_concession(view, n), drip)
+    if n.my_role == "seller":
+        # I concede by lowering the price: never below my last minus step.
+        return min(max(target, my_last - step), my_last)
+    # Buyer concedes by raising: never above my last plus step.
+    return max(min(target, my_last + step), my_last)
 
 
 def _opponent_best_price(view: GameView, n) -> float | None:
@@ -183,7 +293,7 @@ def _optimized_price(view: GameView, n, knobs: Knobs, target_price: float) -> fl
         cont = 0.0
     else:
         cont = max(_my_payoff(n.my_role, value, target_price), 0.0) * 0.8
-    anchor, floor = _anchor_and_floor(n, knobs)
+    anchor, floor = _anchor_and_floor(n, knobs, ultimatum=ultimatum)
     lo, hi = (floor, anchor) if floor <= anchor else (anchor, floor)
     best_price = None
     best_ev = -1.0
@@ -218,7 +328,7 @@ def decide(view: GameView, knobs: Knobs) -> dict:
         price = _target_price(view, n, knobs)
         # Single-round ultimatum: no counteroffers exist, price to close.
         if view.max_rounds == 1:
-            anchor, floor = _anchor_and_floor(n, knobs)
+            anchor, floor = _anchor_and_floor(n, knobs, ultimatum=True)
             # Without the dataset CDF, split the difference between a
             # moderate markup and reservation — closing matters most.
             price = (anchor + floor) / 2
@@ -228,6 +338,10 @@ def decide(view: GameView, knobs: Knobs) -> dict:
         optimized = _optimized_price(view, n, knobs, price)
         if optimized is not None:
             price = optimized
+        if view.max_rounds != 1:
+            anchor, floor = _anchor_and_floor(n, knobs, ultimatum=_is_ultimatum(view))
+            price = _reciprocal_cap(view, n, knobs, price, anchor, floor)
+        price = _feasible_price(price, n)
         out = {"product_price": round(max(price, 0.0), 2)}
         if view.messages_allowed and llm_client.llm_available(knobs):
             msg = llm_messages.negotiation_offer_message(
@@ -312,6 +426,15 @@ def decide(view: GameView, knobs: Knobs) -> dict:
     counter = _optimized_price(view, n, knobs, my_next)
     if counter is None:
         counter = my_next
+    anchor, floor = _anchor_and_floor(n, knobs, ultimatum=_is_ultimatum(view))
+    counter = _reciprocal_cap(view, n, knobs, counter, anchor, floor)
+    # Walkback resistance: never counter below the best they have already
+    # offered us — that price is already banked, and bidding under it hands
+    # back surplus they had conceded.
+    best = _opponent_best_price(view, n)
+    if best is not None:
+        counter = max(counter, best) if n.my_role == "seller" else min(counter, best)
+    counter = _feasible_price(counter, n)
     out = {"decision": "RejectOffer", "product_price": round(max(counter, 0.0), 2)}
     if view.messages_allowed and llm_client.llm_available(knobs):
         msg = llm_messages.negotiation_offer_message(

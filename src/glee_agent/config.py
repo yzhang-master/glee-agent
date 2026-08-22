@@ -60,6 +60,16 @@ class Knobs:
                                          # can profitably accept) and floor concession at
                                          # value +/- frac*surplus instead of own reservation.
                                          # 0 = off; A/B arm runs 0.4
+    neg_ci_anchor_frac: float = 0.80     # complete info: opening leaves the opponent at least
+                                         # (1-this) of the surplus. 0.95 was functionally
+                                         # infeasible -- live acceptance at that level is ~0%,
+                                         # while leaving them 10-20% is accepted ~22%
+    neg_reciprocal: bool = True          # concede at most what the opponent just conceded
+                                         # (plus a drip). Their acceptance probability AND
+                                         # their own concession both fall in our concession
+                                         # speed, so a time-based schedule teaches them to wait
+    neg_drip: float = 0.01               # unreciprocated concession per offer, as a fraction
+                                         # of the anchor-to-floor range
     neg_traj_pct_gate: float = 0.0       # trajectory-accept additionally requires pool pct >= this
                                          # (0 = off; A/B arm 0.45) — blocks the round-12 Boulware
                                          # floor collapse from accepting near-reservation crumbs

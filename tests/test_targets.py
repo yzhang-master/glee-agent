@@ -326,8 +326,11 @@ class TestDecideIntegration:
         assert decision != "AcceptOffer"
 
     def test_neg_ultimatum_seller_uses_optimizer(self, tfix):
-        # Complete info, one round: EV-optimal price 141.6 (rel 0.944, 95%
-        # accept) beats the (anchor+floor)/2 heuristic of 146.
+        # Complete info, one round: EV-optimal price 141.95 (rel 0.946, 95%
+        # accept) beats the (anchor+floor)/2 heuristic of 125.5. The optimum
+        # sits just under the curve's cliff at rel 0.95, where acceptance
+        # halves — pricing nearer the buyer's value would raise the payoff
+        # but more than halve the odds of collecting it.
         game = negotiation_game(
             role="seller",
             game_state={
@@ -337,6 +340,6 @@ class TestDecideIntegration:
             },
         )
         view = parse_game(game)
-        assert negotiation.decide(view, KNOBS)["product_price"] == pytest.approx(141.6, abs=0.01)
+        assert negotiation.decide(view, KNOBS)["product_price"] == pytest.approx(141.95, abs=0.01)
         T.set_targets(T.Targets.null())
-        assert negotiation.decide(view, KNOBS)["product_price"] == pytest.approx(146.0, abs=0.01)
+        assert negotiation.decide(view, KNOBS)["product_price"] == pytest.approx(125.5, abs=0.01)

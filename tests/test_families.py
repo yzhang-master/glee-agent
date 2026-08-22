@@ -628,3 +628,83 @@ class TestNegotiationEndgame:
         view = parse_game(game)
         n = parse_negotiation(view)
         assert neg_mod._opponent_best_price(view, n) == pytest.approx(95.0)
+
+
+class TestNegotiationInvariants:
+    """The feasibility and reciprocity invariants added after measuring that
+    ~58% of our complete-info offers were ones the opponent could never
+    profitably accept (0-0.6% acceptance)."""
+
+    @staticmethod
+    def _ci_game(role="seller", rnd=1, history=None, my_v=100.0, opp_v=200.0):
+        from fixtures import negotiation_game
+        st = {"complete_information": True, "round": rnd,
+              "player_1_value": my_v if role == "seller" else opp_v,
+              "player_2_value": opp_v if role == "seller" else my_v}
+        if history is not None:
+            st["history"] = history
+        g = negotiation_game(role=role, game_state=st)
+        return g
+
+    def test_offer_always_leaves_known_opponent_a_profit(self):
+        """Property: across roles, rounds and knob settings, a returned price
+        never puts a known-value opponent under water."""
+        from glee_agent.schema import parse_game, parse_negotiation
+        for role in ("seller", "buyer"):
+            for rnd in (1, 2, 5, 9, 10):
+                for frac in (0.0, 0.4, 0.6):
+                    g = self._ci_game(role=role, rnd=rnd)
+                    view = parse_game(g)
+                    n = parse_negotiation(view)
+                    act = negotiation.decide(view, Knobs(llm_enabled=False,
+                                                         neg_ci_floor_frac=frac))
+                    price = act.get("product_price")
+                    if price is None:
+                        continue
+                    opp_payoff = (n.opp_value - price if n.my_role == "seller"
+                                  else price - n.opp_value)
+                    assert opp_payoff > 0, (role, rnd, frac, price, n.opp_value)
+
+    def test_concession_never_outruns_the_opponent(self):
+        """A stonewalling opponent gets at most the drip, not the schedule."""
+        from glee_agent.schema import parse_game
+        # They repeat 120 twice (zero concession); we already offered 190.
+        hist = [
+            {"round": 1, "offer": {"price": 190.0, "from_player": "player_1"},
+             "counteroffer": 120.0},
+            {"round": 2, "offer": {"price": 185.0, "from_player": "player_1"},
+             "counteroffer": 120.0},
+        ]
+        g = self._ci_game(rnd=3, history=hist)
+        g["game_state"]["last_offer"] = {"price": 120.0, "from_player": "player_2",
+                                         "round": 2, "message": None}
+        g["phase"] = g["game_state"]["phase"] = "decision"
+        g["game_state"]["current_player"] = "player_1"
+        g["valid_actions"] = {"type": "decision", "fields": {
+            "decision": ["AcceptOffer", "RejectOffer", "WalkAway"],
+            "product_price": "number"}}
+        act = negotiation.decide(parse_game(g), Knobs(llm_enabled=False))
+        if act["decision"] == "RejectOffer":
+            # my last was 185; a stonewaller buys at most the drip of movement
+            assert act["product_price"] >= 185.0 - 0.02 * 200.0
+
+    def test_never_counters_below_their_best_offer(self):
+        """Walkback resistance: a price they already offered is banked."""
+        from glee_agent.schema import parse_game
+        hist = [
+            {"round": 1, "offer": {"price": 190.0, "from_player": "player_1"},
+             "counteroffer": 175.0},
+            {"round": 2, "offer": {"price": 188.0, "from_player": "player_1"},
+             "counteroffer": 130.0},
+        ]
+        g = self._ci_game(rnd=3, history=hist)
+        g["game_state"]["last_offer"] = {"price": 130.0, "from_player": "player_2",
+                                         "round": 2, "message": None}
+        g["phase"] = g["game_state"]["phase"] = "decision"
+        g["game_state"]["current_player"] = "player_1"
+        g["valid_actions"] = {"type": "decision", "fields": {
+            "decision": ["AcceptOffer", "RejectOffer", "WalkAway"],
+            "product_price": "number"}}
+        act = negotiation.decide(parse_game(g), Knobs(llm_enabled=False))
+        if act["decision"] == "RejectOffer":
+            assert act["product_price"] >= 175.0
