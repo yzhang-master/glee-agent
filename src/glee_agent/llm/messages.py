@@ -53,44 +53,46 @@ def _finish(text: str | None) -> str | None:
 
 
 def persuasion_seller_message(
-    recommend: bool, quality_known_high: bool, round_: int, history_summary: str
+    recommend: bool, round_: int, history_summary: str, honest_rounds: str = ""
 ) -> str | None:
-    """A varied, natural 1-3 sentence sales message.
+    """A varied, natural sales message.
 
-    When recommending without knowing the product is good, the prompt is a
-    plain enthusiastic-pitch request: it must never mention product grade or
-    any doubt about it (see module docstring).
+    CRITICAL — one message distribution per SIGNAL, never per quality. A
+    signalling scheme is pi(signal | state): the signal must be drawn from the
+    same distribution whatever the state, only its probability may differ. If
+    the text we write when recommending a good product differs in kind from
+    the text we write when recommending a bad one, the buyer separates them by
+    wording alone: we pay the full reputational cost of a lie while
+    transmitting nothing. So this function is NOT given the quality at all —
+    `recommend` is the only input that may steer the wording.
     """
     try:
         history = history_summary.strip() or "first round"
-        if recommend and quality_known_high:
-            prompt = (
-                f"Round {round_} of a repeated sales game; recent outcomes: {history}. "
-                "Today's product is genuinely top quality and you are recommending it. "
-                "Write a confident, concrete 1-3 sentence pitch to the buyer that "
-                "stands behind the product and invites them to buy."
-                "IMPORTANT: never use the words don't, no, not, pass, skip, or avoid — pure positive phrasing only."
-                " Vary your phrasing "
-                f"from earlier rounds (this is round {round_})."
+        if recommend:
+            certified = (
+                f" You have previously advised the buyer to pass on {honest_rounds}, "
+                "which cost you those sales; you may cite that record as evidence "
+                "your recommendations mean something."
+                if honest_rounds
+                else ""
             )
-        elif recommend:
             prompt = (
                 f"Round {round_} of a repeated sales game; recent outcomes: {history}. "
-                "You are recommending today's product. Write an enthusiastic, upbeat "
-                "1-2 sentence generic pitch that highlights your track record and the "
-                "deal's value, and invites the buyer to purchase."
-                "IMPORTANT: never use the words don't, no, not, pass, skip, or avoid — pure positive phrasing only."
-                " Keep it general — "
-                "no specific product claims. Vary your phrasing from earlier rounds "
-                f"(this is round {round_})."
+                "You are recommending today's product to the buyer. Write a "
+                "specific, concrete, confident 1-3 sentence pitch that invites "
+                f"them to buy.{certified}"
+                " IMPORTANT: never use the words don't, no, not, pass, skip, or "
+                "avoid — pure positive phrasing only. Vary your phrasing from "
+                f"earlier rounds (this is round {round_})."
             )
         else:
             prompt = (
                 f"Round {round_} of a repeated sales game; recent outcomes: {history}. "
-                "You are honestly steering the buyer AWAY from today's product to "
-                "build long-term trust. Write a candid 1-2 sentence message advising "
-                "them to pass this round, signalling that your recommendations mean "
-                "something. Vary your phrasing from earlier rounds."
+                "You are honestly steering the buyer AWAY from today's product, "
+                "forfeiting the sale to keep your recommendations credible. Write "
+                "a candid 1-2 sentence message advising them to pass this round, "
+                "and make clear you are giving up a sale by saying so. Vary your "
+                "phrasing from earlier rounds."
             )
         return _finish(client.complete(prompt, system=_SYSTEM))
     except Exception as e:  # noqa: BLE001 — message layer must never raise

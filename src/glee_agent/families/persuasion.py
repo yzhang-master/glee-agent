@@ -14,7 +14,7 @@ from ..config import Knobs
 from ..llm import client as llm_client
 from ..llm import messages as llm_messages
 from ..schema import GameView, parse_persuasion
-from ..theory.bayes import BetaTracker, kg_lie_rate, posterior_high_given_rec
+from ..theory.bayes import LieRatePosterior, kg_lie_rate
 
 POSITIVE_WORDS = ("recommend", "great", "excellent", "worth", "quality", "buy", "good", "yes")
 # Soft negatives matter: honest sellers phrase anti-recommendations as
@@ -135,49 +135,136 @@ def _history_summary(view: GameView) -> str:
     return " ".join(parts)
 
 
-def _seller_message(recommend: bool, quality: str | None) -> str:
-    if recommend:
-        if quality == "high":
-            return (
-                "I can honestly say this is one of the strongest products I've "
-                "offered you — I stand behind its quality and recommend it."
-            )
-        return "This product is in line with what you've seen from me. I recommend it."
-    return (
-        "I'll be straight with you: I don't think this one is worth it for you. "
-        "I'd rather skip a sale than lose your trust — pass on this round."
-    )
+def _honest_rounds(view: GameView) -> str:
+    """Round numbers where we advised the buyer to PASS, as "3, 7".
+
+    Anti-recommendations are the only observable that certifies the signal:
+    they cost us the sale, so citing them is evidence a recommendation means
+    something. Empty when we have never passed.
+    """
+    rounds = []
+    for i, entry in enumerate(view.history, start=1):
+        if not isinstance(entry, dict):
+            continue
+        if _msg_polarity(str(entry.get("seller_message", ""))) == "neg":
+            rounds.append(str(entry.get("round", i)))
+    return ", ".join(rounds[-3:])
+
+
+# Recommendation templates. CRITICAL: these are drawn from ONE pool regardless
+# of the product's quality. Previously a high-quality recommendation read "one
+# of the strongest products I've offered ... I stand behind its quality" while
+# a low-quality one read "in line with what you've seen from me" — two
+# perfectly separating messages, so every lie was labelled as a lie and the
+# mixing scheme carried no information at all. A signalling scheme requires a
+# single message distribution; only the DECISION to recommend may depend on
+# quality.
+_RECOMMEND_TEMPLATES = (
+    "I recommend this one — it's worth your money at this price.",
+    "This is one worth taking. I recommend it.",
+    "I'd buy this one in your position. Recommended.",
+    "Worth it this round — I recommend going ahead.",
+    "I recommend this product; it earns the price.",
+)
+
+_PASS_TEMPLATES = (
+    "I'll be straight with you: I don't think this one is worth it for you. "
+    "I'd rather skip a sale than lose your trust — pass on this round.",
+    "Not this one. I'm giving up the sale to tell you that — pass this round.",
+    "I'd pass on this one. Telling you so costs me the sale, which is exactly "
+    "why my recommendations are worth something.",
+)
+
+
+def _seller_message(recommend: bool, view: GameView) -> str:
+    """Pick a template from the signal-appropriate pool.
+
+    Selection is deterministic in (game_id, round) so replays are stable, and
+    is INDEPENDENT of the product's quality by construction — the pool is
+    chosen by `recommend` alone.
+    """
+    pool = _RECOMMEND_TEMPLATES if recommend else _PASS_TEMPLATES
+    seed = f"msg:{view.game_id}:{view.round}".encode()
+    idx = int.from_bytes(hashlib.sha256(seed).digest()[:8], "big") % len(pool)
+    return pool[idx]
 
 
 # -------------------------------------------------------------------- buyer
 
-def _buyer_tracker(view: GameView, ps) -> tuple[BetaTracker, BetaTracker, BetaTracker]:
-    """Rebuild (rec_tracker, neg_tracker, neutral_tracker) posteriors from
-    history every turn — stateless across calls, so concurrency and restarts
-    are free. Neutral messages get their own tracker: folding them into `rec`
-    poisons the recommendation posterior, and scoring them at the raw prior
-    forever means an unlisted-keyword anti-rec ("ordinary unit") gets bought
-    every round with zero learning."""
-    x_star = kg_lie_rate(ps.p, ps.v if ps.v is not None else 0.0, ps.price)
-    prior_rec = posterior_high_given_rec(ps.p, x_star) if ps.v else ps.p
-    rec = BetaTracker(prior_mean=max(prior_rec, ps.p), prior_strength=2.0)
-    neg = BetaTracker(prior_mean=min(ps.p * 0.3 + 1e-6, 1.0), prior_strength=2.0)
-    neu = BetaTracker(prior_mean=ps.p, prior_strength=2.0)
+def _buyer_posterior(view: GameView, ps, knobs: Knobs) -> LieRatePosterior:
+    """Rebuild the seller's lie-rate posterior from history every turn.
 
-    for entry in view.history:
-        if not isinstance(entry, dict) or not entry.get("bought"):
-            continue
-        quality = entry.get("quality")
-        if quality not in ("high", "low"):
-            continue
+    Stateless across calls, so concurrency and restarts are free. Both
+    channels are fed: the recommendation FREQUENCY on every past round
+    (available whether or not we bought), and the realized quality on the
+    rounds we did buy. Older rounds are down-weighted so a seller who switches
+    behaviour mid-game (trust repair, endgame pooling) is tracked.
+    """
+    # Prior on the seller's lie rate. NOT the KG-rational x*: measured over
+    # ~900k live rounds the field lies at ~0.19-0.29, far below x* in most
+    # configs, so an x*-anchored prior refuses recommendations that are
+    # actually profitable. The frequency channel corrects this within a few
+    # rounds anyway; the prior only has to be sane at round 1.
+    post = LieRatePosterior(ps.p, knobs.pers_prior_lie, prior_strength=2.0)
+
+    entries = [e for e in view.history if isinstance(e, dict)]
+    n = len(entries)
+    for age, entry in enumerate(reversed(entries)):
+        w = knobs.pers_forget ** age
         polarity = _msg_polarity(str(entry.get("seller_message", "")))
-        if polarity == "neg":
-            neg.update(quality == "high")
-        elif polarity == "pos":
-            rec.update(quality == "high")
-        else:
-            neu.update(quality == "high")
-    return rec, neg, neu
+        recommended = polarity == "pos"
+        if polarity != "neutral" or entry.get("seller_message") is not None:
+            post.observe_message(recommended, weight=w)
+        if entry.get("bought") and entry.get("quality") in ("high", "low"):
+            post.observe_outcome(recommended, entry.get("quality") == "high", weight=w)
+    return post
+
+
+def _buyer_value(p_high: float, ps) -> float:
+    """Expected surplus from buying: p*v + (1-p)*u - price.
+
+    `u` is 0 in every live config, but carrying it keeps the arithmetic right
+    if a config ever prices a low-quality unit above zero.
+    """
+    u = ps.u if getattr(ps, "u", None) is not None else 0.0
+    v = ps.v if ps.v is not None else 0.0
+    return p_high * v + (1.0 - p_high) * u - ps.price
+
+
+def _probe_is_worth_it(view: GameView, ps, knobs: Knobs, post, p_high: float) -> bool:
+    """Knowledge-gradient: is a losing buy worth what it teaches us?
+
+    Buying is the only way to observe a round's quality, so a purchase that is
+    myopically negative can still pay if the resulting posterior would let us
+    buy profitably for the remaining rounds. Replaces the old fixed
+    exploration window + hard caps, which explored on a schedule rather than
+    on the value of the information, and which shut off exactly in the thin
+    configs where the question is live.
+    """
+    total = ps.total_rounds or 10
+    remaining = max(total - view.round, 0)
+    if remaining <= 0:
+        return False
+
+    myopic = _buyer_value(p_high, ps)
+    q_hi = post.hypothetical_p_high(True, True)
+    q_lo = post.hypothetical_p_high(True, False)
+    future = p_high * max(0.0, _buyer_value(q_hi, ps)) + (1.0 - p_high) * max(
+        0.0, _buyer_value(q_lo, ps)
+    )
+    if myopic + (remaining - 1) * future < 0:
+        return False
+
+    # Spend cap: never sink more than a fixed share of the game's maximum
+    # attainable surplus into information.
+    v = ps.v if ps.v is not None else 0.0
+    max_attainable = max(total * (v - ps.price), 1e-9)
+    spent = sum(
+        ps.price - (v if e.get("quality") == "high" else 0.0)
+        for e in view.history
+        if isinstance(e, dict) and e.get("bought") and e.get("quality") == "low"
+    )
+    return spent < knobs.pers_probe_budget * max_attainable
 
 
 def _buyer_decide(view: GameView, ps, knobs: Knobs) -> dict:
@@ -187,45 +274,29 @@ def _buyer_decide(view: GameView, ps, knobs: Knobs) -> dict:
         return {"decision": "no"}
 
     polarity = _msg_polarity(ps.seller_message)
-    rec, neg, neu = _buyer_tracker(view, ps)
-
-    if polarity == "neg":
-        # A seller advising against a sale forfeits revenue — highly credible.
-        p_high = neg.mean
-    elif polarity == "pos":
-        p_high = rec.mean
-    else:
-        p_high = neu.mean  # uninformative message: prior, updated by outcomes
-
-    # Exploratory (UCB) buying pays for information with expected losses, so
-    # it must be affordable: skip it on thin margins (v/price close to 1
-    # needs near-perfect honesty to profit), stop after the game has already
-    # lost money, and never sink more than ~2 speculative buys per game.
     total = ps.total_rounds or 10
-    thin_margin = (v - price) / price < 0.35 if price > 0 else True
-    explore_buys = sum(
-        1
-        for e in view.history
-        if isinstance(e, dict) and e.get("bought") and e.get("quality") == "low"
-    )
-    thin_blocks = thin_margin and not (knobs.pers_thin_explore and p >= 0.5)
-    exploring = (
-        view.round <= max(1, int(total * knobs.pers_explore_frac))
-        and not thin_blocks
-        and ps.my_total_payoff >= 0
-        and explore_buys < 2
-    )
-    if exploring and polarity == "pos":
-        p_high = rec.ucb(c=1.0)
 
-    # Side-dependent margin. THIN configs: the KG-honest prior sits exactly
-    # at indifference, so demand a real edge — any extra seller lying turns
-    # ">=" into guaranteed losses. WIDE configs: the field earns the pool
-    # median by buying at the knife-edge; sitting out scores ~0, below most
-    # of the pool, so tolerate slight prior slack and let evidence cut us
-    # off if the seller over-lies.
+    # Endgame: in the last round the seller faces no future punishment, so a
+    # payoff-maximising one recommends everything and the message carries no
+    # information. Fall back to the prior and ignore what they said.
+    if view.round >= total:
+        return {"decision": "yes" if _buyer_value(p, ps) > 0 else "no"}
+
+    post = _buyer_posterior(view, ps, knobs)
+    p_high = post.p_high_given(polarity == "pos")
+
+    # Side-dependent margin, as before: thin configs need a real edge because
+    # the KG-honest prior sits exactly at indifference; wide configs tolerate
+    # slight slack because the field profits at the knife-edge and sitting out
+    # scores below the pool median.
+    thin_margin = (v - price) / price < 0.35
     margin = knobs.pers_buy_margin if thin_margin else knobs.pers_buy_margin_wide
-    return {"decision": "yes" if p_high * v > price * (1.0 + margin) else "no"}
+    if p_high * v + (1.0 - p_high) * (ps.u or 0.0) > price * (1.0 + margin):
+        return {"decision": "yes"}
+
+    if polarity == "pos" and _probe_is_worth_it(view, ps, knobs, post, p_high):
+        return {"decision": "yes"}
+    return {"decision": "no"}
 
 
 # ----------------------------------------------------------------- dispatch
@@ -236,8 +307,10 @@ def decide(view: GameView, knobs: Knobs) -> dict:
     if view.action_type == "seller_message":
         recommend = _seller_wants_to_recommend(view, ps, knobs)
         if llm_client.llm_available(knobs):
+            # NOTE: quality is deliberately NOT passed — see the docstring of
+            # persuasion_seller_message. The signal is the only input.
             text = llm_messages.persuasion_seller_message(
-                recommend, ps.current_quality == "high", view.round, _history_summary(view)
+                recommend, view.round, _history_summary(view), _honest_rounds(view)
             )
             # The generated pitch must READ as the intended signal under the
             # same keyword heuristics opponents (and our own lie accounting)
@@ -245,7 +318,7 @@ def decide(view: GameView, knobs: Knobs) -> dict:
             # classifies as an anti-recommendation. Mismatch -> template.
             if text and _msg_polarity(text) == ("pos" if recommend else "neg"):
                 return {"message": text}
-        return {"message": _seller_message(recommend, ps.current_quality)}
+        return {"message": _seller_message(recommend, view)}
 
     if view.action_type == "seller_recommendation":
         recommend = _seller_wants_to_recommend(view, ps, knobs)

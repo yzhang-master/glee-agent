@@ -72,9 +72,16 @@ class Knobs:
     pers_buy_margin_wide: float = -0.05  # tolerance on WIDE margins (headroom >= 0.5): field
                                          # buyers profit at the knife-edge; a passive 0 sits
                                          # below the pool median, so accept slight prior slack
-    pers_thin_explore: bool = False      # allow UCB exploration on THIN margins when p >= 0.5:
-                                         # dataset sellers lie less than KG-max, so following
-                                         # credible recs there is +EV — A/B before promoting
+    pers_prior_lie: float = 0.25         # prior P(recommend | low) before we observe anything.
+                                         # MEASURED from ~900k live rounds of field sellers:
+                                         # implied lie rate 0.26 (p=1/3), 0.29 (p=0.5), 0.19
+                                         # (p=0.8) -- the field lies well BELOW the KG-rational
+                                         # x*, so anchoring the prior on x* starts us far too
+                                         # cynical and we refuse profitable recommendations.
+    pers_forget: float = 0.9             # per-round decay on old observations (seller behaviour
+                                         # shifts: trust repair early, pooling at the horizon)
+    pers_probe_budget: float = 0.15      # max share of max-attainable surplus spent on
+                                         # information-gathering (losing) purchases
 
     # LLM layer
     llm_enabled: bool = True

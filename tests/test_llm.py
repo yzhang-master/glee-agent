@@ -40,7 +40,7 @@ def test_persuasion_falls_back_to_template_on_none(monkeypatch):
     monkeypatch.setattr(client, "complete", lambda *a, **k: None)
     view = parse_game(persuasion_game(actor="seller", quality="high"))
     action = persuasion.decide(view, KNOBS)
-    assert action["message"] == persuasion._seller_message(True, "high")
+    assert action["message"] == persuasion._seller_message(True, view)
 
 
 def test_persuasion_uses_llm_text(monkeypatch):
@@ -57,7 +57,7 @@ def test_persuasion_llm_disabled_by_knob(monkeypatch):
     view = parse_game(persuasion_game(actor="seller", quality="high"))
     action = persuasion.decide(view, knobs)
     assert not called
-    assert action["message"] == persuasion._seller_message(True, "high")
+    assert action["message"] == persuasion._seller_message(True, view)
 
 
 def test_persuasion_binary_mode_never_calls_llm(monkeypatch):
@@ -206,11 +206,10 @@ def _capture_complete(monkeypatch):
     return captured
 
 
-def test_bluff_prompt_never_mentions_quality(monkeypatch):
+def test_recommend_prompt_never_mentions_quality(monkeypatch):
     captured = _capture_complete(monkeypatch)
     out = messages.persuasion_seller_message(
         recommend=True,
-        quality_known_high=False,
         round_=5,
         history_summary="r2:rec/buy-lo r3:rec/pass-lo r4:norec/pass-hi",
     )
@@ -219,6 +218,39 @@ def test_bluff_prompt_never_mentions_quality(monkeypatch):
     assert "low" not in blob
     assert "quality is" not in blob
     assert "quality" not in blob
+
+
+def test_seller_message_generator_cannot_separate_on_quality():
+    """The signalling invariant: quality must not be an input at all.
+
+    If the wording of a recommendation could depend on the product's quality,
+    the buyer separates lies from honest recommendations by text alone and the
+    mixing scheme carries zero information.
+    """
+    import inspect
+
+    params = inspect.signature(messages.persuasion_seller_message).parameters
+    assert "quality" not in " ".join(params)
+
+
+def test_templates_identical_across_quality():
+    """Same signal + same game/round -> byte-identical template, whatever the
+    product's quality is."""
+    from glee_agent.schema import parse_game
+
+    hi = parse_game(persuasion_game(actor="seller", quality="high"))
+    lo = parse_game(persuasion_game(actor="seller", quality="low"))
+    assert persuasion._seller_message(True, hi) == persuasion._seller_message(True, lo)
+    assert persuasion._seller_message(False, hi) == persuasion._seller_message(False, lo)
+
+
+def test_every_recommend_template_reads_positive():
+    """Both pools must classify as their intended signal under the same
+    keyword heuristic opponents use, or our own lie accounting misreads it."""
+    for t in persuasion._RECOMMEND_TEMPLATES:
+        assert persuasion._msg_polarity(t) == "pos", t
+    for t in persuasion._PASS_TEMPLATES:
+        assert persuasion._msg_polarity(t) == "neg", t
 
 
 def test_history_summary_encodes_quality_without_the_word_low():

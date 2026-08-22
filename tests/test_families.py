@@ -323,16 +323,33 @@ class TestPersuasion:
         action = run(persuasion, game)
         assert action["decision"] == "no"
 
-    def test_buyer_learns_from_history(self):
-        # Seller recommended and delivered high 6 times: trust recommendation.
+    def test_thin_config_refuses_even_after_a_lucky_run(self):
+        """v = 1.2 x price at p = 0.3 needs a >91%-honest seller (x* = 0.086),
+        and the field averages ~75% honest — so passing is correct here.
+
+        The six high-quality purchases are NOT evidence of honesty: a liar
+        also recommends every high product, so P(recommend, high | x) = p is
+        independent of the lie rate. Only a low-quality sale, or the seller
+        declining to recommend, moves the posterior.
+        """
         history = [
             {"round": i, "seller_message": "Great product!", "buyer_decision": "yes",
              "bought": True, "quality": "high", "seller_payoff": 100, "buyer_payoff": 20}
             for i in range(1, 7)
         ]
         game = persuasion_game(actor="buyer", game_state={"p": 0.3, "history": history, "round": 7})
-        action = run(persuasion, game)
-        assert action["decision"] == "yes"
+        assert run(persuasion, game)["decision"] == "no"
+
+    def test_wide_config_buys_on_the_same_history(self):
+        """Same history, v = 2.5 x price: now the prior alone clears the bar."""
+        history = [
+            {"round": i, "seller_message": "Great product!", "buyer_decision": "yes",
+             "bought": True, "quality": "high", "seller_payoff": 100, "buyer_payoff": 150}
+            for i in range(1, 7)
+        ]
+        game = persuasion_game(actor="buyer", game_state={
+            "p": 0.3, "v": 250.0, "history": history, "round": 7})
+        assert run(persuasion, game)["decision"] == "yes"
 
     def test_seller_trust_repair_after_passes(self):
         # Buyer stopped buying: seller must go honest on a low product.
@@ -354,7 +371,7 @@ class TestPersuasionStopLoss:
         # v=12000, price=10000: needs >83% honesty to profit — thin margin.
         from fixtures import persuasion_game
         base = {"p": 0.5, "v": 12000.0, "product_price": 10000.0,
-                "total_rounds": 20, "round": 3}
+                "total_rounds": 20, "round": 3, "history": []}
         base.update(state)
         return persuasion_game(actor="buyer", game_state=base)
 
@@ -364,15 +381,41 @@ class TestPersuasionStopLoss:
         action = run(persuasion, game)
         assert action["decision"] == "no"
 
-    def test_no_explore_after_losses(self):
-        # Wide margin but game already under water: exploration off.
-        game = self._thin_game(v=30000.0, p=0.2, buyer_total_payoff=-10000.0)
-        history = [{"round": 1, "seller_message": "Great!", "buyer_decision": "yes",
-                    "bought": True, "quality": "low", "buyer_payoff": -10000}]
-        game["game_state"]["history"] = history
-        action = run(persuasion, game)
-        # p=0.2 prior EV=6000 < 10000, and stop-loss blocks the UCB boost.
-        assert action["decision"] == "no"
+    def test_buying_shuts_off_against_a_persistent_liar(self):
+        """Evidence, not a fixed budget, is what stops us.
+
+        p=0.2, v=3x price: x* = 0.5, so a recommendation is genuinely
+        ambiguous at the prior and a few probe buys are the price of the
+        information. What matters is that the posterior closes the tap and
+        keeps it closed once the seller has proved dishonest.
+        """
+        decisions, history = [], []
+        for r in range(1, 9):
+            game = self._thin_game(v=30000.0, p=0.2, round=r,
+                                   history=list(history))
+            game["game_state"]["seller_message"] = "Great product!"
+            d = run(persuasion, game)["decision"]
+            decisions.append(d)
+            history.append({"round": r, "seller_message": "Great product!",
+                            "buyer_decision": d, "bought": d == "yes",
+                            "quality": "low",
+                            "buyer_payoff": -10000 if d == "yes" else 0})
+        assert decisions[-4:] == ["no"] * 4, decisions
+        assert decisions.count("yes") <= 4, decisions
+
+    def test_keeps_buying_from_an_honest_seller(self):
+        """The mirror: an honest seller must not be starved out."""
+        history = []
+        for r in range(1, 7):
+            rec = r % 2 == 1
+            msg = "I recommend it" if rec else "pass on this one"
+            history.append({"round": r, "seller_message": msg,
+                            "buyer_decision": "yes" if rec else "no",
+                            "bought": rec, "quality": "high" if rec else "low"})
+        game = persuasion_game(actor="buyer", game_state={
+            "p": 0.5, "v": 250.0, "product_price": 100.0, "total_rounds": 20,
+            "round": 7, "history": history, "seller_message": "I recommend it"})
+        assert run(persuasion, game)["decision"] == "yes"
 
     def test_profitable_prior_still_buys(self):
         game = self._thin_game(v=25000.0, p=0.5)  # EV 12500 > 10000
@@ -426,21 +469,47 @@ class TestPersuasionNeutralMessages:
         action = run(persuasion, game)
         assert action["decision"] == "yes"
 
-    def test_thin_explore_knob_enables_rec_following(self):
+    def test_buyer_learns_lie_rate_without_ever_buying(self):
+        """The core fix: a buyer who never buys still learns from the seller's
+        recommendation FREQUENCY. Previously this state was absorbing — the
+        tracker only updated on purchases, so 41% of buyer games ended at 0."""
         from fixtures import persuasion_game
         from glee_agent.config import Knobs
         from glee_agent.families import persuasion as pers_mod
         from glee_agent.schema import parse_game
-        # p=0.8, v=1.25x: thin margin — default passes, knob explores the rec.
-        state = {"p": 0.8, "v": 12500.0, "product_price": 10000.0,
-                 "total_rounds": 20, "round": 2,
-                 "seller_message": "yes"}
-        game = persuasion_game(actor="buyer", game_state=state)
-        view = parse_game(game)
-        off = pers_mod.decide(view, Knobs(llm_enabled=False))
-        on = pers_mod.decide(view, Knobs(llm_enabled=False, pers_thin_explore=True))
-        assert off["decision"] == "no"
-        assert on["decision"] == "yes"
+
+        def posterior_after(messages):
+            hist = [{"round": i + 1, "seller_message": m, "buyer_decision": "no",
+                     "bought": False} for i, m in enumerate(messages)]
+            game = persuasion_game(actor="buyer", game_state={
+                "p": 0.5, "v": 250.0, "product_price": 100.0, "total_rounds": 20,
+                "round": len(messages) + 1, "history": hist,
+                "seller_message": "I recommend this one"})
+            view = parse_game(game)
+            ps = pers_mod.parse_persuasion(view)
+            return pers_mod._buyer_posterior(view, ps, Knobs(llm_enabled=False))
+
+        honest = posterior_after(["I recommend it", "pass on this one"] * 5)
+        liar = posterior_after(["I recommend it"] * 10)
+        # Zero purchases in both, yet the frequency channel separates them.
+        assert liar.mean_x > honest.mean_x + 0.25
+        assert honest.p_high_given(True) > liar.p_high_given(True) + 0.15
+
+    def test_buyer_ignores_message_in_final_round(self):
+        """No future punishment exists at T, so a payoff-maximising seller
+        recommends everything and the message is uninformative: fall back to
+        the prior."""
+        from fixtures import persuasion_game
+        from glee_agent.config import Knobs
+        from glee_agent.families import persuasion as pers_mod
+        from glee_agent.schema import parse_game
+        # p=0.5, v=250, price=100 -> prior EV = 125 > 100, so buy regardless
+        # of a hostile-looking message.
+        game = persuasion_game(actor="buyer", game_state={
+            "p": 0.5, "v": 250.0, "product_price": 100.0,
+            "total_rounds": 20, "round": 20,
+            "seller_message": "honestly, skip this one"})
+        assert pers_mod.decide(parse_game(game), Knobs(llm_enabled=False))["decision"] == "yes"
 
 
 class TestNegotiationStalemate:
