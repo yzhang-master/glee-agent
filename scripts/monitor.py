@@ -268,9 +268,41 @@ def _volume_section(conn: sqlite3.Connection, agent: str | None, now: float) -> 
     return lines
 
 
+
+AUTH_MARKERS = ("Invalid API key", "[401]", "[403]")
+RUN_LOG_DIR = Path(__file__).resolve().parents[1] / "logs"
+
+
+def _auth_alarm(agent: str | None) -> list[str]:
+    """Surface a dead API key immediately.
+
+    An agent whose key stops authenticating crash-loops silently: the tmux
+    wrapper retries, the log fills with 401s, and nothing else notices until
+    someone runs a manual check. That has cost us two outages, so the health
+    section reads the tail of each run log directly rather than the DB (a
+    non-authenticating agent writes no turns at all, so the DB cannot see it).
+    """
+    labels = [agent] if agent else ["main", "test_a", "test_b", "test_c", "test_d"]
+    out = []
+    for label in labels:
+        path = RUN_LOG_DIR / f"run-{label}.log"
+        try:
+            with open(path, "rb") as fh:
+                fh.seek(0, 2)
+                fh.seek(max(0, fh.tell() - 20000))
+                tail = fh.read().decode("utf-8", "replace")
+        except OSError:
+            continue
+        recent = tail.splitlines()[-60:]
+        if any(any(m in line for m in AUTH_MARKERS) for line in recent):
+            out.append(f"  !! AUTH FAILURE   {label}: key rejected -- agent is NOT playing")
+    return out or ["  auth               all keys authenticating"]
+
+
 def _health_section(conn: sqlite3.Connection, agent: str | None, now: float) -> list[str]:
     cutoff = now - 24 * 3600.0
     lines = ["Health"]
+    lines.extend(_auth_alarm(agent))
     try:
         total, last24 = _invalid_counts(conn, agent, cutoff)
         lines.append(f"  invalid moves      total {total}, last 24h {last24}")
