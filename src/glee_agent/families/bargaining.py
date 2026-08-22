@@ -19,6 +19,8 @@ Regimes (patience edge e = my_delta - opp_delta_est):
 
 from __future__ import annotations
 
+import hashlib
+
 from ..config import Knobs
 from ..llm import client as llm_client
 from ..llm import messages as llm_messages
@@ -364,6 +366,43 @@ def _final_round_share(view: GameView, knobs: Knobs, adj: dict) -> float:
     return 1.0 - give
 
 
+# Offer messages. Deterministic, zero-cost, and written in the register the
+# literature actually validates: explicit concession accounting ("I've moved,
+# you haven't"), a stated reason, and firm commitment language late. Hedged or
+# analytic phrasing measurably does not move an LLM opponent; declarative
+# commitment does. We never READ the opponent's text — reading it lowers
+# surplus for every model tested — so this is a write-only channel.
+_BARG_OPEN = (
+    "This split reflects what each round of delay costs us — I'd rather close now than shrink the pot for both of us.",
+    "Here's my opening: the sooner we agree, the more there is to divide. Delay only burns value.",
+)
+_BARG_HOLD = (
+    "I've already moved toward you and you've held still. This is where I am until I see movement back.",
+    "My position hasn't changed because yours hasn't. Meet me and I'll meet you.",
+)
+_BARG_CONCEDE = (
+    "I've come down again — that's another move on my part. We're close now; let's not burn the pot arguing over the rest.",
+    "That's me moving toward you a second time. Take it and we both stop losing value to delay.",
+)
+_BARG_FINAL = (
+    "This is my final offer. Rejecting it leaves us both with nothing, and I'd rather we both walked away with something.",
+    "Last round — this is my limit. Accepting beats the zero we both get otherwise.",
+)
+
+
+def _barg_message(view: GameView, share: float, conceded: bool, left: int | None) -> str:
+    if left is not None and left <= 1:
+        pool = _BARG_FINAL
+    elif view.round <= 1:
+        pool = _BARG_OPEN
+    elif conceded:
+        pool = _BARG_CONCEDE
+    else:
+        pool = _BARG_HOLD
+    seed = f"bmsg:{view.game_id}:{view.round}".encode()
+    return pool[int.from_bytes(hashlib.sha256(seed).digest()[:8], "big") % len(pool)]
+
+
 def decide(view: GameView, knobs: Knobs) -> dict:
     b = parse_bargaining(view)
     mine_key, opp_key = _gain_names(view)
@@ -408,13 +447,16 @@ def decide(view: GameView, knobs: Knobs) -> dict:
             my_gain = round(my_gain / 10) * 10
         my_gain = min(max(my_gain, 0.0), pot)
         out = {mine_key: my_gain, opp_key: pot - my_gain}
-        if view.messages_allowed and llm_client.llm_available(knobs):
-            share_pct = int(round(100.0 * my_gain / pot)) if pot > 0 else 50
-            msg = llm_messages.bargaining_offer_message(
-                share_pct, view.round, view.opponent_type == "human"
-            )
-            if msg:
-                out["message"] = msg
+        if view.messages_allowed:
+            my_last = _my_last_offer_share(view, b)
+            conceded = my_last is not None and share < my_last - 1e-9
+            msg = None
+            if llm_client.llm_available(knobs):
+                share_pct = int(round(100.0 * my_gain / pot)) if pot > 0 else 50
+                msg = llm_messages.bargaining_offer_message(
+                    share_pct, view.round, view.opponent_type == "human"
+                )
+            out["message"] = msg or _barg_message(view, share, conceded, left)
         return out
 
     # Decision phase.

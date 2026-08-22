@@ -81,11 +81,34 @@ def test_bargaining_offer_message_attached(monkeypatch):
     assert action["alice_gain"] + action["bob_gain"] == pytest.approx(1000)
 
 
-def test_bargaining_offer_no_message_on_none(monkeypatch):
+def test_bargaining_falls_back_to_template_message(monkeypatch):
+    """With no LLM we must still USE the message channel.
+
+    Messages are allowed in ~50% of games; going silent there forfeits the
+    channel entirely. The template is deterministic and costs nothing, so it
+    is the floor, not an optional extra.
+    """
     monkeypatch.setattr(client, "complete", lambda *a, **k: None)
     view = parse_game(bargaining_game())
     action = bargaining.decide(view, KNOBS)
-    assert "message" not in action
+    assert action["message"]
+    assert action["alice_gain"] + action["bob_gain"] == pytest.approx(1000)
+
+
+def test_messages_never_alter_the_numbers(monkeypatch):
+    """The message layer is write-only and must not move a price or a split."""
+    monkeypatch.setattr(client, "complete", lambda *a, **k: None)
+    from glee_agent.config import Knobs as _K
+    for game in (bargaining_game(), bargaining_game(game_state={"messages_allowed": False})):
+        v = parse_game(game)
+        with_msg = bargaining.decide(v, KNOBS)
+        without = bargaining.decide(v, _K(llm_enabled=False))
+        assert with_msg["alice_gain"] == pytest.approx(without["alice_gain"])
+    for game in (negotiation_game(), negotiation_game(game_state={"messages_allowed": False})):
+        v = parse_game(game)
+        a = negotiation.decide(v, KNOBS)
+        b = negotiation.decide(v, _K(llm_enabled=False))
+        assert a["product_price"] == pytest.approx(b["product_price"])
 
 
 def test_bargaining_no_message_when_messages_not_allowed(monkeypatch):

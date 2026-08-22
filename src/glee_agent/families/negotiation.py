@@ -6,6 +6,8 @@ Prices are absolute; my payoff = price - value (seller) or value - price (buyer)
 
 from __future__ import annotations
 
+import hashlib
+
 from ..config import Knobs
 from ..llm import client as llm_client
 from ..llm import messages as llm_messages
@@ -320,6 +322,43 @@ def _optimized_price(view: GameView, n, knobs: Knobs, target_price: float) -> fl
     return best_price
 
 
+_NEG_OPEN = (
+    "This price reflects what the item is worth to me; I have room to talk but not much.",
+    "That's my opening number. I'd rather settle quickly than grind through rounds.",
+)
+_NEG_HOLD = (
+    "I've moved and you haven't. My number stands until yours does.",
+    "You're asking me to bid against myself. Show me movement and I'll respond in kind.",
+)
+_NEG_CONCEDE = (
+    "I've come down again — that's another concession from me. We're close; let's finish it.",
+    "That's a real move toward you. I've got very little left to give.",
+)
+_NEG_FINAL = (
+    "This is my final price. It beats the nothing we both get if we don't close.",
+    "Last offer — this is my limit, and I'd rather we both walked away with something.",
+)
+
+
+def _neg_message(view: GameView, price: float, conceded: bool) -> str:
+    """Deterministic, zero-cost offer text in the validated register.
+
+    Write-only: we never parse the opponent's prose, because reading it is
+    measured to LOWER surplus for every model tested.
+    """
+    left = _rounds_left(view)
+    if left is not None and left <= 1:
+        pool = _NEG_FINAL
+    elif view.round <= 1:
+        pool = _NEG_OPEN
+    elif conceded:
+        pool = _NEG_CONCEDE
+    else:
+        pool = _NEG_HOLD
+    seed = f"nmsg:{view.game_id}:{view.round}".encode()
+    return pool[int.from_bytes(hashlib.sha256(seed).digest()[:8], "big") % len(pool)]
+
+
 def decide(view: GameView, knobs: Knobs) -> dict:
     n = parse_negotiation(view)
     value = n.my_value if n.my_value is not None else 100.0
@@ -343,12 +382,18 @@ def decide(view: GameView, knobs: Knobs) -> dict:
             price = _reciprocal_cap(view, n, knobs, price, anchor, floor)
         price = _feasible_price(price, n)
         out = {"product_price": round(max(price, 0.0), 2)}
-        if view.messages_allowed and llm_client.llm_available(knobs):
-            msg = llm_messages.negotiation_offer_message(
-                n.my_role, out["product_price"], view.round
+        if view.messages_allowed:
+            mine = _my_offer_prices(view)
+            conceded = bool(mine) and (
+                out["product_price"] < mine[-1] - 1e-9 if n.my_role == "seller"
+                else out["product_price"] > mine[-1] + 1e-9
             )
-            if msg:
-                out["message"] = msg
+            msg = None
+            if llm_client.llm_available(knobs):
+                msg = llm_messages.negotiation_offer_message(
+                    n.my_role, out["product_price"], view.round
+                )
+            out["message"] = msg or _neg_message(view, out["product_price"], conceded)
         return out
 
     # Decision phase.
@@ -436,10 +481,16 @@ def decide(view: GameView, knobs: Knobs) -> dict:
         counter = max(counter, best) if n.my_role == "seller" else min(counter, best)
     counter = _feasible_price(counter, n)
     out = {"decision": "RejectOffer", "product_price": round(max(counter, 0.0), 2)}
-    if view.messages_allowed and llm_client.llm_available(knobs):
-        msg = llm_messages.negotiation_offer_message(
-            n.my_role, out["product_price"], view.round
+    if view.messages_allowed:
+        mine = _my_offer_prices(view)
+        conceded = bool(mine) and (
+            out["product_price"] < mine[-1] - 1e-9 if n.my_role == "seller"
+            else out["product_price"] > mine[-1] + 1e-9
         )
-        if msg:
-            out["message"] = msg
+        msg = None
+        if llm_client.llm_available(knobs):
+            msg = llm_messages.negotiation_offer_message(
+                n.my_role, out["product_price"], view.round
+            )
+        out["message"] = msg or _neg_message(view, out["product_price"], conceded)
     return out
