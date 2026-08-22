@@ -132,7 +132,7 @@ def _fixture_data() -> dict:
 def tfix(tmp_path):
     path = tmp_path / "targets.json"
     path.write_text(json.dumps(_fixture_data()))
-    t = T.load_targets(path)
+    t = T.load_targets(path, live=False)
     T.set_targets(t)
     return t
 
@@ -141,7 +141,7 @@ def tfix(tmp_path):
 
 class TestLoading:
     def test_missing_file_gives_null(self, tmp_path):
-        t = T.load_targets(tmp_path / "nope.json")
+        t = T.load_targets(tmp_path / "nope.json", live=False)
         assert t.is_null
         assert t.payoff_quantile("bargaining", "cfgA", "player_1", 0.5) is None
         assert t.payoff_percentile("bargaining", "cfgA", "player_1", 100) is None
@@ -152,7 +152,7 @@ class TestLoading:
     def test_corrupt_file_gives_null(self, tmp_path):
         path = tmp_path / "targets.json"
         path.write_text("{not json!!")
-        t = T.load_targets(path)
+        t = T.load_targets(path, live=False)
         assert t.is_null
 
     def test_get_targets_never_raises(self, tmp_path, monkeypatch):
@@ -343,3 +343,42 @@ class TestDecideIntegration:
         assert negotiation.decide(view, KNOBS)["product_price"] == pytest.approx(141.95, abs=0.01)
         T.set_targets(T.Targets.null())
         assert negotiation.decide(view, KNOBS)["product_price"] == pytest.approx(125.5, abs=0.01)
+
+
+class TestLiveOverlay:
+    """The live overlay corrects a dataset key that is 2-24x optimistic about
+    this field. It must never widen a lookup's blast radius: thin live cells
+    are ignored, and a missing/corrupt live file leaves the prior untouched."""
+
+    def _base(self, tmp_path):
+        p = tmp_path / "targets.json"
+        p.write_text(json.dumps(_fixture_data()))
+        return p
+
+    def test_missing_live_file_leaves_dataset_intact(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(T, "LIVE_PATH", tmp_path / "absent.json")
+        t = T.load_targets(self._base(tmp_path), live=True)
+        assert t.barg_accept_prob(0.4, 5, False) is not None
+
+    def test_corrupt_live_file_leaves_dataset_intact(self, tmp_path, monkeypatch):
+        bad = tmp_path / "live.json"
+        bad.write_text("{not json")
+        monkeypatch.setattr(T, "LIVE_PATH", bad)
+        t = T.load_targets(self._base(tmp_path), live=True)
+        assert t.barg_accept_prob(0.4, 5, False) is not None
+
+    def test_well_sampled_live_bucket_overrides(self, tmp_path, monkeypatch):
+        key = T._dumps({"share_bucket": 0.4, "rounds_left_bucket": "4+", "human": False})
+        live = tmp_path / "live.json"
+        live.write_text(json.dumps({"barg_accept": {key: [5000, 50]}}))
+        monkeypatch.setattr(T, "LIVE_PATH", live)
+        t = T.load_targets(self._base(tmp_path), live=True)
+        assert t.barg_accept_prob(0.4, 5, False) == pytest.approx(50 / 5000)
+
+    def test_thin_live_bucket_is_ignored(self, tmp_path, monkeypatch):
+        key = T._dumps({"share_bucket": 0.4, "rounds_left_bucket": "4+", "human": False})
+        live = tmp_path / "live.json"
+        live.write_text(json.dumps({"barg_accept": {key: [5, 0]}}))
+        monkeypatch.setattr(T, "LIVE_PATH", live)
+        t = T.load_targets(self._base(tmp_path), live=True)
+        assert t.barg_accept_prob(0.4, 5, False) != pytest.approx(0.0)
