@@ -708,3 +708,34 @@ class TestNegotiationInvariants:
         act = negotiation.decide(parse_game(g), Knobs(llm_enabled=False))
         if act["decision"] == "RejectOffer":
             assert act["product_price"] >= 175.0
+
+
+class TestBargainingWalkback:
+    """A share the opponent has already offered is conceded ground."""
+
+    @staticmethod
+    def _hist(shares_to_me, pot=1000):
+        out = []
+        for i, s in enumerate(shares_to_me, start=1):
+            out.append({"round": i, "proposer": "player_2", "decision": "reject",
+                        "offer": {"player_1_gain": pot * s,
+                                  "player_2_gain": pot * (1 - s), "message": None}})
+        return out
+
+    def test_never_offers_self_less_than_they_already_gave(self):
+        game = bargaining_game(game_state={
+            "round": 5, "delta_1": 0.95, "delta_2": 0.95,
+            "history": self._hist([0.30, 0.62])})
+        act = run(bargaining, game)
+        assert act["alice_gain"] >= 620.0 - 1e-6
+
+    def test_rejects_an_offer_worse_than_their_own_best(self):
+        game = bargaining_decision(my_gain=400, opp_gain=600, game_state={
+            "round": 5, "delta_1": 0.95, "delta_2": 0.95,
+            "history": self._hist([0.30, 0.62])})
+        assert run(bargaining, game)["decision"] == "reject"
+
+    def test_final_round_still_accepts_anything(self):
+        game = bargaining_decision(my_gain=10, opp_gain=990, game_state={
+            "round": 10, "history": self._hist([0.62])})
+        assert run(bargaining, game)["decision"] == "accept"

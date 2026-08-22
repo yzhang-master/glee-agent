@@ -170,6 +170,17 @@ def _offer_shares_by(view: GameView, b, proposer: str) -> list[float]:
     return shares
 
 
+def _opp_best_share_to_me(view: GameView, b) -> float | None:
+    """The largest share the opponent has ever offered me.
+
+    Walkback resistance: a share they have already put on the table is
+    conceded ground. Countering below it hands surplus back, and accepting
+    below it takes less than they have already shown they will give.
+    """
+    shares = _offer_shares_by(view, b, view.opp_player)
+    return max(shares) if shares else None
+
+
 def _my_last_offer_share(view: GameView, b) -> float | None:
     shares = _offer_shares_by(view, b, view.your_player)
     return shares[-1] if shares else None
@@ -440,6 +451,12 @@ def decide(view: GameView, knobs: Knobs) -> dict:
             cap = _endgame_cap(view, b, knobs)
             if cap is not None:
                 share = min(share, cap)
+            # Walkback resistance: never propose myself LESS than the
+            # opponent has already offered me — that share is conceded
+            # ground and giving it back is pure loss.
+            banked = _opp_best_share_to_me(view, b)
+            if banked is not None:
+                share = max(share, min(banked, 0.95))
 
         my_gain = pot * share
         # Humans accept clean numbers more readily.
@@ -532,6 +549,14 @@ def decide(view: GameView, knobs: Knobs) -> dict:
         opp_proposes_last = (view.max_rounds - view.round) % 2 == 0
         if opp_proposes_last and offered_share >= 0.35:
             return {"decision": "accept"}
+
+    # Walkback resistance: they have already offered me more than this, so
+    # taking less is strictly worse than re-proposing what they themselves
+    # put on the table. (The final-round branch above still accepts anything,
+    # so this can never turn a closable game into a no-deal.)
+    banked = _opp_best_share_to_me(view, b)
+    if banked is not None and offered_share < banked - 1e-9:
+        return {"decision": "reject"}
 
     cont = _continuation_value(view, b, knobs)
     # Accept when the offer beats waiting (small tolerance avoids knife-edge
