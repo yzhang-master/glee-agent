@@ -46,6 +46,12 @@ class Knobs:
     barg_patience_edge: float = 0.04     # |my_delta - opp_delta| >= this splits the regimes
     barg_adv_hold: float = 0.75          # advantage-regime acceptance threshold cap
     barg_dis_accept: float = 0.48        # disadvantage regime: accept any share >= this
+    barg_dis_anchor: float = 0.58        # disadvantage regime opening share. Our pot melts
+                                         # faster than theirs, so the whole point is to CLOSE:
+                                         # measured live, our 0.575 offers here are accepted
+                                         # 10.3% of the time and the regime realizes only
+                                         # 0.325 of pot. Pricing to close should beat pricing
+                                         # to win -- under test on an arm.
     barg_drip: float = 0.01              # max unreciprocated concession per offer (0 in advantage)
 
     # Negotiation

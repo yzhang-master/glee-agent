@@ -239,7 +239,7 @@ def _schedule(view: GameView, b, knobs: Knobs) -> tuple[str, float, float]:
         opt_floor = hold
     elif regime == DISADVANTAGE:
         # My pot melts faster than theirs: anchor low and close fast.
-        anchor = min(max(0.58 + adj["floor"] + adj["anchor"], 0.50), 0.65)
+        anchor = min(max(knobs.barg_dis_anchor + adj["floor"] + adj["anchor"], 0.40), 0.65)
         target = min(target, anchor)
         opt_floor = knobs.barg_dis_accept
     else:

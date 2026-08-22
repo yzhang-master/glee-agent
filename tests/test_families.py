@@ -739,3 +739,13 @@ class TestBargainingWalkback:
         game = bargaining_decision(my_gain=10, opp_gain=990, game_state={
             "round": 10, "history": self._hist([0.62])})
         assert run(bargaining, game)["decision"] == "accept"
+
+
+class TestBargainingDisadvantageAnchor:
+    def test_dis_anchor_knob_moves_the_opening(self):
+        game = bargaining_game(game_state={"delta_1": 0.8, "delta_2": 1.0})
+        from glee_agent.schema import parse_game as _pg
+        hi = bargaining.decide(_pg(game), Knobs(llm_enabled=False, barg_dis_anchor=0.58))
+        lo = bargaining.decide(_pg(game), Knobs(llm_enabled=False, barg_dis_anchor=0.50))
+        assert hi["alice_gain"] == pytest.approx(580.0)
+        assert lo["alice_gain"] == pytest.approx(500.0)
