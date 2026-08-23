@@ -78,6 +78,23 @@ def _bounded_adj(x: float) -> float:
     return min(max(abs(x), 0.02), 0.10)
 
 
+def _book_accept_shift(view: GameView, knobs: Knobs) -> float:
+    """How much HIGHER a bar this opponent must clear before we accept.
+
+    Positive against names that have been taking more than half the pie from
+    us. Bounded and sample-gated exactly like the anchor version.
+    """
+    if knobs.barg_book_accept_gain <= 0:
+        return 0.0
+    entry = opponents.book_entry(view.opponent_name, "bargaining")
+    if not entry or entry.get("n", 0) < knobs.barg_book_min_n:
+        return 0.0
+    share = entry.get("share")
+    if not isinstance(share, (int, float)):
+        return 0.0
+    return max(min((0.5 - float(share)) * knobs.barg_book_accept_gain, 0.08), 0.0)
+
+
 def _book_adjust(view: GameView, knobs: Knobs) -> float:
     """Anchor shift from our measured head-to-head record vs THIS opponent.
 
@@ -563,8 +580,13 @@ def decide(view: GameView, knobs: Knobs) -> dict:
         return {"decision": "accept"}
 
     # An offer this good is already top-of-field under percentile scoring;
-    # take the sure thing over a risky squeeze.
-    if offered_share >= knobs.barg_accept_great:
+    # take the sure thing over a risky squeeze. This is the rule that actually
+    # decides most bargaining games: the continuation comparison below sits at
+    # 0.69-0.73 in typical configs, above this bar, so it rarely fires. The
+    # per-opponent shift therefore belongs HERE -- against a name with a
+    # measured record of taking more than half from us, demand more before
+    # grabbing the sure thing.
+    if offered_share >= knobs.barg_accept_great + _book_accept_shift(view, knobs):
         return {"decision": "accept"}
 
     # Endgame parity: in the decision phase the current proposer is the
@@ -586,7 +608,10 @@ def decide(view: GameView, knobs: Knobs) -> dict:
 
     cont = _continuation_value(view, b, knobs)
     # Accept when the offer beats waiting (small tolerance avoids knife-edge
-    # rejections over rounding).
-    if offered_share >= cont - 0.02:
+    # rejections over rounding). Against opponents with a measured record of
+    # taking more than half from us, the bar rises: their opening lowball is
+    # the thing we have been quietly accepting.
+    bar = cont - 0.02 + _book_accept_shift(view, knobs)
+    if offered_share >= bar:
         return {"decision": "accept"}
     return {"decision": "reject"}

@@ -49,6 +49,14 @@ class Knobs:
     barg_book_gain: float = 0.0          # per-opponent anchor shift = (0.5 - our measured share
                                          # vs this name) x this. 0 = off. Our head-to-head share
                                          # spans 0.407-0.581 by opponent, ~5x any global knob
+    barg_book_accept_gain: float = 0.0   # per-opponent ACCEPT-threshold shift = (0.5 - our
+                                         # measured share vs this name) x this. The anchor
+                                         # version moved nothing: 61% of bargaining games end by
+                                         # round 2, so the binding decision is what we ACCEPT,
+                                         # not what we open with. Per-opponent skill gaps are
+                                         # real and large -- 0.16 spread even after adjusting
+                                         # for config mix -- so the lever exists; it just has to
+                                         # be applied where the outcome is actually decided
     barg_book_min_n: int = 60            # games vs a name before its record steers real money
     barg_dis_anchor: float = 0.58        # disadvantage regime opening share. Our pot melts
                                          # faster than theirs, so the whole point is to CLOSE:

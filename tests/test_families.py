@@ -830,3 +830,34 @@ class TestOpponentBook:
         assert B._book_adjust(parse_game(g), Knobs(barg_book_gain=5.0)) <= 0.10
         g2 = self._game("Pushover", monkeypatch, {"n": 900, "share": 0.99})
         assert B._book_adjust(parse_game(g2), Knobs(barg_book_gain=5.0)) >= -0.05
+
+
+class TestOpponentBookAccept:
+    def _game(self, name, monkey, entry, my_gain=400):
+        from glee_agent.theory import opponents as O
+        monkey.setattr(O, "book_entry", lambda n, f: entry if n == name else None)
+        return bargaining_decision(my_gain=my_gain, opp_gain=1000 - my_gain,
+                                   opponent={"type": "agent", "name": name})
+
+    def test_raises_the_bar_against_a_name_that_beats_us(self, monkeypatch):
+        """The shift must bite on barg_accept_great -- the rule that actually
+        decides most games. An offer of 0.66 clears the default 0.65 bar and is
+        taken; against a name that has been beating us, the bar moves to 0.73
+        and we hold out instead."""
+        g = self._game("Agent Smith", monkeypatch, {"n": 500, "share": 0.40}, my_gain=660)
+        off = bargaining.decide(parse_game(g), Knobs(llm_enabled=False))["decision"]
+        on = bargaining.decide(parse_game(g),
+                               Knobs(llm_enabled=False, barg_book_accept_gain=1.0))["decision"]
+        assert (off, on) == ("accept", "reject")
+
+    def test_no_shift_for_a_name_we_beat(self, monkeypatch):
+        from glee_agent.families import bargaining as B
+        g = self._game("Pushover", monkeypatch, {"n": 500, "share": 0.65})
+        assert B._book_accept_shift(parse_game(g), Knobs(barg_book_accept_gain=1.0)) == 0.0
+
+    def test_shift_is_bounded_and_gated(self, monkeypatch):
+        from glee_agent.families import bargaining as B
+        g = self._game("Crusher", monkeypatch, {"n": 900, "share": 0.05})
+        assert B._book_accept_shift(parse_game(g), Knobs(barg_book_accept_gain=9.0)) <= 0.08
+        thin = self._game("Newbie", monkeypatch, {"n": 5, "share": 0.05})
+        assert B._book_accept_shift(parse_game(thin), Knobs(barg_book_accept_gain=1.0)) == 0.0
