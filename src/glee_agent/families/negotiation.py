@@ -77,7 +77,12 @@ def _anchor_and_floor(n, knobs: Knobs, ultimatum: bool = False) -> tuple[float, 
             # accepted 0-0.6% of the time, while an offer leaving them ~10-20%
             # of the surplus is accepted 22%. An offer they cannot profitably
             # accept is not an aggressive offer, it is a wasted round.
-            cap = 0.98 if ultimatum else knobs.neg_ci_anchor_frac
+            # The anchor must stay ABOVE the floor, or the concession range
+            # collapses to a point and the floor knob silently stops doing
+            # anything: floors of 0.85 and 0.95 both clamped to the 0.80 cap,
+            # which turned a ladder into an accidental A/A test.
+            cap = 0.98 if ultimatum else max(knobs.neg_ci_anchor_frac, frac + 0.10)
+            cap = min(cap, 0.98)
             if n.my_role == "seller":
                 anchor = min(anchor, v + cap * surplus)
                 floor = max(floor, v + frac * surplus)

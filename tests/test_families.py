@@ -774,3 +774,24 @@ class TestNegotiationStalemateKnobs:
         act = negotiation.decide(parse_game(game),
                                  Knobs(llm_enabled=False, neg_stall_accept=8))
         assert act["decision"] == "AcceptOffer"
+
+
+class TestNegotiationFloorLadder:
+    def test_higher_floor_actually_raises_the_offer(self):
+        """Regression: the anchor cap used to clamp the floor, so every floor
+        above neg_ci_anchor_frac produced identical play."""
+        from fixtures import negotiation_game
+        from glee_agent.schema import parse_game, parse_negotiation
+        prices = []
+        for frac in (0.5, 0.7, 0.9):
+            g = negotiation_game(role="seller", game_state={
+                "complete_information": True, "round": 3,
+                "player_1_value": 100.0, "player_2_value": 200.0})
+            v = parse_game(g)
+            act = negotiation.decide(v, Knobs(llm_enabled=False, neg_ci_floor_frac=frac))
+            prices.append(act["product_price"])
+        assert prices[0] < prices[1] < prices[2], prices
+        n = parse_negotiation(parse_game(negotiation_game(role="seller", game_state={
+            "complete_information": True, "round": 3,
+            "player_1_value": 100.0, "player_2_value": 200.0})))
+        assert prices[-1] < n.opp_value        # still feasible
