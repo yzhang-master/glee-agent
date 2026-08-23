@@ -78,6 +78,32 @@ def _bounded_adj(x: float) -> float:
     return min(max(abs(x), 0.02), 0.10)
 
 
+def _book_adjust(view: GameView, knobs: Knobs) -> float:
+    """Anchor shift from our measured head-to-head record vs THIS opponent.
+
+    Scoring is opponent-adjusted, so the payoff is in beating what the field
+    gets against this specific name -- and identity is disclosed in half our
+    games. Measured over ~22k games our share ranges 0.407 to 0.581 by
+    opponent, a spread five times any global knob we have moved. The ones
+    beating us are not subtler, they anchor harder: they open by offering us
+    0.347 where the ones we beat open at 0.451. So we mirror it -- hold more
+    against names that have been taking more from us.
+
+    Bounded and sample-gated: a thin or ambiguous record moves nothing.
+    """
+    if knobs.barg_book_gain <= 0:
+        return 0.0
+    entry = opponents.book_entry(view.opponent_name, "bargaining")
+    if not entry or entry.get("n", 0) < knobs.barg_book_min_n:
+        return 0.0
+    share = entry.get("share")
+    if not isinstance(share, (int, float)):
+        return 0.0
+    # Below parity -> hold harder; above parity -> we are already winning.
+    delta = (0.5 - float(share)) * knobs.barg_book_gain
+    return max(min(delta, 0.10), -0.05)
+
+
 def _profile_adjust(view: GameView) -> dict:
     """Strategy adjustments from the opponent's behavioral profile.
 
@@ -211,7 +237,7 @@ def _schedule(view: GameView, b, knobs: Knobs) -> tuple[str, float, float]:
         # SPE can sit very high near an endgame that favors me; cap the greed —
         # real opponents reject "rational" lowballs and deadlock costs the pot.
         start, floor = knobs.barg_anchor_agent, max(knobs.barg_floor_agent, min(spe, 0.70))
-    start = max(start + adj["anchor"], 0.50)
+    start = max(start + adj["anchor"] + _book_adjust(view, knobs), 0.50)
     floor = min(max(floor + adj["floor"], 0.0), start)
 
     # Effective schedule length: horizon if known, else a virtual deadline set

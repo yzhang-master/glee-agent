@@ -127,3 +127,43 @@ def profile(name: str | None) -> dict | None:
         return merged or None
     except Exception:  # noqa: BLE001 — lookups must never raise
         return None
+
+
+BOOK_PATH = Path(__file__).resolve().parents[3] / "data" / "opponent_book.json"
+_BOOK: dict | None = None
+_BOOK_LOCK = threading.Lock()
+
+
+def _load_book(path: Path) -> dict:
+    """Per-opponent head-to-head book built by scripts/build_opponent_book.py.
+
+    Never raises: an absent or corrupt file simply yields {}.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            data = json.load(fh)
+        opp = data.get("opponents")
+        return {str(k).strip().lower(): v for k, v in opp.items()} if isinstance(opp, dict) else {}
+    except Exception as e:  # noqa: BLE001 — the book is strictly optional
+        logger.debug("opponent book unavailable (%s): %s", path, e)
+        return {}
+
+
+def book_entry(name: str | None, family: str) -> dict | None:
+    """Our measured head-to-head record against this opponent in this family."""
+    global _BOOK
+    try:
+        if not isinstance(name, str) or not name.strip():
+            return None
+        if _BOOK is None:
+            with _BOOK_LOCK:
+                if _BOOK is None:
+                    _BOOK = _load_book(BOOK_PATH)
+        rec = _BOOK.get(name.strip().lower())
+        if isinstance(rec, dict):
+            entry = rec.get(family)
+            if isinstance(entry, dict) and entry.get("n"):
+                return entry
+        return None
+    except Exception:  # noqa: BLE001
+        return None

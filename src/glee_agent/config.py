@@ -46,6 +46,10 @@ class Knobs:
     barg_patience_edge: float = 0.04     # |my_delta - opp_delta| >= this splits the regimes
     barg_adv_hold: float = 0.75          # advantage-regime acceptance threshold cap
     barg_dis_accept: float = 0.48        # disadvantage regime: accept any share >= this
+    barg_book_gain: float = 0.0          # per-opponent anchor shift = (0.5 - our measured share
+                                         # vs this name) x this. 0 = off. Our head-to-head share
+                                         # spans 0.407-0.581 by opponent, ~5x any global knob
+    barg_book_min_n: int = 60            # games vs a name before its record steers real money
     barg_dis_anchor: float = 0.58        # disadvantage regime opening share. Our pot melts
                                          # faster than theirs, so the whole point is to CLOSE:
                                          # measured live, our 0.575 offers here are accepted

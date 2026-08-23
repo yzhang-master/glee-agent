@@ -795,3 +795,38 @@ class TestNegotiationFloorLadder:
             "complete_information": True, "round": 3,
             "player_1_value": 100.0, "player_2_value": 200.0})))
         assert prices[-1] < n.opp_value        # still feasible
+
+
+class TestOpponentBook:
+    """Per-opponent anchor shift: bounded, sample-gated, off by default."""
+
+    def _game(self, name, monkey, entry):
+        from glee_agent.theory import opponents as O
+        monkey.setattr(O, "book_entry", lambda n, f: entry if n == name else None)
+        return bargaining_game(opponent={"type": "agent", "name": name})
+
+    def test_off_by_default(self, monkeypatch):
+        g = self._game("Agent Smith", monkeypatch, {"n": 500, "share": 0.40})
+        base = bargaining.decide(parse_game(g), Knobs(llm_enabled=False))
+        assert base["alice_gain"] == pytest.approx(
+            bargaining.decide(parse_game(bargaining_game()), Knobs(llm_enabled=False))["alice_gain"])
+
+    def test_holds_harder_against_a_name_that_beats_us(self, monkeypatch):
+        g = self._game("Agent Smith", monkeypatch, {"n": 500, "share": 0.40})
+        k = Knobs(llm_enabled=False, barg_book_gain=1.0)
+        tough = bargaining.decide(parse_game(g), k)
+        neutral = bargaining.decide(parse_game(bargaining_game()), k)
+        assert tough["alice_gain"] > neutral["alice_gain"]
+
+    def test_thin_record_moves_nothing(self, monkeypatch):
+        g = self._game("Newbie", monkeypatch, {"n": 5, "share": 0.40})
+        k = Knobs(llm_enabled=False, barg_book_gain=1.0)
+        assert bargaining.decide(parse_game(g), k)["alice_gain"] == pytest.approx(
+            bargaining.decide(parse_game(bargaining_game()), k)["alice_gain"])
+
+    def test_adjustment_is_bounded(self, monkeypatch):
+        from glee_agent.families import bargaining as B
+        g = self._game("Crusher", monkeypatch, {"n": 900, "share": 0.05})
+        assert B._book_adjust(parse_game(g), Knobs(barg_book_gain=5.0)) <= 0.10
+        g2 = self._game("Pushover", monkeypatch, {"n": 900, "share": 0.99})
+        assert B._book_adjust(parse_game(g2), Knobs(barg_book_gain=5.0)) >= -0.05
