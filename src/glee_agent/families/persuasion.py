@@ -89,11 +89,19 @@ def _seller_wants_to_recommend(view: GameView, ps, knobs: Knobs) -> bool:
         # max while the field ran 0.28-0.43 and earned 0.70-0.77.
         return True
     if v is None:
-        # Blind seller (buyer's valuation hidden): the KG rate is
-        # uncomputable, and the dataset field simply pools (recommends
-        # everything) — its sellers earn the pool median doing so. Guessing
-        # a rate under-sells against that pool.
-        return True
+        # Blind seller (buyer's valuation hidden) — HALF of all our seller
+        # games. The KG rate is uncomputable without v, but returning True
+        # here was doing two harmful things. It pooled unconditionally,
+        # which is the same indifference trap that cost 0.2-0.3 of max
+        # revenue in the visible thin configs; and because it returned
+        # BEFORE the trust-repair check below, a blind seller kept
+        # recommending even after the buyer had stopped buying altogether,
+        # with no path back. Trust repair now applies here too, and the rate
+        # is a knob rather than a hard-coded 1.0.
+        _, consecutive_pass, _ = _sold_lies_and_trust(view)
+        if consecutive_pass >= 2:
+            return False
+        return _det_coin(view, knobs.pers_blind_lie)
 
     haircut = (
         knobs.pers_kg_haircut_human

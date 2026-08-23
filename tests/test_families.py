@@ -900,3 +900,43 @@ class TestSellerBuyerSurplus:
             recs += P._seller_wants_to_recommend(v, parse_persuasion(v),
                                                  Knobs(llm_enabled=False))
         assert recs < 20, "still pooling on every low-quality round"
+
+
+class TestBlindSeller:
+    """v hidden is HALF our seller games. The branch used to return True
+    before trust repair, so a blind seller pooled forever with no recovery."""
+
+    def _blind(self, history, rnd):
+        g = persuasion_game(actor="seller", quality="low", game_state={
+            "p": 0.5, "product_price": 100.0, "total_rounds": 20,
+            "round": rnd, "history": history})
+        g["game_state"]["v"] = None
+        return g
+
+    def test_trust_repair_now_applies_when_v_is_hidden(self):
+        from glee_agent.families import persuasion as P
+        from glee_agent.schema import parse_game, parse_persuasion
+        hist = [{"round": r, "seller_message": "I recommend it",
+                 "buyer_decision": "no", "bought": False} for r in (1, 2, 3)]
+        v = parse_game(self._blind(hist, 4))
+        assert P._seller_wants_to_recommend(v, parse_persuasion(v),
+                                            Knobs(llm_enabled=False)) is False
+
+    def test_default_still_pools_while_the_buyer_is_buying(self):
+        from glee_agent.families import persuasion as P
+        from glee_agent.schema import parse_game, parse_persuasion
+        hist = [{"round": 1, "seller_message": "I recommend it",
+                 "buyer_decision": "yes", "bought": True, "quality": "high"}]
+        v = parse_game(self._blind(hist, 2))
+        assert P._seller_wants_to_recommend(v, parse_persuasion(v),
+                                            Knobs(llm_enabled=False)) is True
+
+    def test_knob_reduces_the_blind_lie_rate(self):
+        from glee_agent.families import persuasion as P
+        from glee_agent.schema import parse_game, parse_persuasion
+        recs = 0
+        for rnd in range(1, 21):
+            v = parse_game(self._blind([], rnd))
+            recs += P._seller_wants_to_recommend(
+                v, parse_persuasion(v), Knobs(llm_enabled=False, pers_blind_lie=0.4))
+        assert 1 <= recs <= 14, recs
