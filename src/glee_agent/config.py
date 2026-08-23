@@ -76,6 +76,15 @@ class Knobs:
                                          # speed, so a time-based schedule teaches them to wait
     neg_drip: float = 0.01               # unreciprocated concession per offer, as a fraction
                                          # of the anchor-to-floor range
+    neg_never_walk: bool = False         # unlimited-horizon: walking pays exactly 0, the same
+                                         # as running out of road, but forecloses any chance the
+                                         # opponent caves. Measured: WE initiate 64% of walkaways,
+                                         # all in unlimited games, and 73% of negotiation is
+                                         # incomplete-info where the median payoff is already 0
+    neg_stall_accept: int = 0            # unlimited-horizon: accept ANY positive profit from this
+                                         # round on (0 = use neg_max_planned_rounds+4). Under
+                                         # percentile scoring a small positive beats a zero by a
+                                         # wide margin in no-deal-heavy pools
     neg_traj_pct_gate: float = 0.0       # trajectory-accept additionally requires pool pct >= this
                                          # (0 = off; A/B arm 0.45) — blocks the round-12 Boulware
                                          # floor collapse from accepting near-reservation crumbs

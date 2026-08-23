@@ -749,3 +749,28 @@ class TestBargainingDisadvantageAnchor:
         lo = bargaining.decide(_pg(game), Knobs(llm_enabled=False, barg_dis_anchor=0.50))
         assert hi["alice_gain"] == pytest.approx(580.0)
         assert lo["alice_gain"] == pytest.approx(500.0)
+
+
+class TestNegotiationStalemateKnobs:
+    @staticmethod
+    def _marathon(offer_price, rnd):
+        from fixtures import negotiation_decision
+        g = negotiation_decision(role="buyer", offer_price=offer_price)
+        del g["game_state"]["max_rounds"]
+        g["game_state"]["horizon_known"] = False
+        g["game_state"]["round"] = rnd
+        return g
+
+    def test_never_walk_knob_keeps_countering(self):
+        game = self._marathon(150.0, 30)   # offered above our value, hopeless
+        assert run(negotiation, game)["decision"] == "WalkAway"
+        act = negotiation.decide(parse_game(game),
+                                 Knobs(llm_enabled=False, neg_never_walk=True))
+        assert act["decision"] == "RejectOffer"
+
+    def test_stall_accept_knob_closes_earlier(self):
+        game = self._marathon(95.0, 9)     # small profit on the table at round 9
+        assert run(negotiation, game)["decision"] == "RejectOffer"
+        act = negotiation.decide(parse_game(game),
+                                 Knobs(llm_enabled=False, neg_stall_accept=8))
+        assert act["decision"] == "AcceptOffer"

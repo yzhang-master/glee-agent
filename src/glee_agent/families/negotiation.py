@@ -435,10 +435,10 @@ def decide(view: GameView, knobs: Knobs) -> dict:
     # the table; if the opponent has NEVER crossed our reservation by deep
     # into the marathon, walk and free the slot.
     if view.max_rounds is None:
-        stall = knobs.neg_max_planned_rounds + 4
+        stall = knobs.neg_stall_accept or (knobs.neg_max_planned_rounds + 4)
         if view.round >= stall and payoff > 0:
             return {"decision": "AcceptOffer"}
-        if view.round >= stall + 8:
+        if not knobs.neg_never_walk and view.round >= stall + 8:
             best = _opponent_best_price(view, n)
             best_payoff = (
                 _my_payoff(n.my_role, value, best) if best is not None else None
