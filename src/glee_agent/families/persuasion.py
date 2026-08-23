@@ -14,7 +14,7 @@ from ..config import Knobs
 from ..llm import client as llm_client
 from ..llm import messages as llm_messages
 from ..schema import GameView, parse_persuasion
-from ..theory.bayes import LieRatePosterior, kg_lie_rate
+from ..theory.bayes import LieRatePosterior, kg_lie_rate, lie_rate_for_surplus
 
 POSITIVE_WORDS = ("recommend", "great", "excellent", "worth", "quality", "buy", "good", "yes")
 # Soft negatives matter: honest sellers phrase anti-recommendations as
@@ -79,9 +79,14 @@ def _seller_wants_to_recommend(view: GameView, ps, knobs: Knobs) -> bool:
     # Low quality (or unknown — treat unknown as low for safety).
     price, p = ps.price, ps.p
     v = ps.v
-    if v is not None and p * v >= price and price > 0:
-        # Buying is ex-ante profitable for the buyer: recommendations stay
-        # credible even when uninformative; recommending always maximizes sales.
+    if v is not None and price > 0 and p * v >= price * (1.0 + knobs.pers_buyer_surplus):
+        # Buying is ex-ante profitable for the buyer BY A REAL MARGIN, so
+        # recommendations stay credible even when uninformative and pooling
+        # maximises sales. The margin is essential: this test used to be
+        # `p*v >= price`, which fires at exact indifference, where a pooling
+        # seller leaves the buyer precisely zero and they stop buying. In
+        # those configs we ran a lie rate of 1.000 and earned 0.39-0.56 of
+        # max while the field ran 0.28-0.43 and earned 0.70-0.77.
         return True
     if v is None:
         # Blind seller (buyer's valuation hidden): the KG rate is
@@ -95,8 +100,14 @@ def _seller_wants_to_recommend(view: GameView, ps, knobs: Knobs) -> bool:
         if view.opponent_type == "human"
         else knobs.pers_kg_haircut
     )
+    # Cap the rate so the buyer keeps a real surplus. KG's x* is their
+    # indifference point; sitting on it earns them nothing and kills sales.
     x_star = kg_lie_rate(p, v if v is not None else price * 1.5, price)
-    x = x_star * haircut
+    x = min(
+        x_star * haircut,
+        lie_rate_for_surplus(p, v if v is not None else price * 1.5, price,
+                             knobs.pers_buyer_surplus),
+    )
 
     _, consecutive_pass, _ = _sold_lies_and_trust(view)
     if consecutive_pass >= 2:

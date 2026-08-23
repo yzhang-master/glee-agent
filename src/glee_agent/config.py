@@ -102,6 +102,13 @@ class Knobs:
                                          # floor collapse from accepting near-reservation crumbs
 
     # Persuasion
+    pers_buyer_surplus: float = 0.10     # seller: leave the buyer at least this fraction of
+                                         # price in expected surplus per purchase. KG's x* is
+                                         # the buyer's INDIFFERENCE point -- at it they earn
+                                         # exactly zero and a real buyer stops buying. Measured
+                                         # live: in configs where p*v == price our seller ran a
+                                         # lie rate of 1.000 and earned 0.39-0.56 of max, while
+                                         # the field ran 0.28-0.43 and earned 0.70-0.77
     pers_kg_haircut: float = 0.8         # multiply KG x* by this (seller lying rate safety)
     pers_kg_haircut_human: float = 0.4   # vs disclosed human buyers
     pers_explore_frac: float = 0.33      # fraction of rounds with UCB exploration (buyer)

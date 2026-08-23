@@ -861,3 +861,42 @@ class TestOpponentBookAccept:
         assert B._book_accept_shift(parse_game(g), Knobs(barg_book_accept_gain=9.0)) <= 0.08
         thin = self._game("Newbie", monkeypatch, {"n": 5, "share": 0.05})
         assert B._book_accept_shift(parse_game(thin), Knobs(barg_book_accept_gain=1.0)) == 0.0
+
+
+class TestSellerBuyerSurplus:
+    """KG's x* is the buyer's indifference point; sitting on it earns them
+    exactly zero and they stop buying. Measured live: in configs where
+    p*v == price we ran a lie rate of 1.000 and earned 0.39-0.56 of max
+    revenue while the field ran 0.28-0.43 and earned 0.70-0.77."""
+
+    def test_lie_rate_leaves_the_buyer_a_real_surplus(self):
+        from glee_agent.theory.bayes import lie_rate_for_surplus, posterior_high_given_rec
+        p, v, price, s = 0.8, 12500.0, 10000.0, 0.10
+        x = lie_rate_for_surplus(p, v, price, s)
+        q = posterior_high_given_rec(p, x)
+        assert q * v - price >= s * price - 1e-6
+
+    def test_never_exceeds_kg(self):
+        from glee_agent.theory.bayes import lie_rate_for_surplus, kg_lie_rate
+        for p, v, price in ((0.5, 20000.0, 10000.0), (0.8, 12000.0, 10000.0),
+                            (0.333, 20000.0, 10000.0)):
+            assert lie_rate_for_surplus(p, v, price, 0.10) <= kg_lie_rate(p, v, price) + 1e-9
+
+    def test_zero_when_product_cannot_clear_the_bar(self):
+        from glee_agent.theory.bayes import lie_rate_for_surplus
+        assert lie_rate_for_surplus(0.5, 10500.0, 10000.0, 0.10) == 0.0
+
+    def test_indifference_config_no_longer_pools(self):
+        """p*v == price exactly: the old short-circuit recommended every
+        round, which is what the live logs showed."""
+        from glee_agent.families import persuasion as P
+        from glee_agent.schema import parse_game, parse_persuasion
+        recs = 0
+        for rnd in range(1, 21):
+            g = persuasion_game(actor="seller", quality="low", game_state={
+                "p": 0.8, "v": 12500.0, "product_price": 10000.0,
+                "total_rounds": 20, "round": rnd})
+            v = parse_game(g)
+            recs += P._seller_wants_to_recommend(v, parse_persuasion(v),
+                                                 Knobs(llm_enabled=False))
+        assert recs < 20, "still pooling on every low-quality round"

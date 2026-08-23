@@ -152,3 +152,29 @@ class LieRatePosterior:
             return self.p_high_given(True)
         finally:
             self._logw = saved
+
+
+def lie_rate_for_surplus(p: float, v: float, price: float, surplus_frac: float) -> float:
+    """Highest lie rate that still leaves the buyer a real expected surplus.
+
+    KG's x* equalises the buyer's expected value with the price, so a buyer who
+    follows a recommendation at x* earns exactly zero. Anyone who is not
+    perfectly indifferent -- which is everyone -- stops buying. This solves
+    instead for the x at which
+
+        P(high | recommend) * v - price >= surplus_frac * price
+
+    Substituting P(high|rec) = p / (p + (1-p)x) and rearranging:
+
+        x <= p * (v - price*(1+s)) / ((1-p) * price*(1+s))
+
+    Returns 0 when even a perfectly honest seller cannot clear the bar (the
+    product is simply not worth the price at this prior), and is capped at 1.
+    """
+    if price <= 0 or p >= 1.0 or p <= 0.0:
+        return 0.0
+    target = price * (1.0 + surplus_frac)
+    if v <= target:
+        return 0.0
+    x = p * (v - target) / ((1.0 - p) * target)
+    return max(0.0, min(1.0, x))
