@@ -36,6 +36,10 @@ from glee_agent.config import Knobs  # noqa: E402
 from glee_agent.dispatcher import FAMILIES  # noqa: E402
 from glee_agent.guard import guard  # noqa: E402
 from glee_agent.schema import parse_game  # noqa: E402
+from glee_agent.theory.targets import (  # noqa: E402
+    config_key_negotiation,
+    get_targets,
+)
 
 
 # These are the champion knobs shared by all four live processes at the
@@ -108,6 +112,141 @@ EXPERIMENTS = (
         1.0,
     ),
 )
+
+
+# Frozen before reading outcomes beyond the pre-gate pilot checkpoint.  These
+# are joint estimand weights, not a value-only post-stratification: the
+# historical opportunity extraction was specifically buyer round-9 decision
+# counters in hidden-information, ten-round games.  Thus P(role=buyer)=1 and
+# the four own-value weights below sum to one.  Any seller, offer-phase, other
+# horizon, visible-opponent, or complete-information divergence is reported as
+# unsupported and is never silently renormalized into this estimand.
+_NEG_TERMINAL_REFERENCE_CELLS = (
+    {
+        "role": "buyer",
+        "own_value_grid": "80",
+        "phase": "decision",
+        "horizon": "finite",
+        "max_rounds": "10",
+        "opponent_type": "hidden",
+        "complete_information": False,
+        "weight": 481 / 1382,
+        "compatibility_rate": 0.0,
+    },
+    {
+        "role": "buyer",
+        "own_value_grid": "100",
+        "phase": "decision",
+        "horizon": "finite",
+        "max_rounds": "10",
+        "opponent_type": "hidden",
+        "complete_information": False,
+        "weight": 402 / 1382,
+        "compatibility_rate": 0.25467870697552675,
+    },
+    {
+        "role": "buyer",
+        "own_value_grid": "120",
+        "phase": "decision",
+        "horizon": "finite",
+        "max_rounds": "10",
+        "opponent_type": "hidden",
+        "complete_information": False,
+        "weight": 324 / 1382,
+        "compatibility_rate": 0.5082449941107184,
+    },
+    {
+        "role": "buyer",
+        "own_value_grid": "150",
+        "phase": "decision",
+        "horizon": "finite",
+        "max_rounds": "10",
+        "opponent_type": "hidden",
+        "complete_information": False,
+        "weight": 175 / 1382,
+        "compatibility_rate": 0.7539589059023688,
+    },
+)
+
+_NEG_TERMINAL_COMPATIBILITY_RATE = 0.28870841304554923
+_Z_ONE_SIDED_95 = 1.6448536269514722
+_Z_ONE_SIDED_90 = 1.2815515655446004
+
+NEG_TERMINAL_GATE_DESIGN = {
+    "version": "hidden-terminal-close-v1-frozen-2026-08-25",
+    "frozen_before_subsequent_outcomes": True,
+    "pilot_checkpoint": {
+        "treatment": {"direct_converted": 0, "direct_resolved": 2},
+        "control": {"direct_converted": 1, "direct_resolved": 6},
+        "used_to_tune_thresholds": False,
+        "note": (
+            "Pre-gate pilot was T 0/2 versus C 1/6; later outcomes were not "
+            "used to set gates."
+        ),
+        "analysis_window": (
+            "The report retains all strictly enrolled games from the experiment "
+            "cutoff, including the disclosed pilot."
+        ),
+    },
+    "estimand": {
+        "unit": "strictly enrolled game at first exact action-level divergence",
+        "joint_strata": [
+            "role",
+            "own_value_grid",
+            "phase",
+            "horizon",
+            "max_rounds",
+            "opponent_type",
+            "complete_information",
+        ],
+        "role_weight": {"buyer": 1.0},
+        "missing_support_policy": "report and block; never renormalize fixed weights",
+        "agent_epoch_policy": (
+            "Raw JSONL identifies agent but not process epoch; require two distinct "
+            "treatment agent labels with nonnegative standardized block uplift."
+        ),
+    },
+    "reference_cells": [dict(cell) for cell in _NEG_TERMINAL_REFERENCE_CELLS],
+    "historical_reference": {
+        "window": "24h before cutoff 1787672701",
+        "resolved": 1382,
+        "direct_converted": 103,
+        "direct_conversion_rate": 103 / 1382,
+        "recent_6h_direct_conversion_rate": 31 / 341,
+        "compatible_opportunity_rate": _NEG_TERMINAL_COMPATIBILITY_RATE,
+        "normalized_payoff_mean": 0.00606393,
+        "normalized_payoff_sd": 0.033679,
+        "payoff_percentile_mean": 0.722626,
+        "payoff_percentile_sd": 0.22869,
+    },
+    "thresholds": {
+        "promotion_sample": {"treatment": 340, "control": 1020},
+        "promotion_per_joint_cell": {"treatment": 30, "control": 90},
+        "direct_uplift_min": 0.060,
+        "direct_uplift_one_sided_95_lower_min": 0.0,
+        "normalized_payoff_noninferiority_margin": -0.005,
+        "payoff_percentile_noninferiority_margin": -0.050,
+        "treatment_agent_blocks_required": 2,
+        "compatibility_efficiency_diagnostic_target": 0.45,
+        "interim_1": {"treatment": 50, "control": 150},
+        "interim_2": {"treatment": 100, "control": 300},
+        "interim_zero_conversion_rollback": True,
+        "interim_normalized_payoff_rollback": -0.010,
+        "interim_2_treatment_direct_futility": 0.050,
+        "interim_2_conditional_power_futility": 0.10,
+        "treatment_error_rate_excess_max": 0.010,
+        "affected_censor_rate_excess_max": 0.030,
+    },
+    "inference": {
+        "confidence": "one-sided 95% promotion bounds; one-sided 90% futility upper bound",
+        "binary_se": "unpooled fixed-weight normal contrast with Jeffreys cell variance",
+        "continuous_se": "unpooled fixed-weight normal contrast with sample cell variance",
+        "conditional_power": (
+            "canonical information fraction with planned +0.060 alternative and "
+            "historical 9.09% control rate"
+        ),
+    },
+}
 
 
 def _knobs(experiment: Experiment, variant: str) -> Knobs:
@@ -624,6 +763,691 @@ def _offer_outcomes(
     return by_variant
 
 
+_NEG_GATE_CELL_FIELDS = (
+    "role",
+    "own_value_grid",
+    "phase",
+    "horizon",
+    "max_rounds",
+    "opponent_type",
+    "complete_information",
+)
+
+
+def _neg_gate_cell(spec: dict) -> dict:
+    return {field: spec.get(field) for field in _NEG_GATE_CELL_FIELDS}
+
+
+def _neg_gate_cell_id(cell: dict) -> str:
+    return _cell_key(_neg_gate_cell(cell))
+
+
+def _neg_value_grid(value: Any) -> str:
+    """Map scale-equivalent live values onto the public 80/100/120/150 grid."""
+    number = _as_float(value)
+    if number is None or number <= 0:
+        return "unknown"
+    for base in (80, 100, 120, 150):
+        ratio = number / base
+        exponent = round(math.log10(ratio))
+        if math.isclose(ratio, 10**exponent, rel_tol=1e-9, abs_tol=1e-9):
+            return str(base)
+    return "other"
+
+
+def _neg_gate_payoff_percentile(
+    turn: Turn,
+    role: str,
+    own_value: float | None,
+    payoff: float | None,
+    targets: Any,
+) -> float | None:
+    if own_value is None or payoff is None or role not in ("seller", "buyer"):
+        return None
+    try:
+        full_key, role_key = config_key_negotiation(turn.game["game_state"], role, own_value)
+        percentile = None
+        if full_key is not None:
+            percentile = targets.payoff_percentile(
+                "negotiation", full_key, turn.game.get("your_player", "player_1"), payoff
+            )
+        if percentile is None and role_key is not None:
+            percentile = targets.payoff_percentile(
+                "negotiation", role_key, turn.game.get("your_player", "player_1"), payoff
+            )
+        return _as_float(percentile)
+    except Exception:  # noqa: BLE001 - target drift must not kill a health report
+        return None
+
+
+def _neg_gate_unsupported_reason(cell: dict) -> str:
+    if cell.get("complete_information") is not False:
+        return "complete_information"
+    if cell.get("role") != "buyer":
+        return f"role={cell.get('role', 'unknown')}"
+    if cell.get("own_value_grid") not in {"80", "100", "120", "150"}:
+        return f"own_value_grid={cell.get('own_value_grid', 'unknown')}"
+    if cell.get("phase") != "decision":
+        return f"phase={cell.get('phase', 'unknown')}"
+    if cell.get("horizon") != "finite" or cell.get("max_rounds") != "10":
+        return (
+            f"horizon={cell.get('horizon', 'unknown')},"
+            f"max_rounds={cell.get('max_rounds', 'unknown')}"
+        )
+    if cell.get("opponent_type") != "hidden":
+        return f"opponent_type={cell.get('opponent_type', 'unknown')}"
+    return "not_in_frozen_reference"
+
+
+def _neg_terminal_gate_rows(
+    affected: list[dict],
+    enrolled: set[tuple[str, str]],
+    parsed: ParsedRecords,
+    experiment: Experiment,
+) -> list[dict]:
+    """Extract exactly one immutable gate observation per affected game."""
+    affected_by_game: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for item in affected:
+        affected_by_game[(item["agent"], item["game_id"])].append(item)
+    turn_index = {
+        (turn.agent, turn.gid, turn.round, turn.phase): turn
+        for turn in parsed.turns.values()
+        if (turn.agent, turn.gid) in enrolled and turn.family == "negotiation"
+    }
+    reference_ids = {
+        _neg_gate_cell_id(spec) for spec in _NEG_TERMINAL_REFERENCE_CELLS
+    }
+    targets = get_targets()
+    rows: list[dict] = []
+    for key, items in sorted(affected_by_game.items()):
+        first = min(items, key=lambda item: (item["ts"], item["round"], item["phase"]))
+        turn = turn_index.get((key[0], key[1], first["round"], first["phase"]))
+        if turn is None:
+            continue
+        state = turn.game.get("game_state")
+        state = state if isinstance(state, dict) else {}
+        player = turn.game.get("your_player", "player_1")
+        role = state.get(
+            f"{player}_role", "seller" if player == "player_1" else "buyer"
+        )
+        own_value = _as_float(state.get(f"{player}_value"))
+        opponent = turn.game.get("opponent")
+        opponent = opponent if isinstance(opponent, dict) else {}
+        cell = {
+            "role": role,
+            "own_value_grid": _neg_value_grid(own_value),
+            "phase": first.get("phase", "unknown"),
+            "horizon": _horizon(turn),
+            "max_rounds": _max_rounds(turn),
+            "opponent_type": opponent.get("type", "unknown"),
+            "complete_information": bool(state.get("complete_information", False)),
+        }
+        cell_id = _neg_gate_cell_id(cell)
+        terminal = parsed.terminals.get(key)
+        payoff = _terminal_payoff(turn, terminal) if terminal is not None else None
+        normalized = (
+            payoff / own_value
+            if payoff is not None and own_value is not None and own_value > 0
+            else None
+        )
+        offer_round = _round_number(first.get("effective_offer_round"))
+        direct = None
+        if terminal is not None and offer_round is not None:
+            direct = bool(
+                _terminal_agreement(terminal)
+                and _round_number(terminal.result.get("agreed_round")) == offer_round
+            )
+        compatibility = next(
+            (
+                spec["compatibility_rate"]
+                for spec in _NEG_TERMINAL_REFERENCE_CELLS
+                if _neg_gate_cell_id(spec) == cell_id
+            ),
+            None,
+        )
+        rows.append(
+            {
+                "agent": key[0],
+                "variant": experiment.variant_for(key[0]),
+                "game_id": key[1],
+                "cell": cell,
+                "cell_id": cell_id,
+                "supported": cell_id in reference_ids,
+                "unsupported_reason": (
+                    None if cell_id in reference_ids else _neg_gate_unsupported_reason(cell)
+                ),
+                "resolved": terminal is not None,
+                "censored": terminal is None,
+                "terminal_reaped": terminal is not None and terminal.valid is None,
+                "direct": direct,
+                "effective_offer_round": offer_round,
+                "normalized_payoff": normalized,
+                "payoff_percentile": _neg_gate_payoff_percentile(
+                    turn, str(role), own_value, payoff, targets
+                ),
+                "compatibility_rate": compatibility,
+                "direction_violation": bool(first.get("direction_violation")),
+                "assigned_match": bool(first.get("assigned_match")),
+            }
+        )
+    return rows
+
+
+def _neg_gate_sample_empty() -> dict:
+    return {
+        "affected": 0,
+        "resolved": 0,
+        "censored": 0,
+        "terminal_reaped": 0,
+        "direct_trials": 0,
+        "direct_converted": 0,
+        "normalized_payoff_n": 0,
+        "payoff_percentile_n": 0,
+    }
+
+
+def _neg_gate_add_sample(sample: dict, row: dict) -> None:
+    sample["affected"] += 1
+    sample["resolved"] += int(bool(row.get("resolved")))
+    sample["censored"] += int(bool(row.get("censored")))
+    sample["terminal_reaped"] += int(bool(row.get("terminal_reaped")))
+    if isinstance(row.get("direct"), bool):
+        sample["direct_trials"] += 1
+        sample["direct_converted"] += int(row["direct"])
+    sample["normalized_payoff_n"] += int(row.get("normalized_payoff") is not None)
+    sample["payoff_percentile_n"] += int(row.get("payoff_percentile") is not None)
+
+
+def _neg_gate_counts(rows: list[dict]) -> dict:
+    variants = {
+        variant: {"all": _neg_gate_sample_empty(), "primary": _neg_gate_sample_empty()}
+        for variant in ("treatment", "control")
+    }
+    cells: dict[str, dict] = {}
+    for spec in _NEG_TERMINAL_REFERENCE_CELLS:
+        cell = _neg_gate_cell(spec)
+        cell_id = _neg_gate_cell_id(cell)
+        cells[cell_id] = {
+            "cell": cell,
+            "weight": spec["weight"],
+            "compatibility_rate": spec["compatibility_rate"],
+            "treatment": _neg_gate_sample_empty(),
+            "control": _neg_gate_sample_empty(),
+        }
+    agents: dict[str, dict] = {}
+    unsupported_cells: dict[str, dict] = {}
+    unsupported_reasons: dict[str, int] = defaultdict(int)
+    for row in rows:
+        variant = row["variant"]
+        _neg_gate_add_sample(variants[variant]["all"], row)
+        agent = agents.setdefault(
+            row["agent"],
+            {
+                "variant": variant,
+                "all": _neg_gate_sample_empty(),
+                "primary": _neg_gate_sample_empty(),
+            },
+        )
+        _neg_gate_add_sample(agent["all"], row)
+        if row.get("supported"):
+            _neg_gate_add_sample(variants[variant]["primary"], row)
+            _neg_gate_add_sample(agent["primary"], row)
+            _neg_gate_add_sample(cells[row["cell_id"]][variant], row)
+            continue
+        reason = str(row.get("unsupported_reason") or "unknown")
+        unsupported_reasons[reason] += 1
+        entry = unsupported_cells.setdefault(
+            row["cell_id"],
+            {
+                "cell": row.get("cell", {}),
+                "reason": reason,
+                "treatment": _neg_gate_sample_empty(),
+                "control": _neg_gate_sample_empty(),
+            },
+        )
+        _neg_gate_add_sample(entry[variant], row)
+    return {
+        "variants": variants,
+        "cells": cells,
+        "agents": agents,
+        "unsupported": {
+            "total": sum(unsupported_reasons.values()),
+            "reasons": dict(sorted(unsupported_reasons.items())),
+            "cells": dict(sorted(unsupported_cells.items())),
+        },
+    }
+
+
+def _sample_variance(values: list[float]) -> float | None:
+    if len(values) < 2:
+        return None
+    mean = sum(values) / len(values)
+    return sum((value - mean) ** 2 for value in values) / (len(values) - 1)
+
+
+def _neg_gate_standardized(
+    rows: list[dict], field: str, *, binary: bool
+) -> dict:
+    reference = {
+        _neg_gate_cell_id(spec): spec for spec in _NEG_TERMINAL_REFERENCE_CELLS
+    }
+    values: dict[str, dict[str, list[float]]] = {
+        cell_id: {"treatment": [], "control": []} for cell_id in reference
+    }
+    for row in rows:
+        if not row.get("supported") or row.get(field) is None:
+            continue
+        value = float(bool(row[field])) if binary else _as_float(row[field])
+        if value is not None:
+            values[row["cell_id"]][row["variant"]].append(value)
+
+    cell_output: dict[str, dict] = {}
+    coverage = 0.0
+    treatment_mean = 0.0
+    control_mean = 0.0
+    se_squared = 0.0
+    variance_available = True
+    for cell_id, spec in reference.items():
+        weight = float(spec["weight"])
+        arm_output: dict[str, dict] = {}
+        both_present = True
+        cell_variances: dict[str, float | None] = {}
+        for variant in ("treatment", "control"):
+            observed = values[cell_id][variant]
+            mean = sum(observed) / len(observed) if observed else None
+            if binary and observed:
+                # Jeffreys smoothing is used only for the variance, preserving
+                # the observed cell rate in the standardized point estimate.
+                probability = (sum(observed) + 0.5) / (len(observed) + 1)
+                variance = probability * (1 - probability)
+            else:
+                variance = _sample_variance(observed)
+            cell_variances[variant] = variance
+            arm_output[variant] = {
+                "n": len(observed),
+                "mean": mean,
+                "variance": variance,
+            }
+            both_present = both_present and bool(observed)
+        if both_present:
+            coverage += weight
+            treatment_mean += weight * arm_output["treatment"]["mean"]
+            control_mean += weight * arm_output["control"]["mean"]
+            for variant in ("treatment", "control"):
+                variance = cell_variances[variant]
+                n = arm_output[variant]["n"]
+                if variance is None:
+                    variance_available = False
+                else:
+                    se_squared += weight * weight * variance / n
+        cell_output[cell_id] = {
+            "cell": _neg_gate_cell(spec),
+            "weight": weight,
+            **arm_output,
+        }
+
+    complete = math.isclose(coverage, 1.0, rel_tol=0, abs_tol=1e-12)
+    estimate = treatment_mean - control_mean if complete else None
+    standard_error = (
+        math.sqrt(se_squared) if complete and variance_available else None
+    )
+    return {
+        "field": field,
+        "method": (
+            "fixed joint-stratum contrast; raw means; Jeffreys binary cell variance"
+            if binary
+            else "fixed joint-stratum contrast; unpooled sample cell variance"
+        ),
+        "reference_weight_coverage": coverage,
+        "complete_fixed_support": complete,
+        "treatment": treatment_mean if complete else None,
+        "control": control_mean if complete else None,
+        "uplift": estimate,
+        "standard_error": standard_error,
+        "one_sided_95_lower": (
+            estimate - _Z_ONE_SIDED_95 * standard_error
+            if estimate is not None and standard_error is not None
+            else None
+        ),
+        "one_sided_90_upper": (
+            estimate + _Z_ONE_SIDED_90 * standard_error
+            if estimate is not None and standard_error is not None
+            else None
+        ),
+        "cells": cell_output,
+    }
+
+
+def _normal_cdf(value: float) -> float:
+    return 0.5 * (1 + math.erf(value / math.sqrt(2)))
+
+
+def _neg_gate_conditional_power(
+    direct: dict, treatment_n: int, control_n: int
+) -> float | None:
+    estimate = direct.get("uplift")
+    standard_error = direct.get("standard_error")
+    if estimate is None or standard_error is None or standard_error <= 0:
+        return None
+    info = min(treatment_n / 340, control_n / 1020, 1.0)
+    if info <= 0:
+        return None
+    if info >= 1:
+        return float(estimate - _Z_ONE_SIDED_95 * standard_error > 0)
+    historical_control = 31 / 341
+    planned_treatment = historical_control + 0.060
+    planned_se = math.sqrt(
+        planned_treatment * (1 - planned_treatment) / 340
+        + historical_control * (1 - historical_control) / 1020
+    )
+    planned_noncentrality = 0.060 / planned_se
+    current_z = estimate / standard_error
+    numerator = (
+        math.sqrt(info) * current_z
+        + planned_noncentrality * (1 - info)
+        - _Z_ONE_SIDED_95
+    )
+    return _normal_cdf(numerator / math.sqrt(1 - info))
+
+
+def _neg_gate_health(
+    rows: list[dict],
+    agent_data: dict[str, dict] | None,
+    agent_variants: dict[str, str] | None,
+) -> dict:
+    by_variant = {
+        variant: {
+            "traffic_events": 0,
+            "errors": 0,
+            "invalid_results": 0,
+            "corrections": 0,
+            "replay_errors": 0,
+            "affected_wrong_variant": 0,
+            "affected_unknown": 0,
+            "direction_violations": 0,
+            "affected": 0,
+            "censored": 0,
+        }
+        for variant in ("treatment", "control")
+    }
+    observed_variants = {row["agent"]: row["variant"] for row in rows}
+    if agent_data:
+        for agent, data in agent_data.items():
+            variant = (agent_variants or {}).get(agent, observed_variants.get(agent))
+            if variant not in by_variant:
+                continue
+            health = data.get("health", {})
+            routing = data.get("routing", {})
+            target = by_variant[variant]
+            target["traffic_events"] += health.get("turns", 0) + health.get(
+                "result_events", 0
+            )
+            target["errors"] += health.get("turn_errors", 0) + health.get(
+                "result_errors", 0
+            )
+            target["invalid_results"] += health.get("invalid_results", 0)
+            target["corrections"] += health.get("corrections", 0)
+            for key in (
+                "replay_errors",
+                "affected_wrong_variant",
+                "affected_unknown",
+                "direction_violations",
+            ):
+                target[key] += routing.get(key, 0)
+    else:
+        # Pure evaluator callers still receive deterministic healthy rates.
+        for row in rows:
+            target = by_variant[row["variant"]]
+            target["traffic_events"] += 1
+            target["direction_violations"] += int(
+                bool(row.get("direction_violation"))
+            )
+    for row in rows:
+        target = by_variant[row["variant"]]
+        target["affected"] += 1
+        target["censored"] += int(bool(row.get("censored")))
+    for target in by_variant.values():
+        traffic = target["traffic_events"]
+        affected = target["affected"]
+        target["error_rate"] = target["errors"] / traffic if traffic else None
+        target["affected_censor_rate"] = (
+            target["censored"] / affected if affected else None
+        )
+
+    treatment = by_variant["treatment"]
+    control = by_variant["control"]
+    error_excess = (
+        treatment["error_rate"] - control["error_rate"]
+        if treatment["error_rate"] is not None and control["error_rate"] is not None
+        else None
+    )
+    censor_excess = (
+        treatment["affected_censor_rate"] - control["affected_censor_rate"]
+        if treatment["affected_censor_rate"] is not None
+        and control["affected_censor_rate"] is not None
+        else None
+    )
+    structural_faults = sum(
+        target[key]
+        for target in by_variant.values()
+        for key in (
+            "replay_errors",
+            "affected_wrong_variant",
+            "affected_unknown",
+            "direction_violations",
+        )
+    )
+    treatment_validity_faults = treatment["invalid_results"] + treatment["corrections"]
+    checks = {
+        "routing_and_direction_clean": structural_faults == 0,
+        "treatment_invalid_and_corrections_clean": treatment_validity_faults == 0,
+        "treatment_error_rate_excess_within_0.01": (
+            error_excess <= 0.010 if error_excess is not None else None
+        ),
+        "affected_censor_rate_excess_within_0.03": (
+            censor_excess <= 0.030 if censor_excess is not None else None
+        ),
+    }
+    return {
+        "by_variant": by_variant,
+        "treatment_error_rate_excess": error_excess,
+        "affected_censor_rate_excess": censor_excess,
+        "structural_faults": structural_faults,
+        "treatment_validity_faults": treatment_validity_faults,
+        "checks": checks,
+        "pass": all(value is True for value in checks.values()),
+        "hard_fail": any(value is False for value in checks.values()),
+    }
+
+
+def _neg_gate_agent_confirmation(rows: list[dict]) -> dict:
+    treatment_agents = sorted(
+        {row["agent"] for row in rows if row["variant"] == "treatment"}
+    )
+    blocks = []
+    for agent in treatment_agents:
+        block_rows = [
+            row
+            for row in rows
+            if row["variant"] == "control" or row["agent"] == agent
+        ]
+        metric = _neg_gate_standardized(block_rows, "direct", binary=True)
+        passes = bool(
+            metric["complete_fixed_support"]
+            and metric["uplift"] is not None
+            and metric["uplift"] >= 0
+        )
+        blocks.append(
+            {
+                "agent": agent,
+                "direct_trials": sum(
+                    isinstance(row.get("direct"), bool)
+                    for row in rows
+                    if row["agent"] == agent and row.get("supported")
+                ),
+                "complete_fixed_support": metric["complete_fixed_support"],
+                "standardized_direct_uplift": metric["uplift"],
+                "nonnegative": passes,
+            }
+        )
+    confirmed = sum(block["nonnegative"] for block in blocks)
+    return {
+        "unit": "distinct treatment agent label (process epoch unavailable)",
+        "required": 2,
+        "confirmed": confirmed,
+        "pass": confirmed >= 2,
+        "blocks": blocks,
+    }
+
+
+def _neg_terminal_gate_from_rows(
+    rows: list[dict],
+    agent_data: dict[str, dict] | None = None,
+    agent_variants: dict[str, str] | None = None,
+) -> dict:
+    """Pure deterministic evaluator for the frozen hidden terminal-close gate."""
+    counts = _neg_gate_counts(rows)
+    direct = _neg_gate_standardized(rows, "direct", binary=True)
+    normalized = _neg_gate_standardized(rows, "normalized_payoff", binary=False)
+    percentile = _neg_gate_standardized(rows, "payoff_percentile", binary=False)
+    standardized = {
+        "direct": direct,
+        "normalized_payoff": normalized,
+        "payoff_percentile": percentile,
+    }
+    health = _neg_gate_health(rows, agent_data, agent_variants)
+    agent_confirmation = _neg_gate_agent_confirmation(rows)
+    primary = {
+        variant: counts["variants"][variant]["primary"]
+        for variant in ("treatment", "control")
+    }
+    treatment_n = primary["treatment"]["direct_trials"]
+    control_n = primary["control"]["direct_trials"]
+    conditional_power = _neg_gate_conditional_power(direct, treatment_n, control_n)
+
+    interim_reasons: list[str] = []
+    if treatment_n >= 50 and control_n >= 150:
+        if primary["treatment"]["direct_converted"] == 0:
+            interim_reasons.append("T>=50/C>=150 with zero treatment conversions")
+        if (
+            normalized["uplift"] is not None
+            and normalized["uplift"] <= -0.010
+        ):
+            interim_reasons.append("standardized normalized-payoff uplift <= -0.010")
+    if treatment_n >= 100 and control_n >= 300:
+        if direct["treatment"] is not None and direct["treatment"] <= 0.050:
+            interim_reasons.append("standardized treatment direct conversion <= 0.050")
+        if (
+            direct["one_sided_90_upper"] is not None
+            and direct["one_sided_90_upper"] <= 0
+        ):
+            interim_reasons.append("one-sided 90% upper direct uplift <= 0")
+        if conditional_power is not None and conditional_power < 0.10:
+            interim_reasons.append("conditional power for planned +0.060 uplift < 0.10")
+    if health["hard_fail"]:
+        interim_reasons.append("health or direction hard-fail")
+
+    final_sample = treatment_n >= 340 and control_n >= 1020
+    per_cell_sample = all(
+        cell["treatment"]["direct_trials"] >= 30
+        and cell["control"]["direct_trials"] >= 90
+        for cell in counts["cells"].values()
+    )
+    if final_sample and per_cell_sample:
+        stage = "promotion_ready"
+    elif treatment_n >= 100 and control_n >= 300:
+        stage = "interim_2"
+    elif treatment_n >= 50 and control_n >= 150:
+        stage = "interim_1"
+    else:
+        stage = "collecting"
+    interim = {
+        "stage": stage,
+        "treatment_direct_trials": treatment_n,
+        "control_direct_trials": control_n,
+        "information_fraction": min(treatment_n / 340, control_n / 1020, 1.0),
+        "conditional_power": conditional_power,
+        "rollback": bool(interim_reasons),
+        "reasons": interim_reasons,
+    }
+
+    passes = {
+        "overall_sample": final_sample,
+        "joint_cell_sample": per_cell_sample,
+        "complete_fixed_support": direct["complete_fixed_support"],
+        "direct_uplift_point_at_least_0.060": bool(
+            direct["uplift"] is not None and direct["uplift"] >= 0.060
+        ),
+        "direct_uplift_one_sided_95_lower_above_0": bool(
+            direct["one_sided_95_lower"] is not None
+            and direct["one_sided_95_lower"] > 0
+        ),
+        "normalized_payoff_one_sided_95_lower_above_minus_0.005": bool(
+            normalized["one_sided_95_lower"] is not None
+            and normalized["one_sided_95_lower"] > -0.005
+        ),
+        "payoff_percentile_one_sided_95_lower_above_minus_0.050": bool(
+            percentile["one_sided_95_lower"] is not None
+            and percentile["one_sided_95_lower"] > -0.050
+        ),
+        "two_nonnegative_treatment_agent_blocks": agent_confirmation["pass"],
+        "health": health["pass"],
+        "no_interim_rollback": not interim["rollback"],
+    }
+    failed = [name for name, passed in passes.items() if not passed]
+    status = "rollback" if interim["rollback"] else ("promote" if not failed else "continue")
+
+    treatment_direct = direct["treatment"]
+    control_direct = direct["control"]
+    compatibility = {
+        "fixed_compatible_opportunity_rate": _NEG_TERMINAL_COMPATIBILITY_RATE,
+        "historical_control_efficiency_24h": (103 / 1382)
+        / _NEG_TERMINAL_COMPATIBILITY_RATE,
+        "historical_control_efficiency_6h": (31 / 341)
+        / _NEG_TERMINAL_COMPATIBILITY_RATE,
+        "diagnostic_target": 0.45,
+        "standardized_treatment_efficiency": (
+            treatment_direct / _NEG_TERMINAL_COMPATIBILITY_RATE
+            if treatment_direct is not None
+            else None
+        ),
+        "standardized_control_efficiency": (
+            control_direct / _NEG_TERMINAL_COMPATIBILITY_RATE
+            if control_direct is not None
+            else None
+        ),
+        "standardized_uplift_per_compatible_opportunity": (
+            direct["uplift"] / _NEG_TERMINAL_COMPATIBILITY_RATE
+            if direct["uplift"] is not None
+            else None
+        ),
+        "formal_promotion_gate": False,
+        "note": (
+            "Compatibility is an inferred rational ceiling diagnostic, not an "
+            "observed-outcome denominator."
+        ),
+    }
+    return {
+        "design": json.loads(json.dumps(NEG_TERMINAL_GATE_DESIGN)),
+        "counts": counts,
+        "standardized": standardized,
+        "compatibility_diagnostic": compatibility,
+        "health": health,
+        "interim": interim,
+        "agent_confirmation": agent_confirmation,
+        "promotion": {
+            "status": status,
+            "passes": passes,
+            "failed_checks": failed,
+            "reasons": (
+                interim_reasons
+                if status == "rollback"
+                else [f"waiting for {name}" for name in failed]
+            ),
+        },
+    }
+
+
 def _p_key(value: Any) -> str:
     number = _as_float(value)
     return f"{number:.6g}" if number is not None else "unknown"
@@ -933,7 +1757,7 @@ def analyze_experiment(
     else:
         metrics = _offer_outcomes(affected, enrolled, parsed, experiment)
 
-    return {
+    report = {
         "name": experiment.name,
         "family": experiment.family,
         "cutoff": experiment.cutoff,
@@ -950,6 +1774,14 @@ def analyze_experiment(
         "metrics": metrics,
         "affected_turns": affected,
     }
+    if experiment.name == "neg_terminal_close":
+        gate_rows = _neg_terminal_gate_rows(affected, enrolled, parsed, experiment)
+        report["gate"] = _neg_terminal_gate_from_rows(
+            gate_rows,
+            agent_data,
+            {agent: experiment.variant_for(agent) for agent in experiment.agents},
+        )
+    return report
 
 
 def build_report(
@@ -1078,6 +1910,10 @@ def _fmt_rate(value: Any) -> str:
     return "-" if value is None else f"{100 * value:.1f}%"
 
 
+def _fmt_delta(value: Any) -> str:
+    return "-" if value is None else f"{value:+.4f}"
+
+
 def render_text(report: dict, detail_limit: int = 12) -> str:
     lines: list[str] = []
     for experiment in report["experiments"]:
@@ -1111,6 +1947,19 @@ def render_text(report: dict, detail_limit: int = 12) -> str:
             lines.append(
                 f"  {variant:<9} cohort={cohort['games']} "
                 f"resolved={cohort['resolved']} censored={cohort['censored']} | {summary}"
+            )
+        gate = experiment.get("gate")
+        if gate is not None:
+            direct = gate["standardized"]["direct"]
+            primary = gate["counts"]["variants"]
+            lines.append(
+                f"  frozen gate: {gate['promotion']['status']} "
+                f"stage={gate['interim']['stage']} "
+                f"primary_n=T{primary['treatment']['primary']['direct_trials']}/"
+                f"C{primary['control']['primary']['direct_trials']} "
+                f"direct_uplift={_fmt_delta(direct['uplift'])} "
+                f"lower95={_fmt_delta(direct['one_sided_95_lower'])} "
+                f"unsupported={gate['counts']['unsupported']['total']}"
             )
         lines.append("  health/routing by agent:")
         for agent, data in experiment["agents"].items():
