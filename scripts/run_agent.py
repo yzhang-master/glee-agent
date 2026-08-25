@@ -25,6 +25,7 @@ from glee_agent.capture import (  # noqa: E402
 )
 from glee_agent.config import load_settings  # noqa: E402
 from glee_agent.dispatcher import build_strategy  # noqa: E402
+from glee_agent.runtime_manifest import append_runtime_manifest  # noqa: E402
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(name)s %(levelname)s %(message)s")
 logger = logging.getLogger("run_agent")
@@ -77,6 +78,7 @@ def main() -> None:
 
     settings = load_settings(args.agent)
     _lock = acquire_instance_lock(settings.agent_label)  # noqa: F841 — held for process lifetime
+    append_runtime_manifest(settings.agent_label, settings.knobs)
     concurrency = args.concurrency or settings.concurrency
     families = args.families.split(",") if args.families else None
 

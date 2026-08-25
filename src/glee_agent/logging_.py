@@ -1,9 +1,9 @@
-"""Append-only JSONL logs: per-turn records (full game dict, chosen action,
-guard corrections, timing) plus "result", "snapshot", and "lb_snapshot"
-records for results capture. One file per agent per day (platform-wide
-records go to platform-<day>.jsonl); thread-safe via a lock (appends are
-small; contention is negligible at concurrency ~8). Every writer swallows
-all exceptions — logging must never raise into the game loop."""
+"""Append-only JSONL logs: runtime, turn, result, and telemetry records.
+
+One file is written per agent per day (platform-wide records go to
+``platform-<day>.jsonl``); writes are thread-safe.  Every writer swallows all
+exceptions because observability must never raise into the game loop.
+"""
 
 from __future__ import annotations
 
@@ -87,6 +87,23 @@ def log_result(
             "game_over": bool(resp.get("game_over")),
             "error": error if error is not None else resp.get("error"),
             "result": resp.get("result"),
+        }
+        _append(agent_label, record)
+    except Exception:  # noqa: BLE001 — logging must never break play
+        pass
+
+
+def log_runtime(agent_label: str, manifest: dict) -> None:
+    """Append one startup policy manifest as a ``type=runtime`` record."""
+    try:
+        body = manifest if isinstance(manifest, dict) else {}
+        # Reserved envelope keys are written last so malformed callers cannot
+        # disguise the record or redirect it to another agent identity.
+        record = {
+            **body,
+            "type": "runtime",
+            "ts": time.time(),
+            "agent": agent_label,
         }
         _append(agent_label, record)
     except Exception:  # noqa: BLE001 — logging must never break play
