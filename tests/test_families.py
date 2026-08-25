@@ -495,21 +495,33 @@ class TestPersuasionNeutralMessages:
         assert liar.mean_x > honest.mean_x + 0.25
         assert honest.p_high_given(True) > liar.p_high_given(True) + 0.15
 
-    def test_buyer_ignores_message_in_final_round(self):
-        """No future punishment exists at T, so a payoff-maximising seller
-        recommends everything and the message is uninformative: fall back to
-        the prior."""
-        from fixtures import persuasion_game
-        from glee_agent.config import Knobs
-        from glee_agent.families import persuasion as pers_mod
-        from glee_agent.schema import parse_game
-        # p=0.5, v=250, price=100 -> prior EV = 125 > 100, so buy regardless
-        # of a hostile-looking message.
-        game = persuasion_game(actor="buyer", game_state={
-            "p": 0.5, "v": 250.0, "product_price": 100.0,
-            "total_rounds": 20, "round": 20,
-            "seller_message": "honestly, skip this one"})
-        assert pers_mod.decide(parse_game(game), Knobs(llm_enabled=False))["decision"] == "yes"
+    def _final_round_game(self, message, p=0.5, **state):
+        game_state = {
+            "p": p, "v": 250.0, "product_price": 100.0,
+            "total_rounds": 20, "round": 20, "seller_message": message,
+        }
+        game_state.update(state)
+        return persuasion_game(actor="buyer", game_state=game_state)
+
+    def test_buyer_respects_binary_no_in_final_round(self):
+        game = self._final_round_game(
+            {"decision": "no"}, seller_message_type="binary"
+        )
+        assert run(persuasion, game)["decision"] == "no"
+
+    def test_buyer_respects_text_anti_recommendation_in_final_round(self):
+        game = self._final_round_game("honestly, skip this one")
+        assert run(persuasion, game)["decision"] == "no"
+
+    @pytest.mark.parametrize(
+        "message", ["I recommend this one", "Item #7 ships today."]
+    )
+    @pytest.mark.parametrize(("p", "expected"), [(0.5, "yes"), (0.2, "no")])
+    def test_positive_and_neutral_final_messages_fall_back_to_prior(
+        self, message, p, expected
+    ):
+        game = self._final_round_game(message, p=p)
+        assert run(persuasion, game)["decision"] == expected
 
 
 class TestNegotiationStalemate:

@@ -296,9 +296,12 @@ def _buyer_decide(view: GameView, ps, knobs: Knobs) -> dict:
     total = ps.total_rounds or 10
 
     # Endgame: in the last round the seller faces no future punishment, so a
-    # payoff-maximising one recommends everything and the message carries no
-    # information. Fall back to the prior and ignore what they said.
+    # payoff-maximising one recommends everything and a positive or neutral
+    # message carries no information. An explicit anti-recommendation is
+    # still decisive: buying against it cannot improve our payoff.
     if view.round >= total:
+        if polarity == "neg":
+            return {"decision": "no"}
         return {"decision": "yes" if _buyer_value(p, ps) > 0 else "no"}
 
     post = _buyer_posterior(view, ps, knobs)
