@@ -49,6 +49,12 @@ def game_percentile(tg, row) -> float | None:
         if family == "negotiation":
             my_role = "seller" if role == "player_1" else "buyer"
             my_value = config.get(f"{role}_value")
+            # The memory store keeps player values but omits the fixed role
+            # labels.  Without restoring them, even complete-information
+            # games silently miss the exact full-config pool and fall back to
+            # the coarser role marginal.
+            config.setdefault("player_1_role", "seller")
+            config.setdefault("player_2_role", "buyer")
             full_key, role_key = targets_mod.config_key_negotiation(
                 config, my_role, my_value
             )
