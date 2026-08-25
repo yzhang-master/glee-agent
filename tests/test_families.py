@@ -720,7 +720,7 @@ class TestNegotiationEndgame:
         [("seller", 102.0, 145.54), ("buyer", 98.0, 82.17)],
     )
     @pytest.mark.parametrize("phase", ["offer", "decision"])
-    def test_terminal_close_bypasses_reciprocity_at_round_nine(
+    def test_hidden_terminal_close_bypasses_reciprocity_at_round_nine(
         self, role, floor, capped_price, phase
     ):
         game = self._stonewall_game(role, phase, rnd=9)
@@ -739,7 +739,7 @@ class TestNegotiationEndgame:
         [("seller", 102.0, 145.54), ("buyer", 98.0, 82.17)],
     )
     @pytest.mark.parametrize("phase", ["offer", "decision"])
-    def test_terminal_close_preserves_reciprocity_at_round_eight(
+    def test_hidden_terminal_close_preserves_reciprocity_at_round_eight(
         self, role, floor, capped_price, phase
     ):
         game = self._stonewall_game(role, phase, rnd=8)
@@ -754,11 +754,29 @@ class TestNegotiationEndgame:
         assert canary["product_price"] == pytest.approx(capped["product_price"])
         assert canary["product_price"] != pytest.approx(floor)
 
+    @pytest.mark.parametrize("role", ["seller", "buyer"])
+    @pytest.mark.parametrize("phase", ["offer", "decision"])
+    def test_complete_info_terminal_close_is_inert(self, role, phase):
+        game = self._stonewall_game(role, phase, rnd=9)
+        game["game_state"].update({
+            "complete_information": True,
+            "player_1_value": 100.0 if role == "seller" else 80.0,
+            "player_2_value": 200.0 if role == "seller" else 100.0,
+        })
+        view = parse_game(game)
+        off = negotiation.decide(
+            view, Knobs(llm_enabled=False, neg_terminal_close=False)
+        )
+        on = negotiation.decide(
+            view, Knobs(llm_enabled=False, neg_terminal_close=True)
+        )
+        assert on == off
+
     @pytest.mark.parametrize(
         "role,floor", [("seller", 102.0), ("buyer", 98.0)]
     )
     @pytest.mark.parametrize("phase", ["offer", "decision"])
-    def test_terminal_close_uses_floor_instead_of_optimizer(
+    def test_hidden_terminal_close_uses_floor_instead_of_optimizer(
         self, monkeypatch, role, floor, phase
     ):
         def unexpected_optimizer(*args, **kwargs):

@@ -36,10 +36,11 @@ def _is_ultimatum(view: GameView) -> bool:
     return view.max_rounds is not None and view.round >= view.max_rounds
 
 
-def _terminal_close(view: GameView, knobs: Knobs) -> bool:
-    """Whether this is the last finite-horizon offer we can improve."""
+def _terminal_close(view: GameView, n, knobs: Knobs) -> bool:
+    """Whether a hidden-value game reached our last improvable offer."""
     return (
         knobs.neg_terminal_close
+        and n.opp_value is None
         and view.max_rounds is not None
         and view.max_rounds > 1
         and view.round >= view.max_rounds - 1
@@ -487,7 +488,7 @@ def _neg_message(view: GameView, price: float, conceded: bool) -> str:
 def decide(view: GameView, knobs: Knobs) -> dict:
     n = parse_negotiation(view)
     value = n.my_value if n.my_value is not None else 100.0
-    terminal_close = _terminal_close(view, knobs)
+    terminal_close = _terminal_close(view, n, knobs)
 
     if view.action_type == "offer":
         price = _target_price(view, n, knobs)

@@ -102,10 +102,10 @@ class Knobs:
                                          # (plus a drip). Their acceptance probability AND
                                          # their own concession both fall in our concession
                                          # speed, so a time-based schedule teaches them to wait
-    neg_terminal_close: bool = False     # finite horizon: on the last actionable offer, bypass
-                                         # reciprocity and use the scheduled floor. Otherwise a
-                                         # stonewaller can pin our round-(T-1) counter near its
-                                         # opening price and turn a feasible trade into a no-deal
+    neg_terminal_close: bool = False     # incomplete information, finite horizon: on the last
+                                         # actionable offer, bypass reciprocity and use the
+                                         # scheduled floor. Visible-value opponents already close
+                                         # without this concession, so complete info is excluded
     neg_drip: float = 0.01               # unreciprocated concession per offer, as a fraction
                                          # of the anchor-to-floor range
     neg_never_walk: bool = False         # unlimited-horizon: walking pays exactly 0, the same
