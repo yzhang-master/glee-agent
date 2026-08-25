@@ -19,11 +19,12 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import re
 import sys
-from collections import defaultdict
+from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
@@ -37,8 +38,9 @@ from glee_agent.dispatcher import FAMILIES  # noqa: E402
 from glee_agent.guard import guard  # noqa: E402
 from glee_agent.schema import parse_game  # noqa: E402
 from glee_agent.theory.targets import (  # noqa: E402
+    DEFAULT_PATH as TARGETS_PATH,
     config_key_negotiation,
-    get_targets,
+    load_targets,
 )
 
 
@@ -114,66 +116,59 @@ EXPERIMENTS = (
 )
 
 
-# Frozen before reading outcomes beyond the pre-gate pilot checkpoint.  These
-# are joint estimand weights, not a value-only post-stratification: the
-# historical opportunity extraction was specifically buyer round-9 decision
-# counters in hidden-information, ten-round games.  Thus P(role=buyer)=1 and
-# the four own-value weights below sum to one.  Any seller, offer-phase, other
-# horizon, visible-opponent, or complete-information divergence is reported as
-# unsupported and is never silently renormalized into this estimand.
-_NEG_TERMINAL_REFERENCE_CELLS = (
+# Frozen before reading outcomes beyond the pre-gate pilot checkpoint.  The
+# strategy trigger is hidden opponent *value* (complete_information=False),
+# not hidden opponent identity.  A pre-cut reconstruction therefore freezes
+# all eight identity x own-value cells.  P(role=buyer)=1 because the historical
+# opportunity extraction was specifically buyer round-9 decision counters.
+_NEG_TERMINAL_HISTORICAL_CELLS = (
+    # opponent identity, own-value grid, resolved, direct, compatibility rate
+    ("agent", "80", 237, 0, 0.0),
+    ("agent", "100", 195, 18, 0.25467870697552675),
+    ("agent", "120", 168, 20, 0.5082449941107184),
+    ("agent", "150", 92, 10, 0.7539589059023688),
+    ("hidden", "80", 244, 0, 0.0),
+    ("hidden", "100", 207, 18, 0.25467870697552675),
+    ("hidden", "120", 156, 19, 0.5082449941107184),
+    ("hidden", "150", 83, 18, 0.7539589059023688),
+)
+_NEG_TERMINAL_REFERENCE_CELLS = tuple(
     {
         "role": "buyer",
-        "own_value_grid": "80",
+        "own_value_grid": value,
         "phase": "decision",
         "horizon": "finite",
         "max_rounds": "10",
-        "opponent_type": "hidden",
+        "opponent_type": opponent_type,
         "complete_information": False,
-        "weight": 481 / 1382,
-        "compatibility_rate": 0.0,
-    },
-    {
-        "role": "buyer",
-        "own_value_grid": "100",
-        "phase": "decision",
-        "horizon": "finite",
-        "max_rounds": "10",
-        "opponent_type": "hidden",
-        "complete_information": False,
-        "weight": 402 / 1382,
-        "compatibility_rate": 0.25467870697552675,
-    },
-    {
-        "role": "buyer",
-        "own_value_grid": "120",
-        "phase": "decision",
-        "horizon": "finite",
-        "max_rounds": "10",
-        "opponent_type": "hidden",
-        "complete_information": False,
-        "weight": 324 / 1382,
-        "compatibility_rate": 0.5082449941107184,
-    },
-    {
-        "role": "buyer",
-        "own_value_grid": "150",
-        "phase": "decision",
-        "horizon": "finite",
-        "max_rounds": "10",
-        "opponent_type": "hidden",
-        "complete_information": False,
-        "weight": 175 / 1382,
-        "compatibility_rate": 0.7539589059023688,
-    },
+        "weight": resolved / 1382,
+        "compatibility_rate": compatibility,
+        "historical_resolved": resolved,
+        "historical_direct_converted": direct,
+    }
+    for opponent_type, value, resolved, direct, compatibility
+    in _NEG_TERMINAL_HISTORICAL_CELLS
 )
 
 _NEG_TERMINAL_COMPATIBILITY_RATE = 0.28870841304554923
 _Z_ONE_SIDED_95 = 1.6448536269514722
 _Z_ONE_SIDED_90 = 1.2815515655446004
+_NEG_TARGET_ARTIFACT = {
+    "path": "data/targets.json",
+    "sha256": "1d24a579ca2b611e3b30af4ddf7af5b84ad13e7198fa55b93a2f5e6617e65e25",
+    "bytes": 642520,
+    "git_commit": "cb6a7eefff4451baf44e91e293fbcff187846d86",
+    "published_ts": 1787673703.0,
+}
+_NEG_STATIC_ASSIGNMENT = {
+    "epoch_id": "static:neg-terminal-close:1787674193",
+    "start": 1787674193.0,
+    "treatment_agents": ("test_a",),
+    "control_agents": ("main", "test_b", "test_c"),
+}
 
 NEG_TERMINAL_GATE_DESIGN = {
-    "version": "hidden-terminal-close-v1-frozen-2026-08-25",
+    "version": "hidden-value-terminal-close-v2-frozen-2026-08-25",
     "frozen_before_subsequent_outcomes": True,
     "pilot_checkpoint": {
         "treatment": {"direct_converted": 0, "direct_resolved": 2},
@@ -202,13 +197,34 @@ NEG_TERMINAL_GATE_DESIGN = {
         "role_weight": {"buyer": 1.0},
         "missing_support_policy": "report and block; never renormalize fixed weights",
         "agent_epoch_policy": (
-            "Raw JSONL identifies agent but not process epoch; require two distinct "
-            "treatment agent labels with nonnegative standardized block uplift."
+            "Use the frozen timestamped initial assignment, then runtime manifests; "
+            "a later treatment assignment never reclassifies earlier control rows."
+        ),
+        "causal_status_policy": (
+            "Fixed-label evidence can reach screen_pass only. Causal promote "
+            "requires two labels observed with meaningful treatment and control "
+            "support across a manifest-backed switchback."
         ),
     },
     "reference_cells": [dict(cell) for cell in _NEG_TERMINAL_REFERENCE_CELLS],
+    "static_assignment": {
+        **_NEG_STATIC_ASSIGNMENT,
+        "treatment_agents": list(_NEG_STATIC_ASSIGNMENT["treatment_agents"]),
+        "control_agents": list(_NEG_STATIC_ASSIGNMENT["control_agents"]),
+    },
+    "payoff_target_artifact": dict(_NEG_TARGET_ARTIFACT),
     "historical_reference": {
         "window": "24h before cutoff 1787672701",
+        "window_start": 1787586301.0,
+        "window_end_exclusive": 1787672701.0,
+        "extraction": (
+            "latest raw buyer round-9 RejectOffer counter per agent/game; "
+            "max_rounds=10; complete_information=false; terminal rollup resolved"
+        ),
+        "identity_counts_source": (
+            "pre-cut raw turn logs plus immutable agent.db terminal lookup; "
+            "1418 eligible, 1382 resolved, 36 censored"
+        ),
         "resolved": 1382,
         "direct_converted": 103,
         "direct_conversion_rate": 103 / 1382,
@@ -221,19 +237,31 @@ NEG_TERMINAL_GATE_DESIGN = {
     },
     "thresholds": {
         "promotion_sample": {"treatment": 340, "control": 1020},
-        "promotion_per_joint_cell": {"treatment": 30, "control": 90},
+        "promotion_per_joint_cell": {"treatment": 15, "control": 45},
         "direct_uplift_min": 0.060,
         "direct_uplift_one_sided_95_lower_min": 0.0,
         "normalized_payoff_noninferiority_margin": -0.005,
         "payoff_percentile_noninferiority_margin": -0.050,
         "treatment_agent_blocks_required": 2,
+        "treatment_epoch_block_min": {
+            "total": 60,
+            "per_own_value_across_identity": 15,
+            "per_opponent_identity": 20,
+        },
+        "switchback_labels_required": 2,
+        "unsupported_slice": {
+            "per_cell_sample": {"treatment": 15, "control": 45},
+            "direct_noninferiority_margin": -0.050,
+            "normalized_payoff_noninferiority_margin": -0.005,
+            "payoff_percentile_noninferiority_margin": -0.050,
+        },
         "compatibility_efficiency_diagnostic_target": 0.45,
         "interim_1": {"treatment": 50, "control": 150},
         "interim_2": {"treatment": 100, "control": 300},
         "interim_zero_conversion_rollback": True,
         "interim_normalized_payoff_rollback": -0.010,
         "interim_2_treatment_direct_futility": 0.050,
-        "interim_2_conditional_power_futility": 0.10,
+        "interim_2_conditional_power_futility": None,
         "treatment_error_rate_excess_max": 0.010,
         "affected_censor_rate_excess_max": 0.030,
     },
@@ -242,8 +270,12 @@ NEG_TERMINAL_GATE_DESIGN = {
         "binary_se": "unpooled fixed-weight normal contrast with Jeffreys cell variance",
         "continuous_se": "unpooled fixed-weight normal contrast with sample cell variance",
         "conditional_power": (
-            "canonical information fraction with planned +0.060 alternative and "
-            "historical 9.09% control rate"
+            "legacy approximation retained as diagnostic-only; it is not a "
+            "rollback or promotion criterion"
+        ),
+        "payoff_percentile_pool": (
+            "pinned data/targets.json loaded with live=False; mutable live targets "
+            "and the get_targets singleton are excluded"
         ),
     },
 }
@@ -295,6 +327,16 @@ class ResultEvent:
 
 
 @dataclass
+class RuntimeEvent:
+    agent: str
+    ts: float
+    pid: int | None
+    knobs: dict
+    git_head: str | None
+    strategy_sha256: str | None
+
+
+@dataclass
 class ParsedRecords:
     turns: dict[tuple[str, str, int, str], Turn]
     first_turns: dict[tuple[str, str], Turn]
@@ -302,6 +344,7 @@ class ParsedRecords:
     terminals: dict[tuple[str, str], ResultEvent]
     duplicate_events: list[tuple[str, str, float]]
     gid_family: dict[tuple[str, str], str]
+    runtimes: list[RuntimeEvent]
 
 
 def _as_float(value: Any) -> float | None:
@@ -324,6 +367,7 @@ def parse_records(records: Iterable[dict]) -> ParsedRecords:
     first_turns: dict[tuple[str, str], Turn] = {}
     results: list[ResultEvent] = []
     terminals: dict[tuple[str, str], ResultEvent] = {}
+    runtimes: list[RuntimeEvent] = []
     turn_occurrences: dict[tuple[str, str, int, str], list[float]] = defaultdict(list)
     gid_family: dict[tuple[str, str], str] = {}
 
@@ -335,7 +379,35 @@ def parse_records(records: Iterable[dict]) -> ParsedRecords:
         ts = _as_float(record.get("ts"))
         if not agent or ts is None:
             continue
-        if kind == "turn":
+        if kind == "runtime":
+            hashes = record.get("content_hashes")
+            hashes = hashes if isinstance(hashes, dict) else {}
+            strategy = hashes.get("strategy_python")
+            strategy = strategy if isinstance(strategy, dict) else {}
+            pid_value = _as_float(record.get("pid"))
+            runtimes.append(
+                RuntimeEvent(
+                    agent=agent,
+                    ts=ts,
+                    pid=int(pid_value) if pid_value is not None else None,
+                    knobs=(
+                        record.get("knobs")
+                        if isinstance(record.get("knobs"), dict)
+                        else {}
+                    ),
+                    git_head=(
+                        record.get("git_head")
+                        if isinstance(record.get("git_head"), str)
+                        else None
+                    ),
+                    strategy_sha256=(
+                        strategy.get("aggregate_sha256")
+                        if isinstance(strategy.get("aggregate_sha256"), str)
+                        else None
+                    ),
+                )
+            )
+        elif kind == "turn":
             game = record.get("game")
             if not isinstance(game, dict):
                 continue
@@ -410,6 +482,7 @@ def parse_records(records: Iterable[dict]) -> ParsedRecords:
         terminals=terminals,
         duplicate_events=duplicate_events,
         gid_family=gid_family,
+        runtimes=sorted(runtimes, key=lambda event: (event.ts, event.agent)),
     )
 
 
@@ -684,7 +757,7 @@ def _offer_outcomes(
         # ``affected_turns`` for routing diagnostics but cannot create extra
         # conversion trials or reweight the terminal payoff.
         first_affected = min(items, key=lambda item: (item["ts"], item["round"]))
-        variant = experiment.variant_for(turn.agent)
+        variant = first_affected["variant"]
         metric = by_variant[variant]
         metric["affected_games"] += 1
         metric["affected_turns"] += 1
@@ -795,6 +868,80 @@ def _neg_value_grid(value: Any) -> str:
     return "other"
 
 
+def _neg_target_artifact_identity(path: Path = TARGETS_PATH) -> dict:
+    digest = hashlib.sha256()
+    size = 0
+    try:
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+                size += len(chunk)
+    except OSError:
+        return {
+            "path": "data/targets.json",
+            "sha256": None,
+            "bytes": None,
+            "available": False,
+        }
+    return {
+        "path": "data/targets.json",
+        "sha256": digest.hexdigest(),
+        "bytes": size,
+        "available": True,
+    }
+
+
+def _neg_target_integrity(actual: dict | None = None) -> dict:
+    observed = dict(actual) if actual is not None else _neg_target_artifact_identity()
+    matches = bool(
+        observed.get("available") is not False
+        and observed.get("sha256") == _NEG_TARGET_ARTIFACT["sha256"]
+        and observed.get("bytes") == _NEG_TARGET_ARTIFACT["bytes"]
+    )
+    return {
+        "expected": dict(_NEG_TARGET_ARTIFACT),
+        "observed": observed,
+        "pool": "public-only (load_targets live=False)",
+        "pass": matches,
+    }
+
+
+def _neg_gate_assignment(
+    parsed: ParsedRecords,
+    experiment: Experiment,
+    agent: str,
+    ts: float,
+) -> tuple[str, str, str]:
+    eligible = [
+        event
+        for event in parsed.runtimes
+        if event.agent == agent
+        and experiment.cutoff <= event.ts <= ts
+        and experiment.knob in event.knobs
+    ]
+    if eligible:
+        event = max(eligible, key=lambda item: item.ts)
+        value = event.knobs.get(experiment.knob)
+        if value == experiment.treatment_value:
+            variant = "treatment"
+        elif value == experiment.control_value:
+            variant = "control"
+        else:
+            variant = "unknown"
+        identity = event.strategy_sha256 or event.git_head or "unknown"
+        epoch_id = f"runtime:{agent}:{event.ts:.6f}:{event.pid}:{identity[:12]}"
+        return variant, epoch_id, "runtime_manifest"
+
+    if agent in _NEG_STATIC_ASSIGNMENT["treatment_agents"]:
+        variant = "treatment"
+    elif agent in _NEG_STATIC_ASSIGNMENT["control_agents"]:
+        variant = "control"
+    else:
+        variant = experiment.variant_for(agent)
+    epoch_id = f"{_NEG_STATIC_ASSIGNMENT['epoch_id']}:{agent}:{variant}"
+    return variant, epoch_id, "frozen_static_assignment"
+
+
 def _neg_gate_payoff_percentile(
     turn: Turn,
     role: str,
@@ -834,7 +981,7 @@ def _neg_gate_unsupported_reason(cell: dict) -> str:
             f"horizon={cell.get('horizon', 'unknown')},"
             f"max_rounds={cell.get('max_rounds', 'unknown')}"
         )
-    if cell.get("opponent_type") != "hidden":
+    if cell.get("opponent_type") not in ("agent", "hidden"):
         return f"opponent_type={cell.get('opponent_type', 'unknown')}"
     return "not_in_frozen_reference"
 
@@ -857,7 +1004,10 @@ def _neg_terminal_gate_rows(
     reference_ids = {
         _neg_gate_cell_id(spec) for spec in _NEG_TERMINAL_REFERENCE_CELLS
     }
-    targets = get_targets()
+    target_integrity = _neg_target_integrity()
+    targets = (
+        load_targets(TARGETS_PATH, live=False) if target_integrity["pass"] else None
+    )
     rows: list[dict] = []
     for key, items in sorted(affected_by_game.items()):
         first = min(items, key=lambda item: (item["ts"], item["round"], item["phase"]))
@@ -905,10 +1055,15 @@ def _neg_terminal_gate_rows(
             ),
             None,
         )
+        variant, epoch_id, assignment_source = _neg_gate_assignment(
+            parsed, experiment, key[0], first["ts"]
+        )
         rows.append(
             {
                 "agent": key[0],
-                "variant": experiment.variant_for(key[0]),
+                "variant": variant,
+                "assignment_epoch_id": epoch_id,
+                "assignment_source": assignment_source,
                 "game_id": key[1],
                 "cell": cell,
                 "cell_id": cell_id,
@@ -1118,6 +1273,123 @@ def _neg_gate_standardized(
     }
 
 
+def _neg_gate_two_arm_contrast(
+    treatment: list[float], control: list[float], *, binary: bool
+) -> dict:
+    means = {
+        "treatment": sum(treatment) / len(treatment) if treatment else None,
+        "control": sum(control) / len(control) if control else None,
+    }
+    variances: dict[str, float | None] = {}
+    for variant, values in (("treatment", treatment), ("control", control)):
+        if binary and values:
+            probability = (sum(values) + 0.5) / (len(values) + 1)
+            variances[variant] = probability * (1 - probability)
+        else:
+            variances[variant] = _sample_variance(values)
+    estimate = (
+        means["treatment"] - means["control"]
+        if means["treatment"] is not None and means["control"] is not None
+        else None
+    )
+    standard_error = None
+    if estimate is not None and all(value is not None for value in variances.values()):
+        standard_error = math.sqrt(
+            variances["treatment"] / len(treatment)
+            + variances["control"] / len(control)
+        )
+    return {
+        "treatment_n": len(treatment),
+        "control_n": len(control),
+        "treatment": means["treatment"],
+        "control": means["control"],
+        "uplift": estimate,
+        "standard_error": standard_error,
+        "one_sided_95_lower": (
+            estimate - _Z_ONE_SIDED_95 * standard_error
+            if estimate is not None and standard_error is not None
+            else None
+        ),
+    }
+
+
+def _neg_gate_unsupported_safety(rows: list[dict]) -> dict:
+    unsupported = [
+        row
+        for row in rows
+        if not row.get("supported") and row.get("variant") in ("treatment", "control")
+    ]
+    if not unsupported:
+        return {
+            "present": False,
+            "pass": True,
+            "harm_fail": False,
+            "reason": "no unsupported policy-affected rows",
+            "cells": {},
+        }
+    grouped: dict[str, list[dict]] = defaultdict(list)
+    for row in unsupported:
+        grouped[row["cell_id"]].append(row)
+    output: dict[str, dict] = {}
+    all_pass = True
+    harm_fail = False
+    for cell_id, cell_rows in sorted(grouped.items()):
+        metrics = {}
+        for field, binary in (
+            ("direct", True),
+            ("normalized_payoff", False),
+            ("payoff_percentile", False),
+        ):
+            values = {"treatment": [], "control": []}
+            for row in cell_rows:
+                value = row.get(field)
+                if value is None:
+                    continue
+                parsed = float(bool(value)) if binary else _as_float(value)
+                if parsed is not None:
+                    values[row["variant"]].append(parsed)
+            metrics[field] = _neg_gate_two_arm_contrast(
+                values["treatment"], values["control"], binary=binary
+            )
+        sample_pass = all(
+            metric["treatment_n"] >= 15 and metric["control_n"] >= 45
+            for metric in metrics.values()
+        )
+        margins = {
+            "direct": -0.050,
+            "normalized_payoff": -0.005,
+            "payoff_percentile": -0.050,
+        }
+        noninferior = {
+            field: bool(
+                metric["one_sided_95_lower"] is not None
+                and metric["one_sided_95_lower"] > margins[field]
+            )
+            for field, metric in metrics.items()
+        }
+        cell_pass = sample_pass and all(noninferior.values())
+        harm_fail = harm_fail or (sample_pass and not all(noninferior.values()))
+        all_pass = all_pass and cell_pass
+        output[cell_id] = {
+            "cell": cell_rows[0].get("cell", {}),
+            "sample_pass": sample_pass,
+            "noninferiority": noninferior,
+            "pass": cell_pass,
+            "metrics": metrics,
+        }
+    return {
+        "present": True,
+        "pass": all_pass,
+        "harm_fail": harm_fail,
+        "reason": (
+            "all unsupported cells meet frozen sample and noninferiority gates"
+            if all_pass
+            else "unsupported cells lack support or fail noninferiority"
+        ),
+        "cells": output,
+    }
+
+
 def _normal_cdf(value: float) -> float:
     return 0.5 * (1 + math.erf(value / math.sqrt(2)))
 
@@ -1150,10 +1422,81 @@ def _neg_gate_conditional_power(
     return _normal_cdf(numerator / math.sqrt(1 - info))
 
 
+def _neg_gate_epoch_health(
+    parsed: ParsedRecords,
+    experiment: Experiment,
+    affected: list[dict],
+    agent_data: dict[str, dict],
+) -> dict[str, dict]:
+    by_variant = {
+        variant: {
+            "traffic_events": 0,
+            "errors": 0,
+            "invalid_results": 0,
+            "corrections": 0,
+            "replay_errors": 0,
+            "affected_wrong_variant": 0,
+            "affected_unknown": 0,
+            "direction_violations": 0,
+            "affected": 0,
+            "censored": 0,
+        }
+        for variant in ("treatment", "control")
+    }
+    for turn in parsed.turns.values():
+        if (
+            turn.agent not in experiment.agents
+            or turn.family != experiment.family
+            or turn.ts < experiment.cutoff
+        ):
+            continue
+        variant = _neg_gate_assignment(parsed, experiment, turn.agent, turn.ts)[0]
+        if variant not in by_variant:
+            continue
+        target = by_variant[variant]
+        target["traffic_events"] += 1
+        target["errors"] += int(bool(turn.error))
+        target["corrections"] += len(turn.corrections)
+    for event in parsed.results:
+        if (
+            event.agent not in experiment.agents
+            or event.ts < experiment.cutoff
+            or parsed.gid_family.get((event.agent, event.gid)) != experiment.family
+        ):
+            continue
+        variant = _neg_gate_assignment(parsed, experiment, event.agent, event.ts)[0]
+        if variant not in by_variant:
+            continue
+        target = by_variant[variant]
+        target["traffic_events"] += 1
+        target["errors"] += int(bool(event.error))
+        target["invalid_results"] += int(event.valid is False)
+    for item in affected:
+        variant = item.get("variant")
+        if variant not in by_variant:
+            continue
+        target = by_variant[variant]
+        target["affected_wrong_variant"] += int(
+            not item.get("assigned_match") and item.get("other_variant_match")
+        )
+        target["affected_unknown"] += int(
+            not item.get("assigned_match") and not item.get("other_variant_match")
+        )
+        target["direction_violations"] += int(bool(item.get("direction_violation")))
+    # Replay exceptions are global report-integrity failures. They cannot
+    # always be assigned to an epoch because no divergent row is then emitted.
+    by_variant["treatment"]["replay_errors"] = sum(
+        data.get("routing", {}).get("replay_errors", 0)
+        for data in agent_data.values()
+    )
+    return by_variant
+
+
 def _neg_gate_health(
     rows: list[dict],
     agent_data: dict[str, dict] | None,
     agent_variants: dict[str, str] | None,
+    epoch_health: dict[str, dict] | None = None,
 ) -> dict:
     by_variant = {
         variant: {
@@ -1171,7 +1514,12 @@ def _neg_gate_health(
         for variant in ("treatment", "control")
     }
     observed_variants = {row["agent"]: row["variant"] for row in rows}
-    if agent_data:
+    if epoch_health is not None:
+        for variant in ("treatment", "control"):
+            for key, value in epoch_health.get(variant, {}).items():
+                if key in by_variant[variant]:
+                    by_variant[variant][key] = value
+    elif agent_data:
         for agent, data in agent_data.items():
             variant = (agent_variants or {}).get(agent, observed_variants.get(agent))
             if variant not in by_variant:
@@ -1261,30 +1609,57 @@ def _neg_gate_health(
 
 
 def _neg_gate_agent_confirmation(rows: list[dict]) -> dict:
-    treatment_agents = sorted(
-        {row["agent"] for row in rows if row["variant"] == "treatment"}
+    treatment_epochs = sorted(
+        {
+            row.get("assignment_epoch_id", f"legacy:{row['agent']}")
+            for row in rows
+            if row["variant"] == "treatment"
+        }
     )
     blocks = []
-    for agent in treatment_agents:
+    for epoch_id in treatment_epochs:
+        treatment_rows = [
+            row
+            for row in rows
+            if row["variant"] == "treatment"
+            and row.get("assignment_epoch_id", f"legacy:{row['agent']}") == epoch_id
+            and row.get("supported")
+            and isinstance(row.get("direct"), bool)
+        ]
         block_rows = [
             row
             for row in rows
-            if row["variant"] == "control" or row["agent"] == agent
+            if row["variant"] == "control" or row in treatment_rows
         ]
         metric = _neg_gate_standardized(block_rows, "direct", binary=True)
+        by_value = Counter(row["cell"]["own_value_grid"] for row in treatment_rows)
+        by_identity = Counter(row["cell"]["opponent_type"] for row in treatment_rows)
+        sample_pass = bool(
+            len(treatment_rows) >= 60
+            and all(by_value[value] >= 15 for value in ("80", "100", "120", "150"))
+            and all(by_identity[kind] >= 20 for kind in ("agent", "hidden"))
+        )
         passes = bool(
-            metric["complete_fixed_support"]
+            sample_pass
+            and metric["complete_fixed_support"]
             and metric["uplift"] is not None
             and metric["uplift"] >= 0
         )
+        agents = sorted({row["agent"] for row in treatment_rows})
         blocks.append(
             {
-                "agent": agent,
-                "direct_trials": sum(
-                    isinstance(row.get("direct"), bool)
-                    for row in rows
-                    if row["agent"] == agent and row.get("supported")
+                "assignment_epoch_id": epoch_id,
+                "agents": agents,
+                "assignment_sources": sorted(
+                    {
+                        str(row.get("assignment_source", "legacy"))
+                        for row in treatment_rows
+                    }
                 ),
+                "direct_trials": len(treatment_rows),
+                "direct_trials_by_value": dict(sorted(by_value.items())),
+                "direct_trials_by_opponent_identity": dict(sorted(by_identity.items())),
+                "sample_pass": sample_pass,
                 "complete_fixed_support": metric["complete_fixed_support"],
                 "standardized_direct_uplift": metric["uplift"],
                 "nonnegative": passes,
@@ -1292,7 +1667,12 @@ def _neg_gate_agent_confirmation(rows: list[dict]) -> dict:
         )
     confirmed = sum(block["nonnegative"] for block in blocks)
     return {
-        "unit": "distinct treatment agent label (process epoch unavailable)",
+        "unit": "timestamped treatment assignment epoch",
+        "minimum_per_block": {
+            "total": 60,
+            "per_own_value_across_identity": 15,
+            "per_opponent_identity": 20,
+        },
         "required": 2,
         "confirmed": confirmed,
         "pass": confirmed >= 2,
@@ -1300,10 +1680,84 @@ def _neg_gate_agent_confirmation(rows: list[dict]) -> dict:
     }
 
 
+def _neg_gate_block_sample(rows: list[dict]) -> dict:
+    by_value = Counter(row["cell"]["own_value_grid"] for row in rows)
+    by_identity = Counter(row["cell"]["opponent_type"] for row in rows)
+    passes = bool(
+        len(rows) >= 60
+        and all(by_value[value] >= 15 for value in ("80", "100", "120", "150"))
+        and all(by_identity[kind] >= 20 for kind in ("agent", "hidden"))
+    )
+    return {
+        "direct_trials": len(rows),
+        "direct_trials_by_value": dict(sorted(by_value.items())),
+        "direct_trials_by_opponent_identity": dict(sorted(by_identity.items())),
+        "pass": passes,
+    }
+
+
+def _neg_gate_switchback_confirmation(rows: list[dict]) -> dict:
+    supported = [
+        row
+        for row in rows
+        if row.get("supported")
+        and row.get("variant") in ("treatment", "control")
+        and isinstance(row.get("direct"), bool)
+    ]
+    labels = []
+    for agent in sorted({row["agent"] for row in supported}):
+        agent_rows = [row for row in supported if row["agent"] == agent]
+        arm_rows = {
+            variant: [row for row in agent_rows if row["variant"] == variant]
+            for variant in ("treatment", "control")
+        }
+        samples = {
+            variant: _neg_gate_block_sample(arm_rows[variant])
+            for variant in ("treatment", "control")
+        }
+        runtime_arms = sorted(
+            {
+                row["variant"]
+                for row in agent_rows
+                if str(row.get("assignment_epoch_id", "")).startswith("runtime:")
+            }
+        )
+        metric = _neg_gate_standardized(agent_rows, "direct", binary=True)
+        passes = bool(
+            samples["treatment"]["pass"]
+            and samples["control"]["pass"]
+            and runtime_arms
+            and metric["complete_fixed_support"]
+            and metric["uplift"] is not None
+            and metric["uplift"] >= 0
+        )
+        labels.append(
+            {
+                "agent": agent,
+                "runtime_manifest_arms": runtime_arms,
+                "samples": samples,
+                "complete_fixed_support": metric["complete_fixed_support"],
+                "within_label_standardized_direct_uplift": metric["uplift"],
+                "pass": passes,
+            }
+        )
+    confirmed = sum(label["pass"] for label in labels)
+    return {
+        "unit": "agent label crossed over timestamped assignment epochs",
+        "required_labels": 2,
+        "confirmed_labels": confirmed,
+        "pass": confirmed >= 2,
+        "labels": labels,
+        "status_cap_without_pass": "screen_pass",
+    }
+
+
 def _neg_terminal_gate_from_rows(
     rows: list[dict],
     agent_data: dict[str, dict] | None = None,
     agent_variants: dict[str, str] | None = None,
+    target_artifact_identity: dict | None = None,
+    epoch_health: dict[str, dict] | None = None,
 ) -> dict:
     """Pure deterministic evaluator for the frozen hidden terminal-close gate."""
     counts = _neg_gate_counts(rows)
@@ -1315,8 +1769,11 @@ def _neg_terminal_gate_from_rows(
         "normalized_payoff": normalized,
         "payoff_percentile": percentile,
     }
-    health = _neg_gate_health(rows, agent_data, agent_variants)
+    health = _neg_gate_health(rows, agent_data, agent_variants, epoch_health)
     agent_confirmation = _neg_gate_agent_confirmation(rows)
+    switchback_confirmation = _neg_gate_switchback_confirmation(rows)
+    unsupported_safety = _neg_gate_unsupported_safety(rows)
+    target_integrity = _neg_target_integrity(target_artifact_identity)
     primary = {
         variant: counts["variants"][variant]["primary"]
         for variant in ("treatment", "control")
@@ -1342,15 +1799,15 @@ def _neg_terminal_gate_from_rows(
             and direct["one_sided_90_upper"] <= 0
         ):
             interim_reasons.append("one-sided 90% upper direct uplift <= 0")
-        if conditional_power is not None and conditional_power < 0.10:
-            interim_reasons.append("conditional power for planned +0.060 uplift < 0.10")
     if health["hard_fail"]:
         interim_reasons.append("health or direction hard-fail")
+    if unsupported_safety["harm_fail"]:
+        interim_reasons.append("unsupported policy-affected slice failed noninferiority")
 
     final_sample = treatment_n >= 340 and control_n >= 1020
     per_cell_sample = all(
-        cell["treatment"]["direct_trials"] >= 30
-        and cell["control"]["direct_trials"] >= 90
+        cell["treatment"]["direct_trials"] >= 15
+        and cell["control"]["direct_trials"] >= 45
         for cell in counts["cells"].values()
     )
     if final_sample and per_cell_sample:
@@ -1367,6 +1824,11 @@ def _neg_terminal_gate_from_rows(
         "control_direct_trials": control_n,
         "information_fraction": min(treatment_n / 340, control_n / 1020, 1.0),
         "conditional_power": conditional_power,
+        "conditional_power_binding": False,
+        "conditional_power_warning": (
+            "Legacy count-fraction approximation does not match the fixed "
+            "eight-cell estimator; diagnostic only."
+        ),
         "rollback": bool(interim_reasons),
         "reasons": interim_reasons,
     }
@@ -1390,12 +1852,22 @@ def _neg_terminal_gate_from_rows(
             percentile["one_sided_95_lower"] is not None
             and percentile["one_sided_95_lower"] > -0.050
         ),
-        "two_nonnegative_treatment_agent_blocks": agent_confirmation["pass"],
+        "two_supported_nonnegative_treatment_epochs": agent_confirmation["pass"],
+        "balanced_manifest_switchback": switchback_confirmation["pass"],
+        "payoff_target_artifact_matches_cutoff": target_integrity["pass"],
+        "unsupported_policy_slices_noninferior": unsupported_safety["pass"],
         "health": health["pass"],
         "no_interim_rollback": not interim["rollback"],
     }
     failed = [name for name, passed in passes.items() if not passed]
-    status = "rollback" if interim["rollback"] else ("promote" if not failed else "continue")
+    if interim["rollback"]:
+        status = "rollback"
+    elif not failed:
+        status = "promote"
+    elif failed == ["balanced_manifest_switchback"]:
+        status = "screen_pass"
+    else:
+        status = "continue"
 
     treatment_direct = direct["treatment"]
     control_direct = direct["control"]
@@ -1432,9 +1904,12 @@ def _neg_terminal_gate_from_rows(
         "counts": counts,
         "standardized": standardized,
         "compatibility_diagnostic": compatibility,
+        "payoff_target_integrity": target_integrity,
+        "unsupported_safety": unsupported_safety,
         "health": health,
         "interim": interim,
         "agent_confirmation": agent_confirmation,
+        "switchback_confirmation": switchback_confirmation,
         "promotion": {
             "status": status,
             "passes": passes,
@@ -1442,6 +1917,8 @@ def _neg_terminal_gate_from_rows(
             "reasons": (
                 interim_reasons
                 if status == "rollback"
+                else ["causal promotion capped pending balanced manifest switchback"]
+                if status == "screen_pass"
                 else [f"waiting for {name}" for name in failed]
             ),
         },
@@ -1689,7 +2166,12 @@ def analyze_experiment(
             control_action = {"_replay_error": f"{type(exc).__name__}: {exc}"}
             treatment_action = control_action
             routing["replay_errors"] += 1
-        assigned_variant = experiment.variant_for(turn.agent)
+        if experiment.name == "neg_terminal_close":
+            assigned_variant = _neg_gate_assignment(
+                parsed, experiment, turn.agent, turn.ts
+            )[0]
+        else:
+            assigned_variant = experiment.variant_for(turn.agent)
         assigned_action = (
             treatment_action if assigned_variant == "treatment" else control_action
         )
@@ -1780,6 +2262,9 @@ def analyze_experiment(
             gate_rows,
             agent_data,
             {agent: experiment.variant_for(agent) for agent in experiment.agents},
+            epoch_health=_neg_gate_epoch_health(
+                parsed, experiment, affected, agent_data
+            ),
         )
     return report
 

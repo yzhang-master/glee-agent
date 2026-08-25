@@ -108,6 +108,7 @@ def _gate_row(
     opponent_type="hidden",
     complete_information=False,
     direction_violation=False,
+    assignment_epoch_id=None,
 ):
     cell = {
         "role": role,
@@ -124,10 +125,10 @@ def _gate_row(
         and str(value) in {"80", "100", "120", "150"}
         and phase == "decision"
         and max_rounds == "10"
-        and opponent_type == "hidden"
+        and opponent_type in {"agent", "hidden"}
         and complete_information is False
     )
-    return {
+    row = {
         "agent": agent,
         "variant": variant,
         "game_id": f"{agent}-{value}",
@@ -146,6 +147,77 @@ def _gate_row(
         "direction_violation": direction_violation,
         "assigned_match": True,
     }
+    if assignment_epoch_id is not None:
+        row["assignment_epoch_id"] = assignment_epoch_id
+        row["assignment_source"] = "synthetic_timestamped_assignment"
+    return row
+
+
+def _promotable_gate_rows(*, switchback=True):
+    rows = []
+    cells = [
+        (opponent_type, value)
+        for opponent_type in ("agent", "hidden")
+        for value in (80, 100, 120, 150)
+    ]
+    for cell_index, (opponent_type, value) in enumerate(cells):
+        treatment_total = 43 if cell_index < 4 else 42
+        first = (treatment_total + 1) // 2
+        for agent, n, epoch_id in (
+            ("test_a", first, "static:test_a:treatment"),
+            ("test_b", treatment_total - first, "runtime:test_b:on"),
+        ):
+            rows.extend(
+                _gate_row(
+                    agent,
+                    "treatment",
+                    value,
+                    direct=index < 5,
+                    opponent_type=opponent_type,
+                    assignment_epoch_id=epoch_id,
+                )
+                for index in range(n)
+            )
+        control_n = 128 if cell_index < 4 else 127
+        if switchback:
+            for agent, epoch_id in (
+                ("test_a", "runtime:test_a:off"),
+                ("test_b", "static:test_b:control"),
+            ):
+                rows.extend(
+                    _gate_row(
+                        agent,
+                        "control",
+                        value,
+                        direct=index < 2,
+                        opponent_type=opponent_type,
+                        assignment_epoch_id=epoch_id,
+                    )
+                    for index in range(30)
+                )
+            remaining = control_n - 60
+            rows.extend(
+                _gate_row(
+                    "main",
+                    "control",
+                    value,
+                    direct=index < 6,
+                    opponent_type=opponent_type,
+                )
+                for index in range(remaining)
+            )
+        else:
+            rows.extend(
+                _gate_row(
+                    "main",
+                    "control",
+                    value,
+                    direct=index < 10,
+                    opponent_type=opponent_type,
+                )
+                for index in range(control_n)
+            )
+    return rows
 
 
 def test_strict_enrollment_dedup_latest_terminal_and_health():
@@ -404,29 +476,20 @@ def test_negotiation_gate_extracts_scaled_buyer_joint_cell_without_renormalizing
         cell
         for cell in gate["counts"]["cells"].values()
         if cell["cell"]["own_value_grid"] == "100"
+        and cell["cell"]["opponent_type"] == "hidden"
     )
     assert value_100["treatment"]["direct_trials"] == 1
     assert value_100["control"]["direct_trials"] == 1
-    assert value_100["weight"] == pytest.approx(402 / 1382)
+    assert value_100["weight"] == pytest.approx(207 / 1382)
     assert gate["standardized"]["direct"][
         "reference_weight_coverage"
-    ] == pytest.approx(402 / 1382)
+    ] == pytest.approx(207 / 1382)
     assert gate["standardized"]["direct"]["uplift"] is None
     assert gate["promotion"]["passes"]["complete_fixed_support"] is False
 
 
 def test_frozen_negotiation_gate_promotes_only_with_joint_support_and_two_agents():
-    rows = []
-    for value in (80, 100, 120, 150):
-        for agent, n in (("test_a", 43), ("test_b", 42)):
-            rows.extend(
-                _gate_row(agent, "treatment", value, direct=index < 9)
-                for index in range(n)
-            )
-        rows.extend(
-            _gate_row("main", "control", value, direct=index < 20)
-            for index in range(255)
-        )
+    rows = _promotable_gate_rows()
 
     gate = _neg_terminal_gate_from_rows(rows)
 
@@ -441,17 +504,225 @@ def test_frozen_negotiation_gate_promotes_only_with_joint_support_and_two_agents
         "direct_trials"
     ] == 1020
     assert all(
-        cell["treatment"]["direct_trials"] == 85
-        and cell["control"]["direct_trials"] == 255
+        cell["treatment"]["direct_trials"] >= 42
+        and cell["control"]["direct_trials"] >= 127
         for cell in gate["counts"]["cells"].values()
     )
-    assert gate["standardized"]["direct"]["uplift"] == pytest.approx(
-        18 / 85 - 20 / 255
-    )
+    assert gate["standardized"]["direct"]["uplift"] > 0.10
     assert gate["standardized"]["direct"]["one_sided_95_lower"] > 0
     assert gate["agent_confirmation"]["confirmed"] == 2
     assert gate["promotion"]["status"] == "promote"
     assert all(gate["promotion"]["passes"].values())
+
+
+def test_fixed_label_evidence_is_capped_at_screen_pass_without_switchback():
+    gate = _neg_terminal_gate_from_rows(
+        _promotable_gate_rows(switchback=False)
+    )
+
+    assert gate["agent_confirmation"]["pass"] is True
+    assert gate["switchback_confirmation"]["pass"] is False
+    assert gate["promotion"]["passes"]["balanced_manifest_switchback"] is False
+    assert gate["promotion"]["status"] == "screen_pass"
+    assert gate["promotion"]["failed_checks"] == [
+        "balanced_manifest_switchback"
+    ]
+
+
+def test_second_treatment_epoch_cannot_confirm_on_four_games():
+    rows = []
+    cells = [
+        (opponent_type, value)
+        for opponent_type in ("agent", "hidden")
+        for value in (80, 100, 120, 150)
+    ]
+    for cell_index, (opponent_type, value) in enumerate(cells):
+        rows.extend(
+            _gate_row(
+                "test_a",
+                "treatment",
+                value,
+                direct=index < 10,
+                opponent_type=opponent_type,
+                assignment_epoch_id="static:test_a",
+            )
+            for index in range(42)
+        )
+        if cell_index < 4:
+            rows.append(
+                _gate_row(
+                    "test_b",
+                    "treatment",
+                    value,
+                    direct=True,
+                    opponent_type=opponent_type,
+                    assignment_epoch_id="runtime:test_b:200",
+                )
+            )
+        control_n = 128 if cell_index < 4 else 127
+        rows.extend(
+            _gate_row(
+                "main",
+                "control",
+                value,
+                direct=index < 10,
+                opponent_type=opponent_type,
+            )
+            for index in range(control_n)
+        )
+
+    gate = _neg_terminal_gate_from_rows(rows)
+    blocks = {
+        block["assignment_epoch_id"]: block
+        for block in gate["agent_confirmation"]["blocks"]
+    }
+
+    assert gate["counts"]["variants"]["treatment"]["primary"][
+        "direct_trials"
+    ] == 340
+    assert blocks["static:test_a"]["sample_pass"] is True
+    assert blocks["runtime:test_b:200"]["direct_trials"] == 4
+    assert blocks["runtime:test_b:200"]["sample_pass"] is False
+    assert gate["agent_confirmation"]["confirmed"] == 1
+    assert gate["promotion"]["status"] == "continue"
+    assert gate["promotion"]["passes"][
+        "two_supported_nonnegative_treatment_epochs"
+    ] is False
+
+
+def test_payoff_target_artifact_drift_blocks_promotion():
+    gate = _neg_terminal_gate_from_rows(
+        _promotable_gate_rows(),
+        target_artifact_identity={
+            "path": "data/targets.json",
+            "sha256": "0" * 64,
+            "bytes": 642520,
+            "available": True,
+        },
+    )
+
+    assert gate["payoff_target_integrity"]["pass"] is False
+    assert gate["promotion"]["passes"][
+        "payoff_target_artifact_matches_cutoff"
+    ] is False
+    assert gate["promotion"]["status"] == "continue"
+
+
+def test_unsupported_policy_slice_harm_blocks_otherwise_promotable_gate():
+    rows = _promotable_gate_rows()
+    rows.extend(
+        _gate_row("test_a", "treatment", 100, direct=False, role="seller")
+        for _ in range(1000)
+    )
+    rows.extend(
+        _gate_row("main", "control", 100, direct=True, role="seller")
+        for _ in range(1000)
+    )
+
+    gate = _neg_terminal_gate_from_rows(rows)
+
+    assert gate["counts"]["unsupported"]["total"] == 2000
+    assert gate["unsupported_safety"]["present"] is True
+    assert gate["unsupported_safety"]["harm_fail"] is True
+    assert gate["promotion"]["passes"][
+        "unsupported_policy_slices_noninferior"
+    ] is False
+    assert gate["promotion"]["status"] == "rollback"
+
+
+def test_runtime_assignment_does_not_reclassify_earlier_control_game():
+    experiment = Experiment(
+        "neg_terminal_close",
+        "negotiation",
+        100,
+        ("test_a",),
+        ("main", "test_b"),
+        "neg_terminal_close",
+        True,
+        False,
+    )
+
+    def replay(game, knobs):
+        if game["game_state"]["round"] == 1:
+            return {"product_price": 6000}
+        return {
+            "decision": "RejectOffer",
+            "product_price": 9000 if knobs.neg_terminal_close else 8500,
+        }
+
+    common = {
+        "family": "negotiation",
+        "your_player": "player_2",
+        "max_rounds": 10,
+        "horizon_known": True,
+        "complete_information": False,
+        "player_1_role": "seller",
+        "player_2_role": "buyer",
+        "player_2_value": 10000,
+    }
+    records = [
+        _turn("test_b", "before", 110, action={"product_price": 6000}, **common),
+        _turn(
+            "test_b",
+            "before",
+            120,
+            round_=9,
+            phase="decision",
+            history=[{"round": 1}],
+            action={"decision": "RejectOffer", "product_price": 8500},
+            **common,
+        ),
+        _result(
+            "test_b",
+            "before",
+            125,
+            {"outcome": "no_deal", "agreed_round": None, "player_2_payoff": 0},
+        ),
+        {
+            "type": "runtime",
+            "ts": 150,
+            "_agent": "test_b",
+            "agent": "test_b",
+            "pid": 77,
+            "knobs": {"neg_terminal_close": True},
+            "git_head": "a" * 40,
+            "content_hashes": {
+                "strategy_python": {"aggregate_sha256": "b" * 64}
+            },
+        },
+        _turn("test_b", "after", 160, action={"product_price": 6000}, **common),
+        _turn(
+            "test_b",
+            "after",
+            170,
+            round_=9,
+            phase="decision",
+            history=[{"round": 1}],
+            action={"decision": "RejectOffer", "product_price": 9000},
+            **common,
+        ),
+        _result(
+            "test_b",
+            "after",
+            175,
+            {"outcome": "no_deal", "agreed_round": None, "player_2_payoff": 0},
+        ),
+    ]
+
+    report = build_report(records, experiments=(experiment,), replay=replay)[
+        "experiments"
+    ][0]
+
+    assert [item["variant"] for item in report["affected_turns"]] == [
+        "control",
+        "treatment",
+    ]
+    assert report["metrics"]["control"]["direct_resolved"] == 1
+    assert report["metrics"]["treatment"]["direct_resolved"] == 1
+    blocks = report["gate"]["agent_confirmation"]["blocks"]
+    assert len(blocks) == 1
+    assert blocks[0]["assignment_epoch_id"].startswith("runtime:test_b:150.000000")
+    assert blocks[0]["sample_pass"] is False
 
 
 def test_frozen_negotiation_gate_interim_zero_conversion_and_health_rollback():
@@ -474,6 +745,7 @@ def test_frozen_negotiation_gate_interim_zero_conversion_and_health_rollback():
     gate = _neg_terminal_gate_from_rows(rows)
 
     assert gate["interim"]["stage"] == "interim_1"
+    assert gate["interim"]["conditional_power_binding"] is False
     assert gate["interim"]["rollback"] is True
     assert "T>=50/C>=150 with zero treatment conversions" in gate["interim"][
         "reasons"
@@ -495,6 +767,21 @@ def test_frozen_gate_design_was_not_tuned_on_post_pilot_outcomes():
     assert (
         NEG_TERMINAL_GATE_DESIGN["pilot_checkpoint"]["used_to_tune_thresholds"]
         is False
+    )
+    assert sum(
+        cell["historical_resolved"]
+        for cell in NEG_TERMINAL_GATE_DESIGN["reference_cells"]
+    ) == 1382
+    assert sum(
+        cell["historical_direct_converted"]
+        for cell in NEG_TERMINAL_GATE_DESIGN["reference_cells"]
+    ) == 103
+    assert {
+        cell["opponent_type"]
+        for cell in NEG_TERMINAL_GATE_DESIGN["reference_cells"]
+    } == {"agent", "hidden"}
+    assert NEG_TERMINAL_GATE_DESIGN["payoff_target_artifact"]["sha256"] == (
+        "1d24a579ca2b611e3b30af4ddf7af5b84ad13e7198fa55b93a2f5e6617e65e25"
     )
 
 
