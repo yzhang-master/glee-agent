@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
-  "declaration_id": "confirmation-v2-final-look-20260828-2130z",
-  "declared_at": 1787685164,
+  "declaration_id": "confirmation-v2-final-look-20260828-2130z-r2",
+  "declared_at": 1787689408,
   "assignment": {
     "artifact_path": "data/canary_assignment.json",
     "artifact_sha256": "b002b688d02df3233b7dd4f21a5595cf149b4cc8dd501a0bfc2ee5bccd11d745",
@@ -65,8 +65,10 @@
     }
   },
   "prefix_manifest": {
-    "procedure_version": "ordered-physical-jsonl-prefix-v1",
-    "materialize_at": 1787952600,
+    "procedure_version": "stable-filtered-jsonl-snapshot-v2",
+    "capture_not_before": 1787952900,
+    "settlement_delay_seconds": 300,
+    "output_path_template": "data/canary-confirmation-prefix/{declaration_sha256}.json",
     "path_order": "ascending UTF-8 byte order of project-relative POSIX paths",
     "event_log_paths": {
       "path_template": "logs/{agent}-{utc_date}.jsonl",
@@ -84,7 +86,7 @@
       ],
       "all_expanded_paths_required": true,
       "maximum_bytes_per_file": 2147483648,
-      "prefix_rule": "from byte zero through the newline ending the last contiguous record whose literal numeric top-level ts is at most analysis_as_of; timestamps must be nondecreasing and every included record must be strict UTF-8 JSON"
+      "prefix_rule": "capture a stable newline-terminated physical extent no earlier than capture_not_before; every physical line must be strict UTF-8 JSON with unique keys and a literal finite non-boolean numeric top-level ts; timestamp order is unconstrained; select the exact raw newline-terminated bytes, in physical order, of every record whose ts is at most analysis_as_of; exclude later records wherever they occur; read the captured extent twice and require identical extent hashes and selections"
     },
     "assignment_receipt_paths": {
       "path_template": "logs/canary-assignments/{agent}/b002b688d02df3233b7dd4f21a5595cf149b4cc8dd501a0bfc2ee5bccd11d745.jsonl",
@@ -103,7 +105,7 @@
       "follow_symlinks": false,
       "require_regular_files": true,
       "open_mode": "component-wise dirfd walk with O_NOFOLLOW, then O_RDONLY|O_CLOEXEC|O_NOFOLLOW",
-      "snapshot": "capture device, inode, and size from the opened descriptor; read no more than the declared per-file bound; reject a changed descriptor identity or a non-newline-terminated selected prefix"
+      "snapshot": "capture device, inode, and size from the opened descriptor no earlier than capture_not_before; read no more than the declared per-file bound; require a newline-terminated extent and two identical reads through the same descriptor; reject changed device, inode, type, shrinkage, or any change within the captured extent while permitting later append-only growth"
     },
     "entry_schema": [
       "path",
@@ -111,12 +113,13 @@
       "device",
       "inode",
       "snapshot_bytes",
-      "prefix_bytes",
-      "records",
-      "first_timestamp",
-      "last_timestamp",
-      "sha256"
+      "snapshot_sha256",
+      "selected_bytes",
+      "selected_records",
+      "minimum_selected_timestamp",
+      "maximum_selected_timestamp",
+      "selection_sha256"
     ],
-    "aggregate_identity": "sha256 of UTF-8 canonical JSON for the exact ordered entry array, using sorted object keys and separators comma and colon, prefixed by confirmation-prefix-manifest-v1 plus a NUL byte"
+    "aggregate_identity": "sha256 of UTF-8 canonical JSON for the exact ordered entry array, using sorted object keys and separators comma and colon, prefixed by confirmation-prefix-manifest-v2 plus a NUL byte"
   }
 }

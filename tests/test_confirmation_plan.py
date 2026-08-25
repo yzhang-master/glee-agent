@@ -169,6 +169,22 @@ def test_huge_json_integer_fails_closed_as_invalid_json(tmp_path):
     assert loaded.plan is None
 
 
+def test_escaped_lone_surrogate_fails_closed_during_canonicalization(tmp_path):
+    declaration, _assignment = _copy_valid_artifacts(tmp_path)
+    _rewrite_document(
+        declaration,
+        lambda document: document["families"]["bargaining"].update(
+            population="\ud800"
+        ),
+    )
+
+    loaded = load_confirmation_plan(project_root=tmp_path)
+
+    assert loaded.status == "invalid"
+    assert loaded.error_code == "invalid_canonical_json"
+    assert loaded.plan is None
+
+
 @pytest.mark.parametrize(
     "relative_path",
     (Path("../canary_analysis_plan.json"), Path("/tmp/canary_analysis_plan.json")),

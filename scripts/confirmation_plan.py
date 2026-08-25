@@ -25,15 +25,15 @@ SCHEMA_VERSION = 1
 MAX_DECLARATION_BYTES = 64 * 1024
 MAX_LINKED_ARTIFACT_BYTES = 64 * 1024
 
-DECLARATION_ID = "confirmation-v2-final-look-20260828-2130z"
+DECLARATION_ID = "confirmation-v2-final-look-20260828-2130z-r2"
 DECLARATION_SHA256 = (
-    "11a1679a6b789a4f2ae69ef3a175eebf31384b86668cc5bf3f8c9ace20469dc2"
+    "39943a3877adafae71f6bdacfab13a02f0065dc1b955ef6184fbb14dfe20e260"
 )
 DECLARATION_CANONICAL_SHA256 = (
-    "3a7d7b6faf356437b2a8ac18a03411d6d73f2f4e95b70e6c26b6241bb5b3bdb8"
+    "72aefcf5c9477b0a51eda85da7da07e23f7dc0ee6ae7b5e815fc163a8f7d51b8"
 )
-DECLARATION_BYTES = 5307
-DECLARED_AT = 1787685164
+DECLARATION_BYTES = 5950
+DECLARED_AT = 1787689408
 
 ASSIGNMENT_ARTIFACT_PATH = "data/canary_assignment.json"
 ASSIGNMENT_ARTIFACT_SHA256 = (
@@ -59,7 +59,12 @@ TARGET_SHA256 = {
 
 FINAL_LOOK_ID = "final-confirmatory-expiry-plus-persuasion-maturity-v1"
 FINAL_ANALYSIS_AS_OF = 1787952600
-PREFIX_PROCEDURE_VERSION = "ordered-physical-jsonl-prefix-v1"
+PREFIX_PROCEDURE_VERSION = "stable-filtered-jsonl-snapshot-v2"
+PREFIX_CAPTURE_NOT_BEFORE = 1787952900
+PREFIX_SETTLEMENT_DELAY_SECONDS = 300
+PREFIX_OUTPUT_PATH_TEMPLATE = (
+    "data/canary-confirmation-prefix/{declaration_sha256}.json"
+)
 FAMILY_RULES = {
     "bargaining": "barg-anchor-confirm-v2",
     "negotiation": "neg-terminal-confirm-v2",
@@ -129,7 +134,9 @@ _FAMILY_FIELDS = {
 }
 _PREFIX_FIELDS = {
     "procedure_version",
-    "materialize_at",
+    "capture_not_before",
+    "settlement_delay_seconds",
+    "output_path_template",
     "path_order",
     "event_log_paths",
     "assignment_receipt_paths",
@@ -158,11 +165,12 @@ _ENTRY_SCHEMA = (
     "device",
     "inode",
     "snapshot_bytes",
-    "prefix_bytes",
-    "records",
-    "first_timestamp",
-    "last_timestamp",
-    "sha256",
+    "snapshot_sha256",
+    "selected_bytes",
+    "selected_records",
+    "minimum_selected_timestamp",
+    "maximum_selected_timestamp",
+    "selection_sha256",
 )
 
 
@@ -187,6 +195,8 @@ class ConfirmationPlan:
     analysis_as_of: int
     family_maturity_lags: tuple[tuple[str, int], ...]
     prefix_procedure_version: str
+    prefix_capture_not_before: int
+    prefix_output_path_template: str
 
     def manifest(self) -> dict[str, Any]:
         return {
@@ -203,6 +213,8 @@ class ConfirmationPlan:
             "analysis_as_of": self.analysis_as_of,
             "family_maturity_lags": dict(self.family_maturity_lags),
             "prefix_procedure_version": self.prefix_procedure_version,
+            "prefix_capture_not_before": self.prefix_capture_not_before,
+            "prefix_output_path_template": self.prefix_output_path_template,
         }
 
 
@@ -285,13 +297,16 @@ def _exact_string_list(value: Any, expected: tuple[str, ...], code: str) -> None
 
 
 def _canonical_json(document: dict[str, Any]) -> bytes:
-    return json.dumps(
-        document,
-        ensure_ascii=False,
-        allow_nan=False,
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
+    try:
+        return json.dumps(
+            document,
+            ensure_ascii=False,
+            allow_nan=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    except (TypeError, ValueError, UnicodeError, RecursionError):
+        raise _DeclarationError("invalid_canonical_json") from None
 
 
 def _validate_relative_path(relative_path: Path, code: str) -> tuple[str, ...]:
@@ -543,11 +558,27 @@ def _parse_document(raw: bytes) -> tuple[dict[str, Any], ConfirmationPlan, str]:
     )
     if prefix_manifest["procedure_version"] != PREFIX_PROCEDURE_VERSION:
         raise _DeclarationError("unexpected_prefix_procedure")
+    capture_not_before = _integer(
+        prefix_manifest["capture_not_before"], "invalid_capture_not_before"
+    )
+    settlement_delay = _integer(
+        prefix_manifest["settlement_delay_seconds"],
+        "invalid_settlement_delay",
+    )
     if (
-        _integer(prefix_manifest["materialize_at"], "invalid_materialize_at")
-        != analysis_as_of
+        capture_not_before != PREFIX_CAPTURE_NOT_BEFORE
+        or settlement_delay != PREFIX_SETTLEMENT_DELAY_SECONDS
+        or capture_not_before != analysis_as_of + settlement_delay
     ):
-        raise _DeclarationError("prefix_materialization_mismatch")
+        raise _DeclarationError("prefix_capture_timeline_mismatch")
+    if (
+        _string(
+            prefix_manifest["output_path_template"],
+            "invalid_prefix_output_path_template",
+        )
+        != PREFIX_OUTPUT_PATH_TEMPLATE
+    ):
+        raise _DeclarationError("unexpected_prefix_output_path_template")
     _string(prefix_manifest["path_order"], "invalid_prefix_path_order")
 
     event_source = _object(
@@ -626,6 +657,8 @@ def _parse_document(raw: bytes) -> tuple[dict[str, Any], ConfirmationPlan, str]:
         analysis_as_of=analysis_as_of,
         family_maturity_lags=tuple(lags),
         prefix_procedure_version=PREFIX_PROCEDURE_VERSION,
+        prefix_capture_not_before=capture_not_before,
+        prefix_output_path_template=PREFIX_OUTPUT_PATH_TEMPLATE,
     )
     return body, plan, canonical_sha256
 
