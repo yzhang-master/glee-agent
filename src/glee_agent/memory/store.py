@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import sqlite3
 from pathlib import Path
 
@@ -18,6 +19,12 @@ from ..logging_ import LOG_DIR
 logger = logging.getLogger(__name__)
 
 DB_PATH = Path(__file__).resolve().parents[3] / "data" / "agent.db"
+
+# Keep write transactions short enough that a backlog import does not hold the
+# SQLite writer lock for the whole pass.  A single unusually large JSONL record
+# is still ingested atomically, so these are soft (record-boundary) limits.
+_INGEST_CHUNK_MAX_RECORDS = 1_000
+_INGEST_CHUNK_MAX_BYTES = 4 * 1024 * 1024
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS ingest_meta (
@@ -46,7 +53,8 @@ CREATE TABLE IF NOT EXISTS lb (
 CREATE TABLE IF NOT EXISTS games (
     game_id TEXT, agent TEXT, family TEXT, your_player TEXT,
     opp_type TEXT, opp_name TEXT, config_json TEXT, config_key TEXT,
-    first_ts REAL, last_ts REAL, n_turns INTEGER, n_corrections INTEGER,
+    first_ts REAL, last_ts REAL, latest_turn_ts REAL,
+    n_turns INTEGER, n_corrections INTEGER,
     n_errors INTEGER, n_invalid INTEGER, outcome TEXT, my_payoff REAL,
     opp_payoff REAL, agreed_round INTEGER, result_json TEXT,
     PRIMARY KEY (game_id, agent)
@@ -80,6 +88,26 @@ def connect(db_path: Path | None = None) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.executescript(_SCHEMA)
+    # Existing stores predate ``latest_turn_ts``.  Keeping it in the rollup is
+    # what makes metadata selection invariant to ingestion chunk boundaries;
+    # ALTER TABLE is metadata-only and therefore safe for a large live store.
+    game_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(games)")
+    }
+    if "latest_turn_ts" not in game_columns:
+        # Serialize the check-and-alter so two first-time callers cannot both
+        # observe the old schema and race to add the same column.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            game_columns = {
+                row["name"] for row in conn.execute("PRAGMA table_info(games)")
+            }
+            if "latest_turn_ts" not in game_columns:
+                conn.execute("ALTER TABLE games ADD COLUMN latest_turn_ts REAL")
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
     conn.commit()
     return conn
 
@@ -90,25 +118,16 @@ def ingest(log_dir: Path | None = None, db_path: Path | None = None) -> dict:
     legacy turn records; unparseable lines are counted as skipped. Never
     raises. Returns {"turns","results","snapshots","lb","skipped"} counts of
     records ingested this call."""
-    counts = {"turns": 0, "results": 0, "snapshots": 0, "lb": 0, "skipped": 0}
+    counts = _new_counts()
     conn: sqlite3.Connection | None = None
     try:
         directory = Path(log_dir) if log_dir is not None else LOG_DIR
         conn = connect(db_path)
-        # Serialize the WHOLE pass (offset reads included) as one write
-        # transaction: without this, two concurrent ingests both read the same
-        # offset and double-ingest the same lines, permanently inflating the
-        # additive rollup counters. A concurrent caller blocks here (up to the
-        # 30s sqlite timeout) and then re-reads the advanced offsets.
-        conn.execute("BEGIN IMMEDIATE")
-        acc: dict[tuple[str, str], dict] = {}
         for path in sorted(directory.glob("*.jsonl")):
             try:
-                _ingest_file(conn, path, counts, acc)
+                _ingest_file(conn, path, counts)
             except Exception:  # noqa: BLE001 — one bad file must not stop ingest
                 logger.exception("ingest: failed reading %s", path)
-        _apply_rollups(conn, acc)
-        conn.commit()
     except Exception:  # noqa: BLE001 — ingest must never raise into the game loop
         logger.exception("ingest failed")
         try:
@@ -128,41 +147,124 @@ def ingest(log_dir: Path | None = None, db_path: Path | None = None) -> dict:
 # --- per-file / per-line ingestion -----------------------------------------
 
 
+def _new_counts() -> dict[str, int]:
+    return {"turns": 0, "results": 0, "snapshots": 0, "lb": 0, "skipped": 0}
+
+
+def _numeric_ts(value: object) -> int | float | None:
+    """Return a finite JSON number timestamp, excluding bools and strings."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float) and math.isfinite(value):
+        return value
+    return None
+
+
 def _ingest_file(
-    conn: sqlite3.Connection, path: Path, counts: dict, acc: dict[str, dict]
+    conn: sqlite3.Connection, path: Path, counts: dict[str, int]
 ) -> None:
-    key = str(path.resolve())
-    row = conn.execute(
-        "SELECT offset FROM ingest_meta WHERE path = ?", (key,)
-    ).fetchone()
-    offset = int(row["offset"]) if row is not None else 0
-    size = path.stat().st_size
-    if size < offset:  # file shrank (rotated/truncated) — start over
-        offset = 0
-    consumed = offset
-    agent_default = path.name.split("-", 1)[0]
+    """Drain one file through independently committed, bounded chunks."""
+    while True:
+        # The common steady-state path is already caught up.  Avoid acquiring
+        # SQLite's writer lock for every log file merely to rewrite an
+        # unchanged offset.  A concurrent append after this check is safely
+        # picked up by the next ingest pass, just like an append after EOF.
+        key = str(path.resolve())
+        row = conn.execute(
+            "SELECT offset FROM ingest_meta WHERE path = ?", (key,)
+        ).fetchone()
+        offset = int(row["offset"]) if row is not None else 0
+        if path.stat().st_size == offset:
+            return
+        chunk_counts, done = _ingest_chunk(conn, path)
+        for name, value in chunk_counts.items():
+            counts[name] += value
+        if done:
+            return
+
+
+def _ingest_chunk(
+    conn: sqlite3.Connection, path: Path
+) -> tuple[dict[str, int], bool]:
+    """Commit at most one bounded chunk from ``path``.
+
+    The offset is read only after ``BEGIN IMMEDIATE`` has acquired SQLite's
+    writer lock.  Consequently, concurrent ingesters can interleave chunks but
+    cannot consume the same starting offset.  Raw rows, game rollups, and the
+    ending offset are committed (or rolled back) as one unit.
+
+    Returns the committed record counts and whether the file reached EOF (or a
+    partial trailing line) during this chunk.
+    """
+    counts = _new_counts()
+    acc: dict[tuple[str, str], dict] = {}
+    done = False
+    conn.execute("BEGIN IMMEDIATE")
     try:
+        key = str(path.resolve())
+        row = conn.execute(
+            "SELECT offset FROM ingest_meta WHERE path = ?", (key,)
+        ).fetchone()
+        stored_offset = int(row["offset"]) if row is not None else 0
+        offset = stored_offset
+        size = path.stat().st_size
+        if size < offset:  # file shrank (rotated/truncated) — start over
+            offset = 0
+        consumed = offset
+        agent_default = path.name.split("-", 1)[0]
+        chunk_records = 0
+        chunk_bytes = 0
         with path.open("rb") as f:
             f.seek(offset)
-            for raw in f:
+            while True:
+                raw = f.readline()
+                if not raw:
+                    done = True
+                    break
                 if not raw.endswith(b"\n"):
+                    done = True
                     break  # partial trailing line (mid-write) — retry next time
                 _ingest_line(conn, raw, agent_default, counts, acc)
                 consumed += len(raw)
-    finally:
+                chunk_records += 1
+                chunk_bytes += len(raw)
+                if (
+                    chunk_records >= _INGEST_CHUNK_MAX_RECORDS
+                    or chunk_bytes >= _INGEST_CHUNK_MAX_BYTES
+                ):
+                    break
+
+        # A racing ingester may have drained the file between the optimistic
+        # preflight and our lock acquisition.  Likewise, a brand-new file may
+        # contain only a partial line.  Nothing changed, so release the lock
+        # without generating an empty WAL commit.
+        if chunk_records == 0 and (row is None or consumed == stored_offset):
+            conn.rollback()
+            return counts, done
+
+        _apply_rollups(conn, acc)
         conn.execute(
             "INSERT INTO ingest_meta(path, offset) VALUES(?, ?) "
             "ON CONFLICT(path) DO UPDATE SET offset = excluded.offset",
             (key, consumed),
         )
+        conn.commit()
+    except BaseException:
+        # BaseException includes process-level interruptions.  Re-raise them,
+        # but never leave their partial rows/rollups in an open transaction.
+        conn.rollback()
+        raise
+    return counts, done
 
 
 def _ingest_line(
     conn: sqlite3.Connection,
     raw: bytes,
     agent_default: str,
-    counts: dict,
-    acc: dict[str, dict],
+    counts: dict[str, int],
+    acc: dict[tuple[str, str], dict],
 ) -> None:
     try:
         rec = json.loads(raw.decode("utf-8", errors="replace"))
@@ -197,7 +299,10 @@ def _ingest_line(
 
 
 def _handle_turn(
-    conn: sqlite3.Connection, rec: dict, agent_default: str, acc: dict[str, dict]
+    conn: sqlite3.Connection,
+    rec: dict,
+    agent_default: str,
+    acc: dict[tuple[str, str], dict],
 ) -> None:
     game = rec.get("game") if isinstance(rec.get("game"), dict) else {}
     state = game.get("game_state") if isinstance(game.get("game_state"), dict) else {}
@@ -205,6 +310,11 @@ def _handle_turn(
     va = game.get("valid_actions") if isinstance(game.get("valid_actions"), dict) else {}
     corrections = rec.get("corrections") if isinstance(rec.get("corrections"), list) else []
     ts = rec.get("ts")
+    # Keep SQLite's representation aligned with the metadata-selection rule.
+    # REAL affinity would otherwise coerce a malformed numeric-looking string
+    # (for example ``"9999999999"``) into a numeric value that later wins
+    # MAX(ts), despite Python correctly treating it as an invalid timestamp.
+    tsv = _numeric_ts(ts)
     agent = rec.get("agent") or agent_default
     game_id = game.get("game_id")
     family = game.get("game_family")
@@ -217,7 +327,7 @@ def _handle_turn(
         " corrections_json, elapsed_s, error, state_json)"
         " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
         (
-            ts, agent, game_id, family, your_player,
+            tsv, agent, game_id, family, your_player,
             state.get("round"),
             game.get("phase") or state.get("phase"),
             va.get("type"),
@@ -238,7 +348,6 @@ def _handle_turn(
     a["n_corrections"] += len(corrections)
     if error not in (None, ""):
         a["n_errors"] += 1
-    tsv = ts if isinstance(ts, (int, float)) else None
     # A turn only wins "latest" with a real, newer timestamp (a malformed ts
     # must not overwrite the seat/config of a properly-stamped turn).
     if a["latest_turn_ts"] is None or (tsv is not None and tsv >= a["latest_turn_ts"]):
@@ -264,7 +373,10 @@ def _handle_turn(
 
 
 def _handle_result(
-    conn: sqlite3.Connection, rec: dict, agent_default: str, acc: dict[str, dict]
+    conn: sqlite3.Connection,
+    rec: dict,
+    agent_default: str,
+    acc: dict[tuple[str, str], dict],
 ) -> None:
     ts = rec.get("ts")
     agent = rec.get("agent") or agent_default
@@ -362,7 +474,8 @@ def _new_acc() -> dict:
 
 
 def _acc_ts(a: dict, ts: object) -> None:
-    if not isinstance(ts, (int, float)):
+    ts = _numeric_ts(ts)
+    if ts is None:
         return
     a["first_ts"] = ts if a["first_ts"] is None else min(a["first_ts"], ts)
     a["last_ts"] = ts if a["last_ts"] is None else max(a["last_ts"], ts)
@@ -421,12 +534,30 @@ def _apply_rollups(conn: sqlite3.Connection, acc: dict[tuple[str, str], dict]) -
             return old[col] if old is not None and old[col] is not None else default
 
         agent = acc_agent  # the accumulator key IS the row identity
-        if a["has_turn"]:  # this run's turns are newer than any previously stored
+        old_turn_ts = _numeric_ts(_old("latest_turn_ts"))
+        if old is not None and old_turn_ts is None:
+            # Lazy backfill for stores migrated from the original schema.  The
+            # current chunk's rows are already present, so MAX also protects
+            # against an older chunk overwriting newer historical metadata.
+            old_turn_ts = conn.execute(
+                "SELECT MAX(ts) FROM turns WHERE game_id = ? AND agent = ? "
+                "AND typeof(ts) IN ('integer', 'real')",
+                (game_id, acc_agent),
+            ).fetchone()[0]
+        current_turn_ts = a["latest_turn_ts"]
+        current_turn_is_latest = a["has_turn"] and (
+            old_turn_ts is None
+            or (current_turn_ts is not None and current_turn_ts >= old_turn_ts)
+        )
+        if current_turn_is_latest:
             family, your_player = a["family"], a["your_player"]
             config_json, config_key = a["config_json"], a["config_key"]
         else:
             family, your_player = _old("family"), _old("your_player")
             config_json, config_key = _old("config_json"), _old("config_key")
+        latest_turn_ts = (
+            current_turn_ts if current_turn_is_latest else old_turn_ts
+        )
 
         if _opp_known(_old("opp_type")):
             opp_type, opp_name = old["opp_type"], old["opp_name"]
@@ -463,12 +594,12 @@ def _apply_rollups(conn: sqlite3.Connection, acc: dict[tuple[str, str], dict]) -
         conn.execute(
             "INSERT OR REPLACE INTO games (game_id, agent, family, your_player,"
             " opp_type, opp_name, config_json, config_key, first_ts, last_ts,"
-            " n_turns, n_corrections, n_errors, n_invalid, outcome, my_payoff,"
-            " opp_payoff, agreed_round, result_json)"
-            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            " latest_turn_ts, n_turns, n_corrections, n_errors, n_invalid,"
+            " outcome, my_payoff, opp_payoff, agreed_round, result_json)"
+            " VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (
                 game_id, agent, family, your_player, opp_type, opp_name,
-                config_json, config_key, first_ts, last_ts,
+                config_json, config_key, first_ts, last_ts, latest_turn_ts,
                 _old("n_turns", 0) + a["n_turns"],
                 _old("n_corrections", 0) + a["n_corrections"],
                 _old("n_errors", 0) + a["n_errors"],

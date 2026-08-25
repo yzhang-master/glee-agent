@@ -2,8 +2,12 @@
 games rollup payoff mapping, and file-shrink recovery."""
 
 import json
+import sqlite3
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from glee_agent.memory import store
 from glee_agent.memory.store import connect, ingest
 
 TS0 = 1787076848.0
@@ -129,6 +133,21 @@ def _fixture_log(log_dir: Path) -> None:
     )
 
 
+def _turn_records(game_id: str, n: int) -> list[dict]:
+    game = _bargaining_game(game_id, 1, {"type": "agent", "name": "Rival"})
+    return [
+        _legacy_turn(TS0 + i, game, {"alice_gain": 60, "bob_gain": 40})
+        for i in range(n)
+    ]
+
+
+def _jsonl_size(records: list[dict]) -> int:
+    return sum(
+        len((json.dumps(rec, ensure_ascii=False) + "\n").encode("utf-8"))
+        for rec in records
+    )
+
+
 def _counts(db_path: Path) -> dict:
     conn = connect(db_path)
     try:
@@ -195,6 +214,29 @@ def test_ingest_counts_and_rollup(tmp_path):
         conn.close()
 
 
+def test_connect_migrates_pre_chunking_store(tmp_path):
+    db_path = tmp_path / "agent.db"
+    old_schema = store._SCHEMA.replace(
+        "first_ts REAL, last_ts REAL, latest_turn_ts REAL,\n",
+        "first_ts REAL, last_ts REAL,\n",
+    )
+    raw = sqlite3.connect(db_path)
+    try:
+        raw.executescript(old_schema)
+        raw.commit()
+    finally:
+        raw.close()
+
+    conn = connect(db_path)
+    try:
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(games)")
+        }
+        assert "latest_turn_ts" in columns
+    finally:
+        conn.close()
+
+
 def test_ingest_idempotent(tmp_path):
     log_dir = tmp_path / "logs"
     log_dir.mkdir()
@@ -206,6 +248,23 @@ def test_ingest_idempotent(tmp_path):
     counts = ingest(log_dir=log_dir, db_path=db_path)
     assert counts == {"turns": 0, "results": 0, "snapshots": 0, "lb": 0, "skipped": 0}
     assert _counts(db_path) == first
+
+
+def test_caught_up_ingest_skips_writer_transactions(tmp_path, monkeypatch):
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    db_path = tmp_path / "agent.db"
+    _fixture_log(log_dir)
+    ingest(log_dir=log_dir, db_path=db_path)
+
+    def unexpected_chunk(*args, **kwargs):
+        raise AssertionError("caught-up file acquired a writer transaction")
+
+    monkeypatch.setattr(store, "_ingest_chunk", unexpected_chunk)
+    counts = ingest(log_dir=log_dir, db_path=db_path)
+    assert counts == {
+        "turns": 0, "results": 0, "snapshots": 0, "lb": 0, "skipped": 0,
+    }
 
 
 def test_offset_resume(tmp_path):
@@ -317,3 +376,207 @@ def test_file_shrink_resets_offset(tmp_path):
     after = _counts(db_path)
     assert after["results"] == before["results"] + 1
     assert after["turns"] == before["turns"]  # nothing double-ingested
+
+
+def test_ingest_commits_multiple_bounded_chunks(tmp_path, monkeypatch):
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    db_path = tmp_path / "agent.db"
+    log_path = log_dir / "main-chunks.jsonl"
+    records = _turn_records("g-chunks", 5)
+    _write_jsonl(log_path, records)
+
+    monkeypatch.setattr(store, "_INGEST_CHUNK_MAX_RECORDS", 2)
+    monkeypatch.setattr(store, "_INGEST_CHUNK_MAX_BYTES", 10**9)
+    real_chunk = store._ingest_chunk
+    committed = []
+
+    def observe_chunk(conn, path):
+        result = real_chunk(conn, path)
+        committed.append(result[0].copy())
+        return result
+
+    monkeypatch.setattr(store, "_ingest_chunk", observe_chunk)
+    counts = store.ingest(log_dir=log_dir, db_path=db_path)
+
+    assert counts == {
+        "turns": 5, "results": 0, "snapshots": 0, "lb": 0, "skipped": 0,
+    }
+    assert [chunk["turns"] for chunk in committed] == [2, 2, 1]
+    conn = connect(db_path)
+    try:
+        offset = conn.execute(
+            "SELECT offset FROM ingest_meta WHERE path = ?",
+            (str(log_path.resolve()),),
+        ).fetchone()["offset"]
+        game = conn.execute(
+            "SELECT n_turns FROM games WHERE game_id = 'g-chunks'"
+        ).fetchone()
+        assert offset == log_path.stat().st_size
+        assert game["n_turns"] == 5
+    finally:
+        conn.close()
+
+
+def test_latest_turn_metadata_is_invariant_to_chunk_boundaries(tmp_path, monkeypatch):
+    records = _turn_records("g-out-of-order", 2)
+    # _turn_records intentionally reuses a game fixture; split it here so the
+    # two serialized turns can carry different metadata.
+    records[1] = json.loads(json.dumps(records[1]))
+    records[0]["ts"] = TS0 + 2
+    records[0]["game"]["game_state"]["money_to_divide"] = 100
+    records[1]["ts"] = TS0 + 1
+    records[1]["game"]["game_state"]["money_to_divide"] = 200
+
+    observed = []
+    for chunk_size in (1, 1000):
+        log_dir = tmp_path / f"logs-{chunk_size}"
+        log_dir.mkdir()
+        db_path = tmp_path / f"agent-{chunk_size}.db"
+        _write_jsonl(log_dir / "main-out-of-order.jsonl", records)
+        monkeypatch.setattr(store, "_INGEST_CHUNK_MAX_RECORDS", chunk_size)
+        monkeypatch.setattr(store, "_INGEST_CHUNK_MAX_BYTES", 10**9)
+
+        store.ingest(log_dir=log_dir, db_path=db_path)
+        conn = connect(db_path)
+        try:
+            row = conn.execute(
+                "SELECT config_json, latest_turn_ts FROM games "
+                "WHERE game_id = 'g-out-of-order'"
+            ).fetchone()
+            observed.append((json.loads(row["config_json"]), row["latest_turn_ts"]))
+        finally:
+            conn.close()
+
+    assert observed[0] == observed[1]
+    assert observed[0][0]["money_to_divide"] == 100
+    assert observed[0][1] == TS0 + 2
+
+
+def test_malformed_timestamps_do_not_block_later_numeric_chunk(tmp_path, monkeypatch):
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    db_path = tmp_path / "agent.db"
+    records = _turn_records("g-malformed-ts", 4)
+    records = [json.loads(json.dumps(record)) for record in records]
+    for record, ts, money in zip(
+        records,
+        (float("nan"), "9999999999", "bad-3", TS0 + 3),
+        (100, 200, 250, 300),
+        strict=True,
+    ):
+        record["ts"] = ts
+        record["game"]["game_state"]["money_to_divide"] = money
+    _write_jsonl(log_dir / "main-malformed-ts.jsonl", records)
+    monkeypatch.setattr(store, "_INGEST_CHUNK_MAX_RECORDS", 1)
+    monkeypatch.setattr(store, "_INGEST_CHUNK_MAX_BYTES", 10**9)
+
+    counts = store.ingest(log_dir=log_dir, db_path=db_path)
+    assert counts["turns"] == 4
+    conn = connect(db_path)
+    try:
+        row = conn.execute(
+            "SELECT config_json, latest_turn_ts, n_turns FROM games "
+            "WHERE game_id = 'g-malformed-ts'"
+        ).fetchone()
+        assert json.loads(row["config_json"])["money_to_divide"] == 300
+        assert row["latest_turn_ts"] == TS0 + 3
+        assert row["n_turns"] == 4
+    finally:
+        conn.close()
+
+
+def test_interrupted_chunk_keeps_prior_progress_and_retries_atomically(
+    tmp_path, monkeypatch
+):
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    db_path = tmp_path / "agent.db"
+    log_path = log_dir / "main-interrupted.jsonl"
+    records = _turn_records("g-interrupted", 5)
+    _write_jsonl(log_path, records)
+
+    monkeypatch.setattr(store, "_INGEST_CHUNK_MAX_RECORDS", 2)
+    monkeypatch.setattr(store, "_INGEST_CHUNK_MAX_BYTES", 10**9)
+    real_ingest_line = store._ingest_line
+    calls = 0
+
+    def fail_during_second_chunk(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 4:
+            # The third line has already been inserted in this transaction;
+            # both it and its rollup must be rolled back with the fourth line.
+            raise RuntimeError("simulated interruption")
+        return real_ingest_line(*args, **kwargs)
+
+    monkeypatch.setattr(store, "_ingest_line", fail_during_second_chunk)
+    first = store.ingest(log_dir=log_dir, db_path=db_path)
+    assert first == {
+        "turns": 2, "results": 0, "snapshots": 0, "lb": 0, "skipped": 0,
+    }
+
+    conn = connect(db_path)
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM turns").fetchone()[0] == 2
+        assert conn.execute(
+            "SELECT n_turns FROM games WHERE game_id = 'g-interrupted'"
+        ).fetchone()[0] == 2
+        assert conn.execute(
+            "SELECT offset FROM ingest_meta WHERE path = ?",
+            (str(log_path.resolve()),),
+        ).fetchone()[0] == _jsonl_size(records[:2])
+    finally:
+        conn.close()
+
+    monkeypatch.setattr(store, "_ingest_line", real_ingest_line)
+    second = store.ingest(log_dir=log_dir, db_path=db_path)
+    assert second == {
+        "turns": 3, "results": 0, "snapshots": 0, "lb": 0, "skipped": 0,
+    }
+    assert _counts(db_path)["turns"] == 5
+    conn = connect(db_path)
+    try:
+        assert conn.execute(
+            "SELECT n_turns FROM games WHERE game_id = 'g-interrupted'"
+        ).fetchone()[0] == 5
+    finally:
+        conn.close()
+    assert store.ingest(log_dir=log_dir, db_path=db_path) == {
+        "turns": 0, "results": 0, "snapshots": 0, "lb": 0, "skipped": 0,
+    }
+
+
+def test_concurrent_ingesters_do_not_duplicate_chunks(tmp_path, monkeypatch):
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    db_path = tmp_path / "agent.db"
+    records = _turn_records("g-concurrent", 20)
+    _write_jsonl(log_dir / "main-concurrent.jsonl", records)
+
+    # Create the schema before the race so this test targets chunk ownership,
+    # not concurrent first-time database initialization.
+    conn = connect(db_path)
+    conn.close()
+    monkeypatch.setattr(store, "_INGEST_CHUNK_MAX_RECORDS", 1)
+    monkeypatch.setattr(store, "_INGEST_CHUNK_MAX_BYTES", 10**9)
+    start = threading.Barrier(2)
+
+    def run_ingest():
+        start.wait()
+        return store.ingest(log_dir=log_dir, db_path=db_path)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [pool.submit(run_ingest) for _ in range(2)]
+        results = [future.result(timeout=20) for future in futures]
+
+    assert sum(result["turns"] for result in results) == len(records)
+    assert sum(result["skipped"] for result in results) == 0
+    assert _counts(db_path)["turns"] == len(records)
+    conn = connect(db_path)
+    try:
+        assert conn.execute(
+            "SELECT n_turns FROM games WHERE game_id = 'g-concurrent'"
+        ).fetchone()[0] == len(records)
+    finally:
+        conn.close()
