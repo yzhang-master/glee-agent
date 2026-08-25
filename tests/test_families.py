@@ -575,8 +575,173 @@ class TestNegotiationCompleteInfo:
         assert act["decision"] == "RejectOffer"
         assert act["product_price"] >= 140.0 - 1e-6
 
+    def test_ci_ultimatum_default_captures_promoted_surplus(self):
+        game = self._ci_offer(rnd=1, my_value=100.0, opp_value=200.0)
+        game["game_state"]["max_rounds"] = 1
+        act = self._decide(game)
+        assert act["product_price"] == pytest.approx(195.0)
+
+    def test_ci_ultimatum_default_is_symmetric_for_buyer(self):
+        from fixtures import negotiation_game
+        game = negotiation_game(role="buyer", game_state={
+            "complete_information": True,
+            "round": 1,
+            "max_rounds": 1,
+            "player_1_value": 100.0,
+            "player_2_value": 200.0,
+        })
+        act = self._decide(game)
+        assert act["product_price"] == pytest.approx(105.0)
+
+    def test_ci_ultimatum_default_does_not_affect_incomplete_information(self):
+        from fixtures import negotiation_game
+        game = negotiation_game(role="seller", game_state={"max_rounds": 1})
+        promoted = self._decide(game)
+        rollback = self._decide(game, neg_ci_ultimatum_frac=0.0)
+        assert promoted == rollback
+
+    def test_ii_ultimatum_canary_uses_configured_seller_markup(self):
+        from fixtures import negotiation_game
+        game = negotiation_game(role="seller", game_state={"max_rounds": 1})
+        act = self._decide(
+            game, neg_ii_ultimatum_markup=0.475, neg_ii_prior_capture_frac=0.0
+        )
+        assert act["product_price"] == pytest.approx(147.5)
+
+    def test_ii_ultimatum_canary_is_symmetric_for_buyer(self):
+        from fixtures import negotiation_game
+        game = negotiation_game(role="buyer", game_state={"max_rounds": 1})
+        act = self._decide(
+            game, neg_ii_ultimatum_markup=0.475, neg_ii_prior_capture_frac=0.0
+        )
+        assert act["product_price"] == pytest.approx(52.5)
+
+    def test_ii_ultimatum_canary_does_not_override_complete_information(self):
+        game = self._ci_offer(rnd=1, my_value=100.0, opp_value=200.0)
+        game["game_state"]["max_rounds"] = 1
+        act = self._decide(game, neg_ii_ultimatum_markup=0.475)
+        assert act["product_price"] == pytest.approx(195.0)
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [(80.0, 118.0), (100.0, 147.5), (120.0, 148.5), (8000.0, 11800.0)],
+    )
+    def test_ii_prior_uses_value_aware_seller_anchor(self, value, expected):
+        from fixtures import negotiation_game
+        game = negotiation_game(role="seller", game_state={"player_1_value": value})
+        act = self._decide(game, neg_ii_prior_capture_frac=0.95)
+        assert act["product_price"] == pytest.approx(expected)
+
+    @pytest.mark.parametrize(
+        ("value", "expected"),
+        [(100.0, 81.0), (120.0, 101.0), (150.0, 102.5), (1500000.0, 1025000.0)],
+    )
+    def test_ii_prior_uses_value_aware_buyer_anchor(self, value, expected):
+        from fixtures import negotiation_game
+        game = negotiation_game(role="buyer", game_state={"player_2_value": value})
+        act = self._decide(game, neg_ii_prior_capture_frac=0.95)
+        assert act["product_price"] == pytest.approx(expected)
+
+    def test_ii_prior_falls_back_outside_known_value_grid(self):
+        from fixtures import negotiation_game
+        game = negotiation_game(role="seller", game_state={"player_1_value": 90.0})
+        baseline = self._decide(game)
+        prior = self._decide(game, neg_ii_prior_capture_frac=0.95)
+        assert prior == baseline
+
+    def test_ii_prior_prices_one_round_game_directly(self):
+        from fixtures import negotiation_game
+        game = negotiation_game(
+            role="seller", game_state={"max_rounds": 1, "player_1_value": 120.0}
+        )
+        act = self._decide(game, neg_ii_prior_capture_frac=0.95)
+        assert act["product_price"] == pytest.approx(148.5)
+
+    def test_ii_prior_is_the_promoted_default(self):
+        from fixtures import negotiation_game
+        game = negotiation_game(role="seller", game_state={"player_1_value": 80.0})
+        promoted = self._decide(game)
+        explicit = self._decide(game, neg_ii_prior_capture_frac=0.95)
+        rollback = self._decide(game, neg_ii_prior_capture_frac=0.0)
+        assert promoted == explicit
+        assert promoted["product_price"] == pytest.approx(118.0)
+        assert rollback["product_price"] != promoted["product_price"]
+
 
 class TestNegotiationEndgame:
+    @staticmethod
+    def _stonewall_history(role):
+        me = "player_1" if role == "seller" else "player_2"
+        opp = "player_2" if role == "seller" else "player_1"
+        if role == "seller":
+            return [
+                {"round": 1, "offer": {"price": 147.5, "from_player": me},
+                 "counteroffer": 90.0},
+                {"round": 2, "offer": {"price": 90.0, "from_player": opp},
+                 "counteroffer": 146.0},
+                {"round": 3, "offer": {"price": 146.0, "from_player": me},
+                 "counteroffer": 90.0},
+            ]
+        return [
+            {"round": 1, "offer": {"price": 130.0, "from_player": opp},
+             "counteroffer": 81.0},
+            {"round": 2, "offer": {"price": 81.0, "from_player": me},
+             "counteroffer": 110.0},
+            {"round": 3, "offer": {"price": 110.0, "from_player": opp},
+             "counteroffer": 82.0},
+            {"round": 4, "offer": {"price": 82.0, "from_player": me},
+             "counteroffer": 110.0},
+        ]
+
+    @classmethod
+    def _stonewall_game(cls, role, phase, rnd):
+        state = {"round": rnd, "history": cls._stonewall_history(role)}
+        if phase == "offer":
+            return negotiation_game(role=role, game_state=state)
+        offer = 90.0 if role == "seller" else 110.0
+        return negotiation_decision(
+            role=role, offer_price=offer, game_state=state
+        )
+
+    @pytest.mark.parametrize(
+        "role,floor,capped_price",
+        [("seller", 102.0, 145.54), ("buyer", 98.0, 82.17)],
+    )
+    @pytest.mark.parametrize("phase", ["offer", "decision"])
+    def test_terminal_close_bypasses_reciprocity_at_round_nine(
+        self, role, floor, capped_price, phase
+    ):
+        game = self._stonewall_game(role, phase, rnd=9)
+        view = parse_game(game)
+        capped = negotiation.decide(
+            view, Knobs(llm_enabled=False, neg_terminal_close=False)
+        )
+        closing = negotiation.decide(
+            view, Knobs(llm_enabled=False, neg_terminal_close=True)
+        )
+        assert capped["product_price"] == pytest.approx(capped_price)
+        assert closing["product_price"] == pytest.approx(floor)
+
+    @pytest.mark.parametrize(
+        "role,floor,capped_price",
+        [("seller", 102.0, 145.54), ("buyer", 98.0, 82.17)],
+    )
+    @pytest.mark.parametrize("phase", ["offer", "decision"])
+    def test_terminal_close_preserves_reciprocity_at_round_eight(
+        self, role, floor, capped_price, phase
+    ):
+        game = self._stonewall_game(role, phase, rnd=8)
+        view = parse_game(game)
+        capped = negotiation.decide(
+            view, Knobs(llm_enabled=False, neg_terminal_close=False)
+        )
+        canary = negotiation.decide(
+            view, Knobs(llm_enabled=False, neg_terminal_close=True)
+        )
+        assert capped["product_price"] == pytest.approx(capped_price)
+        assert canary["product_price"] == pytest.approx(capped["product_price"])
+        assert canary["product_price"] != pytest.approx(floor)
+
     def test_finite_endgame_prices_floor(self):
         # Seller, T=10, round 9 (incomplete info): schedule used to leave the
         # ask at ~1.24x value; now the last offers go out at the floor.

@@ -325,7 +325,7 @@ class TestDecideIntegration:
         decision = negotiation.decide(parse_game(game), KNOBS)["decision"]
         assert decision != "AcceptOffer"
 
-    def test_neg_ultimatum_seller_uses_optimizer(self, tfix):
+    def test_neg_ultimatum_rollback_uses_optimizer(self, tfix):
         # Complete info, one round: EV-optimal price 141.95 (rel 0.946, 95%
         # accept) beats the (anchor+floor)/2 heuristic of 125.5. The optimum
         # sits just under the curve's cliff at rel 0.95, where acceptance
@@ -340,9 +340,10 @@ class TestDecideIntegration:
             },
         )
         view = parse_game(game)
-        assert negotiation.decide(view, KNOBS)["product_price"] == pytest.approx(141.95, abs=0.01)
+        rollback = Knobs(neg_ci_ultimatum_frac=0.0)
+        assert negotiation.decide(view, rollback)["product_price"] == pytest.approx(141.95, abs=0.01)
         T.set_targets(T.Targets.null())
-        assert negotiation.decide(view, KNOBS)["product_price"] == pytest.approx(125.5, abs=0.01)
+        assert negotiation.decide(view, rollback)["product_price"] == pytest.approx(125.5, abs=0.01)
 
 
 class TestLiveOverlay:

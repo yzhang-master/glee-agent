@@ -82,10 +82,30 @@ class Knobs:
                                          # (1-this) of the surplus. 0.95 was functionally
                                          # infeasible -- live acceptance at that level is ~0%,
                                          # while leaving them 10-20% is accepted ~22%
+    neg_ci_ultimatum_frac: float = 0.95  # complete-info T=1 proposers capture this fraction of
+                                         # visible surplus, bypassing the stale dataset accept
+                                         # curve. Historical control: 0.95 capture closed 189/189;
+                                         # the prior 0.73 policy closed 705/706. The isolated live
+                                         # canary then closed 2/2 at exactly 0.95 with no invalids.
+    neg_ii_ultimatum_markup: float = 0.0 # opt-in incomplete-info T=1 markup over own value.
+                                         # The observed buyer/seller value ratios are 1.2, 1.25,
+                                         # 1.5, and 1.875. Raising the current 0.26 markup to
+                                         # 0.475 leaves the same buyer types feasible while nearly
+                                         # doubling seller profit when a 1.5x buyer accepts.
+    neg_ii_prior_capture_frac: float = 0.95 # Bayesian anchor for incomplete-information games.
+                                            # A 1,374-game live canary improved agreement by 7.4pp
+                                            # and payoff/value by 0.018 vs concurrent A/A controls;
+                                            # the directly treated T=1 proposer slice improved by
+                                            # 10.0pp and 0.067. Zero rolls back to the generic
+                                            # own-value markup.
     neg_reciprocal: bool = True          # concede at most what the opponent just conceded
                                          # (plus a drip). Their acceptance probability AND
                                          # their own concession both fall in our concession
                                          # speed, so a time-based schedule teaches them to wait
+    neg_terminal_close: bool = False     # finite horizon: on the last actionable offer, bypass
+                                         # reciprocity and use the scheduled floor. Otherwise a
+                                         # stonewaller can pin our round-(T-1) counter near its
+                                         # opening price and turn a feasible trade into a no-deal
     neg_drip: float = 0.01               # unreciprocated concession per offer, as a fraction
                                          # of the anchor-to-floor range
     neg_never_walk: bool = False         # unlimited-horizon: walking pays exactly 0, the same

@@ -7,6 +7,7 @@ Prices are absolute; my payoff = price - value (seller) or value - price (buyer)
 from __future__ import annotations
 
 import hashlib
+import math
 
 from ..config import Knobs
 from ..llm import client as llm_client
@@ -35,6 +36,15 @@ def _is_ultimatum(view: GameView) -> bool:
     return view.max_rounds is not None and view.round >= view.max_rounds
 
 
+def _terminal_close(view: GameView, knobs: Knobs) -> bool:
+    """Whether this is the last finite-horizon offer we can improve."""
+    return (
+        knobs.neg_terminal_close
+        and view.max_rounds is not None
+        and view.round >= view.max_rounds - 1
+    )
+
+
 def _schedule_length(view: GameView, knobs: Knobs) -> int:
     if view.max_rounds is not None:
         return max(min(view.max_rounds, knobs.neg_max_planned_rounds), 1)
@@ -59,6 +69,16 @@ def _anchor_and_floor(n, knobs: Knobs, ultimatum: bool = False) -> tuple[float, 
             else knobs.neg_anchor_markup
         )
         anchor, floor = v * (1.0 - markup), max(v - margin, 0.0)
+
+    # In incomplete information the platform draws values from a small,
+    # stable grid. A generic 50% own-value anchor sits outside that grid for
+    # many buyer states and wastes the high-leverage opening round. The
+    # prior anchor targets the EV-optimal opponent-type boundary while leaving
+    # the existing Boulware floor and reciprocal concession intact. Setting
+    # its capture fraction to zero restores the generic anchor.
+    prior_price = _ii_prior_price(n, knobs)
+    if prior_price is not None:
+        anchor = prior_price
 
     # Complete information: an ask above the buyer's value (bid below the
     # seller's) can never be profitably accepted — those offers burn every
@@ -110,6 +130,91 @@ def _feasible_price(price: float, n, eps_frac: float = 0.01) -> float:
     if n.my_role == "seller":
         return min(price, n.opp_value - eps)   # buyer must gain by buying
     return max(price, n.opp_value + eps)       # seller must gain by selling
+
+
+def _ci_ultimatum_price(n, knobs: Knobs) -> float | None:
+    """Direct surplus price for a one-round complete-info offer.
+
+    In this branch there is no continuation value and both reservation values
+    are public. The historical control captures a median 95% of the visible
+    surplus with 100% agreement, whereas the dataset-CDF optimizer gives away
+    roughly 27% with the same agreement rate. A zero knob remains available
+    as a rollback to the previous heuristic.
+    """
+    frac = knobs.neg_ci_ultimatum_frac
+    if frac <= 0 or n.my_value is None or n.opp_value is None:
+        return None
+    frac = min(max(frac, 0.0), 0.99)
+    if n.my_role == "seller":
+        surplus = n.opp_value - n.my_value
+        if surplus <= 0:
+            return None
+        return n.my_value + frac * surplus
+    surplus = n.my_value - n.opp_value
+    if surplus <= 0:
+        return None
+    return n.my_value - frac * surplus
+
+
+def _ii_ultimatum_price(n, knobs: Knobs) -> float | None:
+    """Opt-in direct price for a one-round hidden-value offer.
+
+    This is deliberately independent of the complete-information surplus
+    rule: only my reservation value is visible here, so the knob is a markup
+    (or buyer discount) rather than a share of surplus. Zero preserves the
+    established midpoint heuristic for clean live comparison.
+    """
+    markup = knobs.neg_ii_ultimatum_markup
+    if markup <= 0 or n.my_value is None or n.opp_value is not None:
+        return None
+    markup = min(max(markup, 0.0), 0.99)
+    if n.my_role == "seller":
+        return n.my_value * (1.0 + markup)
+    return n.my_value * (1.0 - markup)
+
+
+def _ii_prior_price(n, knobs: Knobs) -> float | None:
+    """Bayesian anchor from the platform's discrete hidden-value prior.
+
+    Complete-information live games expose the same value grid used for
+    hidden-information games. Conditional EV is maximized at these opponent
+    type boundaries (scaled by order of magnitude):
+
+    * seller 8 -> target buyer 12; seller 10/12 -> target buyer 15
+    * buyer 10 -> target seller 8; buyer 12/15 -> target seller 10
+
+    ``frac`` captures that share of surplus at the selected boundary. Values
+    outside the known grid fall back to the established generic anchor.
+    """
+    frac = knobs.neg_ii_prior_capture_frac
+    value = n.my_value
+    if frac <= 0 or value is None or value <= 0 or n.opp_value is not None:
+        return None
+    frac = min(max(frac, 0.0), 0.99)
+    order = 10.0 ** math.floor(math.log10(value))
+    mantissa = value / order
+
+    def near(expected: float) -> bool:
+        return abs(mantissa - expected) <= 1e-6
+
+    if n.my_role == "seller":
+        if near(8.0):
+            boundary = 12.0 * order
+        elif near(1.0) or near(1.2):
+            boundary = 1.5 * order
+        else:
+            return None
+        surplus = boundary - value
+        return value + frac * surplus if surplus > 0 else None
+
+    if near(1.0):
+        boundary = 0.8 * order
+    elif near(1.2) or near(1.5):
+        boundary = 1.0 * order
+    else:
+        return None
+    surplus = value - boundary
+    return value - frac * surplus if surplus > 0 else None
 
 
 def _target_price(view: GameView, n, knobs: Knobs) -> float:
@@ -370,22 +475,36 @@ def decide(view: GameView, knobs: Knobs) -> dict:
 
     if view.action_type == "offer":
         price = _target_price(view, n, knobs)
+        direct_ultimatum = None
         # Single-round ultimatum: no counteroffers exist, price to close.
         if view.max_rounds == 1:
-            anchor, floor = _anchor_and_floor(n, knobs, ultimatum=True)
-            # Without the dataset CDF, split the difference between a
-            # moderate markup and reservation — closing matters most.
-            price = (anchor + floor) / 2
+            direct_ultimatum = _ci_ultimatum_price(n, knobs)
+            if direct_ultimatum is None:
+                direct_ultimatum = _ii_prior_price(n, knobs)
+            if direct_ultimatum is None:
+                direct_ultimatum = _ii_ultimatum_price(n, knobs)
+            if direct_ultimatum is not None:
+                price = direct_ultimatum
+            else:
+                anchor, floor = _anchor_and_floor(n, knobs, ultimatum=True)
+                # Without the dataset CDF, split the difference between a
+                # moderate markup and reservation — closing matters most.
+                price = (anchor + floor) / 2
         # Empirical accept-curve optimizer (ultimatum seller always prefers
         # it when curve data exists; otherwise it overrides Boulware only
         # when it disagrees materially).
-        optimized = _optimized_price(view, n, knobs, price)
-        if optimized is not None:
-            price = optimized
+        if direct_ultimatum is None:
+            optimized = _optimized_price(view, n, knobs, price)
+            if optimized is not None:
+                price = optimized
         if view.max_rounds != 1:
             anchor, floor = _anchor_and_floor(n, knobs, ultimatum=_is_ultimatum(view))
-            price = _reciprocal_cap(view, n, knobs, price, anchor, floor)
-        price = _feasible_price(price, n)
+            if not _terminal_close(view, knobs):
+                price = _reciprocal_cap(view, n, knobs, price, anchor, floor)
+        # The direct CI price already leaves the opponent a positive share of
+        # the actual surplus. Do not replace that with the generic 1%-of-value
+        # epsilon, which can consume most of a thin surplus.
+        price = _feasible_price(price, n, eps_frac=0.0 if direct_ultimatum is not None else 0.01)
         out = {"product_price": round(max(price, 0.0), 2)}
         if view.messages_allowed:
             mine = _my_offer_prices(view)
@@ -477,7 +596,8 @@ def decide(view: GameView, knobs: Knobs) -> dict:
     if counter is None:
         counter = my_next
     anchor, floor = _anchor_and_floor(n, knobs, ultimatum=_is_ultimatum(view))
-    counter = _reciprocal_cap(view, n, knobs, counter, anchor, floor)
+    if not _terminal_close(view, knobs):
+        counter = _reciprocal_cap(view, n, knobs, counter, anchor, floor)
     # Walkback resistance: never counter below the best they have already
     # offered us — that price is already banked, and bidding under it hands
     # back surplus they had conceded.
