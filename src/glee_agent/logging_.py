@@ -21,6 +21,7 @@ LOG_DIR = Path(__file__).resolve().parents[2] / "logs"
 # telemetry write can never block a move past the turn clock.
 _lock = threading.Lock()
 _telemetry_lock = threading.Lock()
+_RESULT_SOURCES = {"move", "move_transport_error", "reaper"}
 
 
 def _fsync_directory(path: Path) -> None:
@@ -103,23 +104,43 @@ def log_result(
     game_id: str,
     move_response: dict | None,
     error: str | None = None,
+    *,
+    result_source: str | None = None,
+    reaped: bool | None = None,
 ) -> None:
     """Log the server's response to a move as a "result" record.
 
     ``move_response`` is the dict returned by ``GleeClient.move`` (or None when
-    the call raised, in which case ``error`` carries the exception text)."""
+    the call raised, in which case ``error`` carries the exception text).
+    ``result_source`` and ``reaped`` are explicit provenance supplied by the
+    direct-move or reaper call site; malformed provenance remains null so a
+    prospective consumer can reject the record rather than infer its origin.
+    """
     try:
         resp = move_response if isinstance(move_response, dict) else {}
+        raw_game_over = resp.get("game_over")
+        raw_result = resp.get("result")
+        response_reaped = resp.get("reaped")
+        exact_reaped = reaped if type(reaped) is bool else None
+        if exact_reaped is None and type(response_reaped) is bool:
+            exact_reaped = response_reaped
         record = {
             "type": "result",
             "ts": time.time(),
             "agent": agent_label,
             "game_id": game_id,
+            "result_source": (
+                result_source
+                if isinstance(result_source, str)
+                and result_source in _RESULT_SOURCES
+                else None
+            ),
+            "reaped": exact_reaped,
             "valid": resp.get("valid"),
             "attempts_left": resp.get("attempts_left"),
-            "game_over": bool(resp.get("game_over")),
+            "game_over": raw_game_over if type(raw_game_over) is bool else None,
             "error": error if error is not None else resp.get("error"),
-            "result": resp.get("result"),
+            "result": raw_result if isinstance(raw_result, dict) else None,
         }
         _append(agent_label, record)
     except Exception:  # noqa: BLE001 — logging must never break play

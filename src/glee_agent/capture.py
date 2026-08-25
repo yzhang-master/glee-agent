@@ -85,10 +85,23 @@ class LoggingGleeClient(GleeClient):
                 error_text = str(e)
             except Exception:  # noqa: BLE001
                 error_text = type(e).__name__
-            log_result(self.agent_label, game_id, None, error=error_text)
+            log_result(
+                self.agent_label,
+                game_id,
+                None,
+                result_source="move_transport_error",
+                reaped=False,
+                error=error_text,
+            )
             raise
-        log_result(self.agent_label, game_id, response)
-        if isinstance(response, dict) and response.get("game_over"):
+        log_result(
+            self.agent_label,
+            game_id,
+            response,
+            result_source="move",
+            reaped=False,
+        )
+        if isinstance(response, dict) and response.get("game_over") is True:
             self.mark_resolved(game_id)
         return response
 
@@ -147,8 +160,9 @@ def start_reaper_thread(
                         log_result(
                             game_client.agent_label,
                             gid,
-                            {"valid": None, "game_over": True, "result": result,
-                             "reaped": True},
+                            {"valid": None, "game_over": True, "result": result},
+                            result_source="reaper",
+                            reaped=True,
                         )
                         game_client.mark_resolved(gid)
                     elif status is None and data.get("detail"):
