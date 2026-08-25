@@ -158,6 +158,17 @@ def test_duplicate_keys_and_oversize_fail_before_becoming_a_plan(tmp_path):
     assert oversized.plan is None
 
 
+def test_huge_json_integer_fails_closed_as_invalid_json(tmp_path):
+    declaration, _assignment = _copy_valid_artifacts(tmp_path)
+    declaration.write_bytes(b'{"declared_at":' + b"9" * 10_000 + b"}")
+
+    loaded = load_confirmation_plan(project_root=tmp_path)
+
+    assert loaded.status == "invalid"
+    assert loaded.error_code == "invalid_json"
+    assert loaded.plan is None
+
+
 @pytest.mark.parametrize(
     "relative_path",
     (Path("../canary_analysis_plan.json"), Path("/tmp/canary_analysis_plan.json")),

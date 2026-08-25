@@ -414,7 +414,11 @@ def _parse_document(raw: bytes) -> tuple[dict[str, Any], ConfirmationPlan, str]:
         )
     except _DeclarationError:
         raise
-    except (UnicodeDecodeError, json.JSONDecodeError, RecursionError):
+    # Python's integer-string digit limit raises a plain ``ValueError`` for
+    # otherwise syntactically valid JSON containing an enormous integer.
+    # Treat every decoder ValueError as invalid input instead of letting a
+    # hostile declaration escape the fail-closed loader.
+    except (UnicodeDecodeError, ValueError, RecursionError):
         raise _DeclarationError("invalid_json") from None
 
     body = _object(document, _TOP_FIELDS, "invalid_top_level_fields")
