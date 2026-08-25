@@ -30,6 +30,7 @@ def log_turn(
     elapsed_s: float,
     move_result: dict | None = None,
     error: str | None = None,
+    canary_assignment: dict | None = None,
 ) -> None:
     try:
         LOG_DIR.mkdir(exist_ok=True)
@@ -44,6 +45,9 @@ def log_turn(
             "elapsed_s": round(elapsed_s, 3),
             "move_result": move_result,
             "error": error,
+            "canary_assignment": (
+                canary_assignment if isinstance(canary_assignment, dict) else None
+            ),
         }
         line = json.dumps(record, ensure_ascii=False, default=str)
         with _lock, path.open("a", encoding="utf-8") as f:

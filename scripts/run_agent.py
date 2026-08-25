@@ -17,6 +17,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from glee_sdk import GleeClient  # noqa: E402
 
+from glee_agent.canary_assignment import load_assignment_plan  # noqa: E402
 from glee_agent.capture import (  # noqa: E402
     LoggingGleeClient,
     start_leaderboard_thread,
@@ -78,7 +79,12 @@ def main() -> None:
 
     settings = load_settings(args.agent)
     _lock = acquire_instance_lock(settings.agent_label)  # noqa: F841 — held for process lifetime
-    append_runtime_manifest(settings.agent_label, settings.knobs)
+    canary_assignment = load_assignment_plan()
+    append_runtime_manifest(
+        settings.agent_label,
+        settings.knobs,
+        canary_assignment=canary_assignment,
+    )
     concurrency = args.concurrency or settings.concurrency
     families = args.families.split(",") if args.families else None
 
@@ -95,7 +101,7 @@ def main() -> None:
     start_leaderboard_thread(stats.get("agent_id"))
     start_reaper_thread(client, GleeClient(api_key=settings.glee_api_key))
 
-    strategy = build_strategy(settings)
+    strategy = build_strategy(settings, canary_assignment=canary_assignment)
     client.run(
         strategy,
         game_families=families,

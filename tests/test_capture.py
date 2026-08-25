@@ -73,6 +73,29 @@ def test_log_result_invalid_move(log_dir):
     assert rec["result"] is None
 
 
+def test_log_turn_persists_canary_assignment_metadata(log_dir):
+    assignment = {
+        "status": "assigned",
+        "plan_id": "rotation-1",
+        "rule_id": "barg-1",
+        "arm": "treatment",
+        "assignment_sha256": "a" * 64,
+        "enrollment": "new",
+    }
+
+    logging_.log_turn(
+        "test_a",
+        {"game_id": "g-1"},
+        {"decision": "accept"},
+        [],
+        0.01,
+        canary_assignment=assignment,
+    )
+
+    record = read_records(log_dir, "test_a")[0]
+    assert record["canary_assignment"] == assignment
+
+
 def test_log_snapshot_shape(log_dir):
     stats = {
         "agent_id": "abc",

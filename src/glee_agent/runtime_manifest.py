@@ -3,7 +3,8 @@
 One manifest is appended when ``scripts/run_agent.py`` acquires its instance
 lock.  It records the complete :class:`~glee_agent.config.Knobs` dataclass and
 content identities for every Python file shipped in the agent package, the
-runner entry point, and the two payoff-target artifacts used by strategy code.
+runner entry point, the payoff-target artifacts, and the optional validated
+canary-assignment artifact and parsed contract.
 
 This module intentionally accepts ``Knobs`` rather than ``Settings``.  API
 keys, LLM credentials, endpoint configuration, and the ambient environment
@@ -20,6 +21,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
+from .canary_assignment import LoadedAssignmentPlan, load_assignment_plan
 from .config import Knobs
 from .logging_ import log_runtime
 
@@ -104,21 +106,25 @@ def build_runtime_manifest(
     *,
     project_root: Path = PROJECT_ROOT,
     pid: int | None = None,
+    canary_assignment: LoadedAssignmentPlan | None = None,
 ) -> dict[str, Any]:
     """Build a JSON-safe manifest containing policy state and no credentials."""
     root = project_root.resolve(strict=False)
     targets = {
         relative.as_posix(): _hash_file(root / relative) for relative in TARGET_PATHS
     }
+    assignment = canary_assignment or load_assignment_plan(project_root=root)
     return {
         "agent": str(agent_label),
         "pid": os.getpid() if pid is None else int(pid),
         "knobs": asdict(knobs),
         "git_head": _git_head(root),
+        "canary_assignment": assignment.manifest(agent_label=agent_label),
         "content_hashes": {
             "algorithm": HASH_ALGORITHM,
             "strategy_python": _source_hashes(root),
             "targets": targets,
+            "canary_assignment": assignment.artifact_manifest(),
         },
     }
 
@@ -128,12 +134,18 @@ def append_runtime_manifest(
     knobs: Knobs,
     *,
     project_root: Path = PROJECT_ROOT,
+    canary_assignment: LoadedAssignmentPlan | None = None,
 ) -> None:
     """Build and append one startup manifest; never interfere with play."""
     try:
         log_runtime(
             agent_label,
-            build_runtime_manifest(agent_label, knobs, project_root=project_root),
+            build_runtime_manifest(
+                agent_label,
+                knobs,
+                project_root=project_root,
+                canary_assignment=canary_assignment,
+            ),
         )
     except Exception:  # noqa: BLE001 - runtime provenance is strictly fail-open
         pass
