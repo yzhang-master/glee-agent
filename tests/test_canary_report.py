@@ -309,6 +309,9 @@ def test_strict_enrollment_dedup_latest_terminal_and_health():
     assert control["direct_converted"] == 1
     assert control["direct_resolved"] == 1
     assert control["mean_normalized_payoff"] == pytest.approx(0.30)
+    assert control["normalized_payoff_sum"] == pytest.approx(0.30)
+    assert control["normalized_payoff_sum_squares"] == pytest.approx(0.09)
+    assert control["sample_variance_normalized_payoff"] is None
     assert report["metrics"]["treatment"]["resolved"] == 0
 
 
@@ -882,6 +885,8 @@ def test_blind_persuasion_revenue_p_strata_and_deterministic_routing():
     treatment = report["metrics"]["treatment"]
     control = report["metrics"]["control"]
     assert treatment["mean_revenue_share"] == pytest.approx(0.5)
+    assert treatment["revenue_share_sum"] == pytest.approx(0.5)
+    assert treatment["revenue_share_sum_squares"] == pytest.approx(0.25)
     assert treatment["zero_sales_rate"] == 0
     assert control["mean_revenue_share"] == 0
     assert control["zero_sales_rate"] == 1
@@ -898,6 +903,149 @@ def test_blind_persuasion_revenue_p_strata_and_deterministic_routing():
     assert control["deterministic_route_matches"] == 1
     assert report["agents"]["main"]["routing"]["affected_assigned_matches"] == 2
     assert not any(item["direction_violation"] for item in report["affected_turns"])
+
+
+def test_bargaining_itt_includes_unaffected_games_and_separates_invalid_terminals():
+    experiment = _experiment()
+
+    def replay(game, knobs):
+        state = game["game_state"]
+        if state.get("same_policy"):
+            return {"alice_gain": 50, "bob_gain": 50}
+        return _barg_replay(game, knobs)
+
+    records = [
+        _turn(
+            "test_b",
+            "unaffected-valid",
+            101,
+            action={"alice_gain": 50, "bob_gain": 50},
+            money_to_divide=100,
+            max_rounds=6,
+            horizon_known=True,
+            same_policy=True,
+        ),
+        _result(
+            "test_b",
+            "unaffected-valid",
+            102,
+            {"outcome": "agreement", "player_1_payoff": 40},
+        ),
+        _turn(
+            "test_b",
+            "invalid-terminal",
+            103,
+            action={"alice_gain": 50, "bob_gain": 50},
+            money_to_divide=100,
+            max_rounds=6,
+            horizon_known=True,
+            same_policy=True,
+        ),
+        _result(
+            "test_b",
+            "invalid-terminal",
+            104,
+            {"outcome": "agreement", "player_1_payoff": 90},
+            valid="false",
+        ),
+        # The deterministic report clock advances beyond both 1200-second
+        # maturity deadlines without touching either game or live state.
+        {
+            "type": "runtime",
+            "ts": 1400,
+            "_agent": "observer",
+            "agent": "observer",
+            "pid": 1,
+            "knobs": {},
+            "git_head": "a" * 40,
+            "content_hashes": {
+                "strategy_python": {"aggregate_sha256": "b" * 64}
+            },
+        },
+    ]
+
+    full_report = build_report(
+        records,
+        experiments=(experiment,),
+        replay=replay,
+    )
+    report = full_report["experiments"][0]
+    treatment = report["itt"]["treatment"]
+
+    assert report["metrics"]["treatment"]["affected_games"] == 0
+    assert treatment["games"] == 2
+    assert treatment["matured"] == 2
+    assert treatment["resolved"] == 1
+    assert treatment["invalid_terminals"] == 1
+    assert treatment["censored"] == 0
+    assert treatment["deadline_zeroes"] == 1
+    assert treatment["normalized_outcome_sum"] == pytest.approx(0.4)
+    assert treatment["normalized_outcome_sum_squares"] == pytest.approx(0.16)
+    assert treatment["mean_normalized_outcome"] == pytest.approx(0.2)
+    assert report["analysis_as_of_ts"] == 1400
+    assert full_report["gates"][experiment.name]["data_integrity"]["passed"] is False
+
+
+def test_root_gates_are_additive_and_do_not_replace_negotiation_gate():
+    negotiation = _experiment(
+        name="neg_terminal_close", family="negotiation", cutoff=100
+    )
+    bargaining = _experiment()
+
+    report = build_report(
+        [],
+        experiments=(negotiation, bargaining),
+        replay=lambda _game, _knobs: {},
+    )
+    by_name = {entry["name"]: entry for entry in report["experiments"]}
+
+    assert "gate" in by_name["neg_terminal_close"]
+    assert "gate" not in by_name["barg_dis_anchor"]
+    assert set(report["gates"]) == {"barg_dis_anchor"}
+    assert report["gates"]["barg_dis_anchor"]["rule_version"].endswith(
+        "amended-v2"
+    )
+
+
+def test_malformed_negotiation_runtime_assignment_fails_closed_without_crashing():
+    experiment = _experiment(
+        name="neg_terminal_close", family="negotiation", cutoff=100
+    )
+    records = [
+        {
+            "type": "runtime",
+            "ts": 101,
+            "_agent": "test_b",
+            "agent": "test_b",
+            "pid": 77,
+            "knobs": {"neg_terminal_close": "false"},
+            "git_head": "a" * 40,
+            "content_hashes": {
+                "strategy_python": {"aggregate_sha256": "b" * 64}
+            },
+        },
+        _turn(
+            "test_b",
+            "unknown-arm",
+            102,
+            family="negotiation",
+            action={"product_price": 100},
+            max_rounds=10,
+            horizon_known=True,
+            player_1_role="seller",
+            player_1_value=100,
+        ),
+    ]
+
+    report = build_report(
+        records,
+        experiments=(experiment,),
+        replay=lambda _game, _knobs: {"product_price": 100},
+    )["experiments"][0]
+
+    assert report["agents"]["test_b"]["routing"]["replay_errors"] == 1
+    assert report["affected_turns"] == []
+    assert report["gate"]["health"]["hard_fail"] is True
 
 
 def test_offer_outcomes_use_only_first_exact_divergence_per_game():

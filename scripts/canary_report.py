@@ -37,6 +37,11 @@ from glee_agent.config import Knobs  # noqa: E402
 from glee_agent.dispatcher import FAMILIES  # noqa: E402
 from glee_agent.guard import guard  # noqa: E402
 from glee_agent.schema import parse_game  # noqa: E402
+
+if __package__:
+    from scripts.canary_gates import evaluate_report_gates
+else:  # direct ``python scripts/canary_report.py`` execution
+    from canary_gates import evaluate_report_gates
 from glee_agent.theory.targets import (  # noqa: E402
     DEFAULT_PATH as TARGETS_PATH,
     config_key_negotiation,
@@ -687,7 +692,11 @@ def _outcome_metric_empty() -> dict:
         "agreements": 0,
         "no_deal": 0,
         "normalized_payoff_sum": 0.0,
+        "normalized_payoff_sum_squares": 0.0,
+        "normalized_payoff_valid": 0,
+        "normalized_payoff_invalid": 0,
         "mean_normalized_payoff": None,
+        "sample_variance_normalized_payoff": None,
         "direct_offers": 0,
         "direct_resolved": 0,
         "direct_converted": 0,
@@ -695,10 +704,23 @@ def _outcome_metric_empty() -> dict:
     }
 
 
+def _sample_variance_from_sums(total: float, sum_squares: float, n: int) -> float | None:
+    if n < 2:
+        return None
+    numerator = sum_squares - total * total / n
+    # Roundoff can make a mathematically zero numerator very slightly negative.
+    return max(numerator / (n - 1), 0.0)
+
+
 def _finish_outcome_metrics(metric: dict) -> None:
     resolved = metric.get("resolved", 0)
     metric["mean_normalized_payoff"] = (
-        metric.pop("normalized_payoff_sum") / resolved if resolved else None
+        metric["normalized_payoff_sum"] / resolved if resolved else None
+    )
+    metric["sample_variance_normalized_payoff"] = _sample_variance_from_sums(
+        metric["normalized_payoff_sum"],
+        metric["normalized_payoff_sum_squares"],
+        resolved,
     )
     trials = metric.get("direct_resolved", 0)
     if "direct_resolved" in metric:
@@ -789,14 +811,16 @@ def _offer_outcomes(
             else:
                 player = turn.game.get("your_player", "player_1")
                 denominator = _as_float(state.get(f"{player}_value"))
-            normalized = (
-                payoff / denominator
-                if payoff is not None and denominator is not None and denominator > 0
-                else 0.0
+            normalized_valid = (
+                payoff is not None and denominator is not None and denominator > 0
             )
+            normalized = payoff / denominator if normalized_valid else 0.0
             for target in targets:
                 target["resolved"] += 1
                 target["normalized_payoff_sum"] += normalized
+                target["normalized_payoff_sum_squares"] += normalized * normalized
+                target["normalized_payoff_valid"] += int(normalized_valid)
+                target["normalized_payoff_invalid"] += int(not normalized_valid)
                 if _terminal_agreement(terminal):
                     target["agreements"] += 1
                 else:
@@ -833,6 +857,274 @@ def _offer_outcomes(
             round_metric["conversion_rate"] = (
                 round_metric["converted"] / n if n else None
             )
+    return by_variant
+
+
+def _analysis_timestamp(parsed: ParsedRecords) -> float:
+    """Latest persisted event time, used as a deterministic censoring clock."""
+    timestamps = [turn.ts for turn in parsed.turns.values()]
+    timestamps.extend(event.ts for event in parsed.results)
+    timestamps.extend(event.ts for event in parsed.runtimes)
+    return max(timestamps, default=0.0)
+
+
+def _itt_leaf_empty() -> dict:
+    return {
+        "games": 0,
+        "matured": 0,
+        "pending_maturation": 0,
+        "resolved": 0,
+        "censored": 0,
+        "deadline_censored": 0,
+        "timely_valid_terminals": 0,
+        "deadline_zeroes": 0,
+        "late_terminals": 0,
+        "invalid_terminals": 0,
+        "normalized_outcome_sum": 0.0,
+        "normalized_outcome_sum_squares": 0.0,
+        "mean_normalized_outcome": None,
+        "sample_variance_normalized_outcome": None,
+        "zero_sales": 0,
+        "zero_sales_rate": None,
+    }
+
+
+def _itt_metric_empty(*, population: str, maturity_lag_s: int) -> dict:
+    return {
+        **_itt_leaf_empty(),
+        "population": population,
+        "maturity_lag_s": maturity_lag_s,
+        "deadline_policy": (
+            "a missing, late, or invalid terminal is payoff zero after maturity"
+        ),
+        "cells": {},
+        "p_strata": {},
+    }
+
+
+def _finish_itt_leaf(metric: dict) -> None:
+    matured = metric["matured"]
+    metric["mean_normalized_outcome"] = (
+        metric["normalized_outcome_sum"] / matured if matured else None
+    )
+    metric["sample_variance_normalized_outcome"] = _sample_variance_from_sums(
+        metric["normalized_outcome_sum"],
+        metric["normalized_outcome_sum_squares"],
+        matured,
+    )
+    metric["zero_sales_rate"] = metric["zero_sales"] / matured if matured else None
+
+
+def _finish_itt_metric(metric: dict) -> None:
+    for entry in metric["cells"].values():
+        _finish_itt_leaf(entry)
+    for entry in metric["p_strata"].values():
+        _finish_itt_leaf(entry)
+    _finish_itt_leaf(metric)
+
+
+def _first_enrolled_turns(
+    enrolled: set[tuple[str, str]], parsed: ParsedRecords, family: str
+) -> dict[tuple[str, str], Turn]:
+    first: dict[tuple[str, str], Turn] = {}
+    for turn in parsed.turns.values():
+        key = (turn.agent, turn.gid)
+        if key not in enrolled or turn.family != family:
+            continue
+        old = first.get(key)
+        if old is None or turn.ts < old.ts:
+            first[key] = turn
+    return first
+
+
+def _runtime_variant(
+    parsed: ParsedRecords, experiment: Experiment, agent: str, ts: float
+) -> str:
+    """Resolve a non-negotiation arm from the latest available manifest."""
+    eligible = [
+        event
+        for event in parsed.runtimes
+        if event.agent == agent
+        and experiment.cutoff <= event.ts <= ts
+    ]
+    if eligible:
+        event = max(eligible, key=lambda item: item.ts)
+        if (
+            experiment.knob not in event.knobs
+            or not (event.strategy_sha256 or event.git_head)
+        ):
+            return "unknown"
+        value = event.knobs[experiment.knob]
+        if type(value) is type(experiment.treatment_value) and value == experiment.treatment_value:
+            return "treatment"
+        if type(value) is type(experiment.control_value) and value == experiment.control_value:
+            return "control"
+        return "unknown"
+    return experiment.variant_for(agent)
+
+
+def _itt_cell_bargaining(turn: Turn) -> dict:
+    player = turn.game.get("your_player", "player_1")
+    return {"role": player, "horizon": _horizon(turn)}
+
+
+def _itt_cell_persuasion(turn: Turn) -> dict:
+    state = turn.game.get("game_state")
+    state = state if isinstance(state, dict) else {}
+    return {
+        "p": _as_float(state.get("p")),
+        "message_type": state.get("seller_message_type", "unknown"),
+        "price": _as_float(state.get("product_price")),
+        "total_rounds": _round_number(state.get("total_rounds")),
+    }
+
+
+def _add_itt_observation(
+    metric: dict,
+    turn: Turn,
+    terminal: ResultEvent | None,
+    *,
+    analysis_ts: float,
+    cell: dict,
+    denominator: float | None,
+    p_key: str | None = None,
+) -> None:
+    cell_metric = metric["cells"].setdefault(
+        _cell_key(cell), {"cell": cell, **_itt_leaf_empty()}
+    )
+    targets = [metric, cell_metric]
+    if p_key is not None:
+        targets.append(metric["p_strata"].setdefault(p_key, _itt_leaf_empty()))
+    for target in targets:
+        target["games"] += 1
+
+    deadline = turn.ts + metric["maturity_lag_s"]
+    if analysis_ts < deadline:
+        for target in targets:
+            target["pending_maturation"] += 1
+        return
+
+    payoff = _terminal_payoff(turn, terminal) if terminal is not None else None
+    terminal_timely = terminal is not None and terminal.ts <= deadline
+    terminal_structured = bool(
+        terminal_timely
+        and (terminal.valid is True or terminal.valid is None)
+        and not terminal.error
+        and isinstance(terminal.result.get("outcome"), str)
+    )
+    normalized_valid = (
+        terminal_structured
+        and payoff is not None
+        and denominator is not None
+        and denominator > 0
+    )
+    normalized = payoff / denominator if normalized_valid else 0.0
+    normalized_valid = bool(
+        normalized_valid and math.isfinite(normalized) and 0 <= normalized <= 1
+    )
+    if not normalized_valid:
+        normalized = 0.0
+    for target in targets:
+        target["matured"] += 1
+        target["normalized_outcome_sum"] += normalized
+        target["normalized_outcome_sum_squares"] += normalized * normalized
+        target["zero_sales"] += int(normalized <= 0)
+        if normalized_valid:
+            target["resolved"] += 1
+            target["timely_valid_terminals"] += 1
+        else:
+            target["deadline_zeroes"] += 1
+            if terminal_timely:
+                target["invalid_terminals"] += 1
+            else:
+                target["censored"] += 1
+                target["deadline_censored"] += 1
+                target["late_terminals"] += int(terminal is not None)
+
+
+def _bargaining_itt(
+    enrolled: set[tuple[str, str]],
+    parsed: ParsedRecords,
+    experiment: Experiment,
+    *,
+    analysis_ts: float,
+) -> dict:
+    by_variant = {
+        arm: _itt_metric_empty(
+            population="all strictly enrolled bargaining games",
+            maturity_lag_s=1200,
+        )
+        for arm in ("treatment", "control")
+    }
+    by_variant["integrity"] = {"unknown_assignment_games": 0}
+    for key, turn in _first_enrolled_turns(enrolled, parsed, "bargaining").items():
+        variant = _runtime_variant(parsed, experiment, turn.agent, turn.ts)
+        if variant not in by_variant:
+            by_variant["integrity"]["unknown_assignment_games"] += 1
+            continue
+        state = turn.game.get("game_state")
+        state = state if isinstance(state, dict) else {}
+        _add_itt_observation(
+            by_variant[variant],
+            turn,
+            parsed.terminals.get(key),
+            analysis_ts=analysis_ts,
+            cell=_itt_cell_bargaining(turn),
+            denominator=_as_float(state.get("money_to_divide")),
+        )
+    for arm in ("treatment", "control"):
+        metric = by_variant[arm]
+        _finish_itt_metric(metric)
+    return by_variant
+
+
+def _persuasion_itt(
+    enrolled: set[tuple[str, str]],
+    parsed: ParsedRecords,
+    experiment: Experiment,
+    *,
+    analysis_ts: float,
+) -> dict:
+    by_variant = {
+        arm: _itt_metric_empty(
+            population="all strictly enrolled explicit blind-seller games",
+            maturity_lag_s=1800,
+        )
+        for arm in ("treatment", "control")
+    }
+    by_variant["integrity"] = {"unknown_assignment_games": 0}
+    for key, turn in _first_enrolled_turns(enrolled, parsed, "persuasion").items():
+        state = turn.game.get("game_state")
+        state = state if isinstance(state, dict) else {}
+        player = turn.game.get("your_player", "player_1")
+        seller = player == "player_1" or state.get(f"{player}_role") == "seller"
+        # V2 deliberately excludes ambiguous legacy payloads: the estimand is
+        # the explicit blind-seller contract, not a post-hoc missing-v proxy.
+        if not seller or state.get("is_seller_know_cv") is not False:
+            continue
+        variant = _runtime_variant(parsed, experiment, turn.agent, turn.ts)
+        if variant not in by_variant:
+            by_variant["integrity"]["unknown_assignment_games"] += 1
+            continue
+        price = _as_float(state.get("product_price"))
+        rounds_value = _as_float(state.get("total_rounds"))
+        denominator = (
+            price * rounds_value
+            if price is not None and price > 0 and rounds_value is not None and rounds_value > 0
+            else None
+        )
+        _add_itt_observation(
+            by_variant[variant],
+            turn,
+            parsed.terminals.get(key),
+            analysis_ts=analysis_ts,
+            cell=_itt_cell_persuasion(turn),
+            denominator=denominator,
+            p_key=_p_key(state.get("p")),
+        )
+    for arm in ("treatment", "control"):
+        metric = by_variant[arm]
+        _finish_itt_metric(metric)
     return by_variant
 
 
@@ -917,17 +1209,28 @@ def _neg_gate_assignment(
         for event in parsed.runtimes
         if event.agent == agent
         and experiment.cutoff <= event.ts <= ts
-        and experiment.knob in event.knobs
     ]
     if eligible:
         event = max(eligible, key=lambda item: item.ts)
-        value = event.knobs.get(experiment.knob)
-        if value == experiment.treatment_value:
-            variant = "treatment"
-        elif value == experiment.control_value:
-            variant = "control"
-        else:
+        if (
+            experiment.knob not in event.knobs
+            or not (event.strategy_sha256 or event.git_head)
+        ):
             variant = "unknown"
+        else:
+            value = event.knobs[experiment.knob]
+            if (
+                type(value) is type(experiment.treatment_value)
+                and value == experiment.treatment_value
+            ):
+                variant = "treatment"
+            elif (
+                type(value) is type(experiment.control_value)
+                and value == experiment.control_value
+            ):
+                variant = "control"
+            else:
+                variant = "unknown"
         identity = event.strategy_sha256 or event.git_head or "unknown"
         epoch_id = f"runtime:{agent}:{event.ts:.6f}:{event.pid}:{identity[:12]}"
         return variant, epoch_id, "runtime_manifest"
@@ -1760,6 +2063,12 @@ def _neg_terminal_gate_from_rows(
     epoch_health: dict[str, dict] | None = None,
 ) -> dict:
     """Pure deterministic evaluator for the frozen hidden terminal-close gate."""
+    unknown_assignment_rows = sum(
+        row.get("variant") not in ("treatment", "control") for row in rows
+    )
+    rows = [
+        row for row in rows if row.get("variant") in ("treatment", "control")
+    ]
     counts = _neg_gate_counts(rows)
     direct = _neg_gate_standardized(rows, "direct", binary=True)
     normalized = _neg_gate_standardized(rows, "normalized_payoff", binary=False)
@@ -1770,6 +2079,12 @@ def _neg_terminal_gate_from_rows(
         "payoff_percentile": percentile,
     }
     health = _neg_gate_health(rows, agent_data, agent_variants, epoch_health)
+    health["unknown_assignment_rows"] = unknown_assignment_rows
+    if unknown_assignment_rows:
+        health["structural_faults"] += unknown_assignment_rows
+        health["checks"]["assignment_evidence_complete"] = False
+        health["pass"] = False
+        health["hard_fail"] = True
     agent_confirmation = _neg_gate_agent_confirmation(rows)
     switchback_confirmation = _neg_gate_switchback_confirmation(rows)
     unsupported_safety = _neg_gate_unsupported_safety(rows)
@@ -1936,7 +2251,11 @@ def _pers_leaf_empty() -> dict:
         "resolved": 0,
         "censored": 0,
         "revenue_share_sum": 0.0,
+        "revenue_share_sum_squares": 0.0,
+        "revenue_share_valid": 0,
+        "revenue_share_invalid": 0,
         "mean_revenue_share": None,
+        "sample_variance_revenue_share": None,
         "zero_sales": 0,
         "zero_sales_rate": None,
         "affected_games": 0,
@@ -1958,7 +2277,12 @@ def _pers_metric_empty() -> dict:
 def _finish_pers_metric(metric: dict) -> None:
     resolved = metric["resolved"]
     metric["mean_revenue_share"] = (
-        metric.pop("revenue_share_sum") / resolved if resolved else None
+        metric["revenue_share_sum"] / resolved if resolved else None
+    )
+    metric["sample_variance_revenue_share"] = _sample_variance_from_sums(
+        metric["revenue_share_sum"],
+        metric["revenue_share_sum_squares"],
+        resolved,
     )
     metric["zero_sales_rate"] = metric["zero_sales"] / resolved if resolved else None
 
@@ -2051,10 +2375,14 @@ def _persuasion_outcomes(
             if price is not None and price > 0 and rounds_value is not None and rounds_value > 0
             else None
         )
-        share = payoff / denominator if payoff is not None and denominator else 0.0
+        share_valid = payoff is not None and denominator is not None
+        share = payoff / denominator if share_valid else 0.0
         for target in targets:
             target["resolved"] += 1
             target["revenue_share_sum"] += share
+            target["revenue_share_sum_squares"] += share * share
+            target["revenue_share_valid"] += int(share_valid)
+            target["revenue_share_invalid"] += int(not share_valid)
             if payoff is None or payoff <= 0:
                 target["zero_sales"] += 1
 
@@ -2172,6 +2500,9 @@ def analyze_experiment(
             )[0]
         else:
             assigned_variant = experiment.variant_for(turn.agent)
+        if assigned_variant not in ("treatment", "control"):
+            routing["replay_errors"] += 1
+            continue
         assigned_action = (
             treatment_action if assigned_variant == "treatment" else control_action
         )
@@ -2234,16 +2565,37 @@ def analyze_experiment(
             }
         )
 
+    analysis_ts = _analysis_timestamp(parsed)
     if experiment.family == "persuasion":
         metrics = _persuasion_outcomes(affected, enrolled, parsed, experiment)
+        itt = _persuasion_itt(
+            enrolled,
+            parsed,
+            experiment,
+            analysis_ts=analysis_ts,
+        )
     else:
         metrics = _offer_outcomes(affected, enrolled, parsed, experiment)
+        itt = (
+            _bargaining_itt(
+                enrolled,
+                parsed,
+                experiment,
+                analysis_ts=analysis_ts,
+            )
+            if experiment.family == "bargaining"
+            else None
+        )
 
     report = {
         "name": experiment.name,
         "family": experiment.family,
         "cutoff": experiment.cutoff,
         "cutoff_utc": datetime.fromtimestamp(experiment.cutoff, timezone.utc).isoformat(),
+        "analysis_as_of_ts": analysis_ts,
+        "analysis_as_of_utc": datetime.fromtimestamp(
+            analysis_ts, timezone.utc
+        ).isoformat(),
         "assignment": {
             "knob": experiment.knob,
             "treatment_value": experiment.treatment_value,
@@ -2253,7 +2605,13 @@ def analyze_experiment(
         },
         "agents": agent_data,
         "variants": variants,
+        "variants_assignment_basis": (
+            "static_agent_legacy; use experiment.gate epoch-aware counts"
+            if experiment.name == "neg_terminal_close"
+            else "runtime_manifest_then_static_assignment"
+        ),
         "metrics": metrics,
+        "itt": itt,
         "affected_turns": affected,
     }
     if experiment.name == "neg_terminal_close":
@@ -2277,13 +2635,17 @@ def build_report(
 ) -> dict:
     parsed = parse_records(records)
     prior = preexisting or set()
-    return {
+    report = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "experiments": [
             analyze_experiment(parsed, prior, experiment, replay)
             for experiment in experiments
         ],
     }
+    # Additive root-level gates never overwrite the negotiation experiment's
+    # independently frozen ``experiment.gate`` object.
+    report["gates"] = evaluate_report_gates(report)
+    return report
 
 
 _TS_RE = re.compile(rb'"ts"\s*:\s*([0-9]+(?:\.[0-9]+)?)')
