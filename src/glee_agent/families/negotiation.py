@@ -41,6 +41,7 @@ def _terminal_close(view: GameView, knobs: Knobs) -> bool:
     return (
         knobs.neg_terminal_close
         and view.max_rounds is not None
+        and view.max_rounds > 1
         and view.round >= view.max_rounds - 1
     )
 
@@ -308,6 +309,20 @@ def _reciprocal_cap(view: GameView, n, knobs: Knobs, target: float,
     return max(min(target, my_last + step), my_last)
 
 
+def _terminal_generosity_guard(n, terminal: float, reciprocal: float) -> float:
+    """A terminal close may improve an offer, never retract one.
+
+    Reciprocity combines two jobs: limiting the speed of a concession and
+    preventing walkback from our own prior offer.  The canary bypasses only
+    the speed limit.  Comparing against the reciprocal candidate retains the
+    no-walkback invariant even if an optimizer or unusual history would make
+    the raw terminal candidate less generous to the opponent.
+    """
+    if n.my_role == "seller":
+        return min(terminal, reciprocal)
+    return max(terminal, reciprocal)
+
+
 def _opponent_best_price(view: GameView, n) -> float | None:
     """The most favorable price the opponent has ever put on the table for me."""
     best: float | None = None
@@ -472,6 +487,7 @@ def _neg_message(view: GameView, price: float, conceded: bool) -> str:
 def decide(view: GameView, knobs: Knobs) -> dict:
     n = parse_negotiation(view)
     value = n.my_value if n.my_value is not None else 100.0
+    terminal_close = _terminal_close(view, knobs)
 
     if view.action_type == "offer":
         price = _target_price(view, n, knobs)
@@ -493,14 +509,18 @@ def decide(view: GameView, knobs: Knobs) -> dict:
         # Empirical accept-curve optimizer (ultimatum seller always prefers
         # it when curve data exists; otherwise it overrides Boulware only
         # when it disagrees materially).
-        if direct_ultimatum is None:
+        if direct_ultimatum is None and not terminal_close:
             optimized = _optimized_price(view, n, knobs, price)
             if optimized is not None:
                 price = optimized
         if view.max_rounds != 1:
             anchor, floor = _anchor_and_floor(n, knobs, ultimatum=_is_ultimatum(view))
-            if not _terminal_close(view, knobs):
-                price = _reciprocal_cap(view, n, knobs, price, anchor, floor)
+            reciprocal = _reciprocal_cap(view, n, knobs, price, anchor, floor)
+            price = (
+                _terminal_generosity_guard(n, price, reciprocal)
+                if terminal_close
+                else reciprocal
+            )
         # The direct CI price already leaves the opponent a positive share of
         # the actual surplus. Do not replace that with the generic 1%-of-value
         # epsilon, which can consume most of a thin surplus.
@@ -592,12 +612,16 @@ def decide(view: GameView, knobs: Knobs) -> dict:
 
     # Counter at the optimizer's price when the accept curve supports one
     # (the accept test above still used the Boulware trajectory).
-    counter = _optimized_price(view, n, knobs, my_next)
+    counter = None if terminal_close else _optimized_price(view, n, knobs, my_next)
     if counter is None:
         counter = my_next
     anchor, floor = _anchor_and_floor(n, knobs, ultimatum=_is_ultimatum(view))
-    if not _terminal_close(view, knobs):
-        counter = _reciprocal_cap(view, n, knobs, counter, anchor, floor)
+    reciprocal = _reciprocal_cap(view, n, knobs, counter, anchor, floor)
+    counter = (
+        _terminal_generosity_guard(n, counter, reciprocal)
+        if terminal_close
+        else reciprocal
+    )
     # Walkback resistance: never counter below the best they have already
     # offered us — that price is already banked, and bidding under it hands
     # back surplus they had conceded.

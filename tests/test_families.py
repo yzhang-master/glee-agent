@@ -754,6 +754,54 @@ class TestNegotiationEndgame:
         assert canary["product_price"] == pytest.approx(capped["product_price"])
         assert canary["product_price"] != pytest.approx(floor)
 
+    @pytest.mark.parametrize(
+        "role,floor", [("seller", 102.0), ("buyer", 98.0)]
+    )
+    @pytest.mark.parametrize("phase", ["offer", "decision"])
+    def test_terminal_close_uses_floor_instead_of_optimizer(
+        self, monkeypatch, role, floor, phase
+    ):
+        def unexpected_optimizer(*args, **kwargs):
+            raise AssertionError("terminal floor was replaced by optimizer")
+
+        monkeypatch.setattr(negotiation, "_optimized_price", unexpected_optimizer)
+        game = self._stonewall_game(role, phase, rnd=9)
+        closing = negotiation.decide(
+            parse_game(game),
+            Knobs(llm_enabled=False, neg_terminal_close=True),
+        )
+        assert closing["product_price"] == pytest.approx(floor)
+
+    @pytest.mark.parametrize(
+        "role,terminal,reciprocal,expected",
+        [
+            ("seller", 110.0, 105.0, 105.0),
+            ("seller", 100.0, 105.0, 100.0),
+            ("buyer", 90.0, 95.0, 95.0),
+            ("buyer", 100.0, 95.0, 100.0),
+        ],
+    )
+    def test_terminal_close_never_moves_away_from_opponent(
+        self, role, terminal, reciprocal, expected
+    ):
+        class State:
+            my_role = role
+
+        assert negotiation._terminal_generosity_guard(
+            State(), terminal, reciprocal
+        ) == pytest.approx(expected)
+
+    @pytest.mark.parametrize("role", ["seller", "buyer"])
+    def test_terminal_close_does_not_change_one_round_optimizer(self, role):
+        game = negotiation_game(role=role, game_state={"max_rounds": 1})
+        off = negotiation.decide(
+            parse_game(game), Knobs(llm_enabled=False, neg_terminal_close=False)
+        )
+        on = negotiation.decide(
+            parse_game(game), Knobs(llm_enabled=False, neg_terminal_close=True)
+        )
+        assert on == off
+
     def test_finite_endgame_prices_floor(self):
         # Seller, T=10, round 9 (incomplete info): schedule used to leave the
         # ask at ~1.24x value; now the last offers go out at the floor.
