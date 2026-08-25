@@ -23,6 +23,7 @@ import json
 import math
 from collections import defaultdict
 from collections.abc import Mapping
+from copy import deepcopy
 from typing import Any
 
 
@@ -44,54 +45,6 @@ AMENDMENT_PROVENANCE = {
         "reporter_source_sha256": (
             "cad077340a8372eb6c3f397e82e00ac1e2c2550f633c4c22ef8198e53bbcaf9c"
         ),
-        "bargaining": {
-            "affected": {
-                "treatment": {"games": 56, "resolved": 55, "censored": 1},
-                "control": {"games": 99, "resolved": 96, "censored": 3},
-            },
-            "all_enrolled_itt": {
-                "treatment": {
-                    "games": 368,
-                    "matured": 303,
-                    "pending_maturation": 65,
-                    "resolved": 300,
-                    "censored": 3,
-                    "invalid_terminals": 0,
-                },
-                "control": {
-                    "games": 744,
-                    "matured": 658,
-                    "pending_maturation": 86,
-                    "resolved": 650,
-                    "censored": 8,
-                    "invalid_terminals": 0,
-                },
-            },
-        },
-        "persuasion": {
-            "affected": {
-                "treatment": {"games": 106, "resolved": 104, "censored": 15},
-                "control": {"games": 94, "resolved": 102, "censored": 10},
-            },
-            "all_enrolled_itt": {
-                "treatment": {
-                    "games": 119,
-                    "matured": 77,
-                    "pending_maturation": 42,
-                    "resolved": 76,
-                    "censored": 1,
-                    "invalid_terminals": 0,
-                },
-                "control": {
-                    "games": 112,
-                    "matured": 88,
-                    "pending_maturation": 24,
-                    "resolved": 88,
-                    "censored": 0,
-                    "invalid_terminals": 0,
-                },
-            },
-        },
         "prior_rows_status": "pilot_or_exploratory_screen_only",
         "confirmatory_requirement": (
             "first assignment and enrollment must be strictly after the max "
@@ -143,6 +96,42 @@ _PERS_CELL_COUNTS = {
     ("0.8", "text", 1000000.0, 20): 112,
 }
 PERS_CELL_WEIGHTS = {key: count / 1762 for key, count in _PERS_CELL_COUNTS.items()}
+
+_CONFIRMATION_PLAN_SHA256 = (
+    "b002b688d02df3233b7dd4f21a5595cf149b4cc8dd501a0bfc2ee5bccd11d745"
+)
+_CONFIRMATION_PLAN_ID = "confirmation-v2-20260825-2100z"
+_CONFIRMATION_STRATEGY_SHA256 = (
+    "631ef69862d572644ba855174a411f80a220b11ed5c20e30b43ffc31f1303388"
+)
+_CONFIRMATION_ACTIVATED_AT = 1787691600
+_CONFIRMATION_EXPIRES_AT = 1787950800
+_CONFIRMATION_TARGET_SHA256 = {
+    "data/targets.json": (
+        "1d24a579ca2b611e3b30af4ddf7af5b84ad13e7198fa55b93a2f5e6617e65e25"
+    ),
+    "data/live_targets.json": (
+        "3dcaff69f17175648e4b46499859bf183bba03b1321364de329d01bed0e618a3"
+    ),
+}
+_CONFIRMATION_RULES = {
+    "bargaining": {
+        "family": "bargaining",
+        "rule_id": "barg-anchor-confirm-v2",
+        "knob": "barg_dis_anchor",
+        "control": 0.58,
+        "treatment": 0.5,
+        "treatment_probability": 0.25,
+    },
+    "persuasion": {
+        "family": "persuasion",
+        "rule_id": "pers-blind-confirm-v2",
+        "knob": "pers_blind_lie",
+        "control": 1.0,
+        "treatment": 0.4,
+        "treatment_probability": 0.5,
+    },
+}
 
 
 def _number(value: Any) -> float | None:
@@ -681,6 +670,143 @@ def _fixed_standardized_difference(
     }
 
 
+def _aggregate_fixed_risk_cells(
+    metric: Mapping[str, Any],
+    fields: tuple[str, ...],
+) -> tuple[dict[tuple[Any, ...], dict[str, int]], list[str]]:
+    """Aggregate zero-sale counts without accepting malformed evidence as zero."""
+    groups: dict[tuple[Any, ...], dict[str, int]] = {}
+    failures: list[str] = []
+    cells = metric.get("cells")
+    if not isinstance(cells, Mapping):
+        return {}, ["cells missing or malformed"]
+    for raw_key, entry in cells.items():
+        if not isinstance(entry, Mapping) or not isinstance(entry.get("cell"), Mapping):
+            failures.append(f"cell {raw_key!s} malformed")
+            continue
+        matured = _strict_count(entry.get("matured"))
+        zero_sales = _strict_count(entry.get("zero_sales"))
+        if (
+            matured is None
+            or matured <= 0
+            or zero_sales is None
+            or zero_sales > matured
+        ):
+            failures.append(f"cell {raw_key!s} has invalid zero-sale counts")
+            continue
+        key = _fixed_key(entry["cell"], fields)
+        group = groups.setdefault(key, {"matured": 0, "zero_sales": 0})
+        group["matured"] += matured
+        group["zero_sales"] += zero_sales
+    return groups, failures
+
+
+def _fixed_weight_risk_difference(
+    treatment: Mapping[str, Any],
+    control: Mapping[str, Any],
+    fields: tuple[str, ...],
+    weights: Mapping[tuple[Any, ...], float],
+) -> dict:
+    """Frozen-weight MOVER contrast for stratified zero-sale risks.
+
+    Each cell uses a Wilson component interval.  The fixed-weight MOVER
+    excursions are combined in quadrature.  Weights are never renormalized;
+    unsupported reference mass is charged the worst possible treatment-minus-
+    control risk contrast.
+    """
+    treatment_groups, treatment_failures = _aggregate_fixed_risk_cells(
+        treatment, fields
+    )
+    control_groups, control_failures = _aggregate_fixed_risk_cells(control, fields)
+    treatment_extra = sorted(set(treatment_groups) - set(weights), key=repr)
+    control_extra = sorted(set(control_groups) - set(weights), key=repr)
+    if treatment_extra:
+        treatment_failures.append(f"unexpected fixed cells: {treatment_extra!r}")
+    if control_extra:
+        control_failures.append(f"unexpected fixed cells: {control_extra!r}")
+
+    treatment_risk = 0.0
+    control_risk = 0.0
+    upper_excursion_sq = 0.0
+    lower_excursion_sq = 0.0
+    common_mass = 0.0
+    cells: list[dict] = []
+    for key, weight in weights.items():
+        treatment_group = treatment_groups.get(key)
+        control_group = control_groups.get(key)
+        supported = treatment_group is not None and control_group is not None
+        row = {
+            "cell": _group_label(fields, key),
+            "weight": weight,
+            "supported": supported,
+        }
+        if supported:
+            treatment_summary = _binomial_summary(
+                treatment_group["zero_sales"], treatment_group["matured"]
+            )
+            control_summary = _binomial_summary(
+                control_group["zero_sales"], control_group["matured"]
+            )
+            supported = bool(treatment_summary["valid"] and control_summary["valid"])
+            row["supported"] = supported
+            row["treatment"] = treatment_summary
+            row["control"] = control_summary
+            if supported:
+                pt = treatment_summary["rate"]
+                pc = control_summary["rate"]
+                upper_t = treatment_summary["upper_95_one_sided"]
+                lower_t = treatment_summary["lower_95_one_sided"]
+                upper_c = control_summary["upper_95_one_sided"]
+                lower_c = control_summary["lower_95_one_sided"]
+                assert None not in (pt, pc, upper_t, lower_t, upper_c, lower_c)
+                treatment_risk += weight * pt
+                control_risk += weight * pc
+                common_mass += weight
+                upper_excursion_sq += weight * weight * (
+                    (upper_t - pt) ** 2 + (pc - lower_c) ** 2
+                )
+                lower_excursion_sq += weight * weight * (
+                    (pt - lower_t) ** 2 + (upper_c - pc) ** 2
+                )
+        cells.append(row)
+
+    missing_mass = max(1.0 - common_mass, 0.0)
+    difference = treatment_risk - control_risk
+    upper = (
+        difference + math.sqrt(upper_excursion_sq) + missing_mass
+        if common_mass > 0
+        else None
+    )
+    lower = (
+        difference - math.sqrt(lower_excursion_sq) - missing_mass
+        if common_mass > 0
+        else None
+    )
+    return {
+        "available": bool(
+            common_mass > 0 and not treatment_failures and not control_failures
+        ),
+        "treatment_risk_on_fixed_scale": treatment_risk,
+        "control_risk_on_fixed_scale": control_risk,
+        "difference": difference if common_mass > 0 else None,
+        "lower_95_one_sided": lower,
+        "upper_95_one_sided": upper,
+        "missing_mass_conservative_upper_95_one_sided": upper,
+        "method": "fixed_weight_stratified_newcombe_mover_wilson",
+        "support": {
+            "dimensions": list(fields),
+            "fixed_mass": sum(weights.values()),
+            "common_mass": common_mass,
+            "missing_mass": missing_mass,
+        },
+        "integrity_failures": {
+            "treatment": treatment_failures,
+            "control": control_failures,
+        },
+        "cells": cells,
+    }
+
+
 def _arm_rate_guardrails(experiment: Mapping[str, Any]) -> dict:
     """Compare treatment/control censor and logged-error event rates.
 
@@ -711,59 +837,143 @@ def _arm_rate_guardrails(experiment: Mapping[str, Any]) -> dict:
         else None
     )
 
+    arm_health = experiment.get("arm_health")
+    arm_health = arm_health if isinstance(arm_health, Mapping) else {}
+    analysis_as_of = _number(experiment.get("analysis_as_of_ts"))
+    reporter_arm_health_present = "arm_health" in experiment
+    reporter_integrity = arm_health.get("integrity")
+    reporter_integrity = (
+        reporter_integrity if isinstance(reporter_integrity, Mapping) else {}
+    )
+    reporter_integrity_counts = {
+        key: _strict_count(reporter_integrity.get(key))
+        for key in (
+            "unknown_turn_events",
+            "unknown_result_events",
+            "unassigned_or_missing_after_activation",
+        )
+    }
+    reporter_contract_valid = bool(
+        type(arm_health.get("schema_version")) is int
+        and arm_health.get("schema_version") == 1
+        and arm_health.get("attribution")
+        == "immutable first-game assignment plus raw event occurrences"
+        and _number(arm_health.get("prospective_activation"))
+        == _CONFIRMATION_ACTIVATED_AT
+        and isinstance(arm_health.get("cohorts"), Mapping)
+        and analysis_as_of is not None
+        and all(value is not None for value in reporter_integrity_counts.values())
+        and not any(reporter_integrity_counts.values())
+        and arm_health.get("integrity_pass") is True
+    )
+    use_reporter_arm_health = reporter_arm_health_present and reporter_contract_valid
+    health_cohort = (
+        "prospective"
+        if analysis_as_of is not None
+        and analysis_as_of >= _CONFIRMATION_ACTIVATED_AT
+        else "legacy"
+    )
     assignment = experiment.get("assignment", {})
     assignment = assignment if isinstance(assignment, Mapping) else {}
     agents = experiment.get("agents", {})
     agents = agents if isinstance(agents, Mapping) else {}
     errors: dict[str, dict] = {}
     for arm in ("treatment", "control"):
-        labels = assignment.get(f"{arm}_agents", [])
-        labels = labels if isinstance(labels, (list, tuple)) else []
         events = 0
         lower_failures = 0
         upper_failures = 0
-        valid = bool(labels)
         integrity_failures: list[str] = []
-        for label in labels:
-            agent = agents.get(label, {})
-            agent = agent if isinstance(agent, Mapping) else {}
-            health = agent.get("health", {})
+        if reporter_arm_health_present and not reporter_contract_valid:
+            valid = False
+            integrity_failures.append("reporter arm-health contract malformed")
+        elif use_reporter_arm_health:
+            cohorts = arm_health.get("cohorts", {})
+            cohort = cohorts.get(health_cohort, {}) if isinstance(cohorts, Mapping) else {}
+            health = cohort.get(arm, {}) if isinstance(cohort, Mapping) else {}
             health = health if isinstance(health, Mapping) else {}
             required = {
                 key: _strict_count(health.get(key))
-                for key in (
-                    "turns",
-                    "result_events",
-                    "turn_errors",
-                    "result_errors",
-                    "invalid_results",
-                )
+                for key in ("turn_events", "result_events", "turn_errors", "result_errors", "invalid_results")
             }
             if any(value is None for value in required.values()):
                 valid = False
-                integrity_failures.append(f"{label}: missing/malformed health count")
-                continue
-            turns = required["turns"]
-            results = required["result_events"]
-            turn_errors = required["turn_errors"]
-            result_errors = required["result_errors"]
-            invalid_results = required["invalid_results"]
-            assert None not in (
-                turns, results, turn_errors, result_errors, invalid_results
-            )
-            if (
-                turn_errors > turns
-                or result_errors > results
-                or invalid_results > results
-            ):
-                valid = False
-                integrity_failures.append(f"{label}: health count exceeds denominator")
-                continue
-            events += turns + results
-            lower_failures += turn_errors + max(result_errors, invalid_results)
-            upper_failures += turn_errors + min(
-                results, result_errors + invalid_results
-            )
+                integrity_failures.append(
+                    f"{health_cohort}:{arm}: missing/malformed arm health count"
+                )
+            else:
+                turns = required["turn_events"]
+                results = required["result_events"]
+                turn_errors = required["turn_errors"]
+                result_errors = required["result_errors"]
+                invalid_results = required["invalid_results"]
+                assert None not in (
+                    turns, results, turn_errors, result_errors, invalid_results
+                )
+                valid = bool(
+                    turn_errors <= turns
+                    and result_errors <= results
+                    and invalid_results <= results
+                )
+                if not valid:
+                    integrity_failures.append(
+                        f"{health_cohort}:{arm}: health count exceeds denominator"
+                    )
+                else:
+                    events = turns + results
+                    lower_failures = turn_errors + max(
+                        result_errors, invalid_results
+                    )
+                    upper_failures = turn_errors + min(
+                        results, result_errors + invalid_results
+                    )
+        else:
+            labels = assignment.get(f"{arm}_agents", [])
+            labels = labels if isinstance(labels, (list, tuple)) else []
+            valid = bool(labels)
+            for label in labels:
+                agent = agents.get(label, {})
+                agent = agent if isinstance(agent, Mapping) else {}
+                health = agent.get("health", {})
+                health = health if isinstance(health, Mapping) else {}
+                required = {
+                    key: _strict_count(health.get(key))
+                    for key in (
+                        "turns",
+                        "result_events",
+                        "turn_errors",
+                        "result_errors",
+                        "invalid_results",
+                    )
+                }
+                if any(value is None for value in required.values()):
+                    valid = False
+                    integrity_failures.append(
+                        f"{label}: missing/malformed health count"
+                    )
+                    continue
+                turns = required["turns"]
+                results = required["result_events"]
+                turn_errors = required["turn_errors"]
+                result_errors = required["result_errors"]
+                invalid_results = required["invalid_results"]
+                assert None not in (
+                    turns, results, turn_errors, result_errors, invalid_results
+                )
+                if (
+                    turn_errors > turns
+                    or result_errors > results
+                    or invalid_results > results
+                ):
+                    valid = False
+                    integrity_failures.append(
+                        f"{label}: health count exceeds denominator"
+                    )
+                    continue
+                events += turns + results
+                lower_failures += turn_errors + max(result_errors, invalid_results)
+                upper_failures += turn_errors + min(
+                    results, result_errors + invalid_results
+                )
         valid = valid and events > 0 and upper_failures <= events
         absolute = _binomial_summary(upper_failures, events) if valid else _binomial_summary(None, None)
         errors[arm] = {
@@ -802,6 +1012,15 @@ def _arm_rate_guardrails(experiment: Mapping[str, Any]) -> dict:
                 and errors["control"]["absolute_upper_at_most_0.01"]
             ),
             "method": "logged_event_union_bounds",
+            "attribution": (
+                f"reporter_game_arm:{health_cohort}"
+                if use_reporter_arm_health
+                else (
+                    "invalid_reporter_arm_health"
+                    if reporter_arm_health_present
+                    else "legacy_static_agent_labels"
+                )
+            ),
         },
     }
 
@@ -828,6 +1047,17 @@ def _validate_moment_bounds(total: Any, sum_squares: Any, n: int) -> bool:
     return lower - 1e-9 <= squares_number <= total_number + 1e-9
 
 
+def _reported_rate_matches_counts(value: Any, successes: int, trials: int) -> bool:
+    if successes > trials:
+        return False
+    if trials == 0:
+        return value is None
+    rate = _bounded_mean(value)
+    return rate is not None and math.isclose(
+        rate, successes / trials, rel_tol=0.0, abs_tol=1e-12
+    )
+
+
 def _validate_affected_arm(metric: Mapping[str, Any], family: str) -> list[str]:
     failures: list[str] = []
     total_key = "affected_games" if family == "bargaining" else "blind_seller_games"
@@ -847,7 +1077,6 @@ def _validate_affected_arm(metric: Mapping[str, Any], family: str) -> list[str]:
         games = _strict_count(metric.get("games"))
         if games is None or games != total:
             failures.append("bargaining games != affected_games")
-    if family == "bargaining":
         valid = _strict_count(metric.get("normalized_payoff_valid"))
         invalid = _strict_count(metric.get("normalized_payoff_invalid"))
         if valid is None or invalid is None or valid + invalid != resolved:
@@ -858,6 +1087,79 @@ def _validate_affected_arm(metric: Mapping[str, Any], family: str) -> list[str]:
             resolved,
         ):
             failures.append("normalized payoff moments invalid")
+        direct_resolved = _strict_count(metric.get("direct_resolved"))
+        direct_converted = _strict_count(metric.get("direct_converted"))
+        if direct_resolved is None or direct_converted is None:
+            failures.append("direct conversion counts missing/malformed")
+        else:
+            if direct_resolved > resolved or direct_converted > direct_resolved:
+                failures.append("direct conversion counts exceed bounds")
+            if not _reported_rate_matches_counts(
+                metric.get("direct_conversion_rate"),
+                direct_converted,
+                direct_resolved,
+            ):
+                failures.append("direct conversion rate inconsistent with counts")
+
+        horizons = metric.get("horizon_strata")
+        if not isinstance(horizons, Mapping):
+            failures.append("bargaining horizon strata missing/malformed")
+        else:
+            expected_horizons = {"finite", "unlimited"}
+            extras = set(horizons) - expected_horizons
+            if extras:
+                failures.append(f"unexpected bargaining horizon strata: {sorted(extras)!r}")
+            horizon_totals = {
+                key: 0
+                for key in (
+                    "games",
+                    "resolved",
+                    "censored",
+                    "direct_resolved",
+                    "direct_converted",
+                )
+            }
+            for horizon in sorted(expected_horizons):
+                entry = horizons.get(horizon)
+                if not isinstance(entry, Mapping):
+                    failures.append(f"{horizon} horizon missing/malformed")
+                    continue
+                counts = {
+                    key: _strict_count(entry.get(key)) for key in horizon_totals
+                }
+                if any(value is None for value in counts.values()):
+                    failures.append(f"{horizon} horizon count missing/malformed")
+                    continue
+                values = {key: int(value) for key, value in counts.items()}
+                if values["games"] != values["resolved"] + values["censored"]:
+                    failures.append(
+                        f"{horizon} horizon games != resolved + censored"
+                    )
+                if (
+                    values["direct_resolved"] > values["resolved"]
+                    or values["direct_converted"] > values["direct_resolved"]
+                ):
+                    failures.append(f"{horizon} direct conversion counts exceed bounds")
+                if not _reported_rate_matches_counts(
+                    entry.get("direct_conversion_rate"),
+                    values["direct_converted"],
+                    values["direct_resolved"],
+                ):
+                    failures.append(
+                        f"{horizon} direct conversion rate inconsistent with counts"
+                    )
+                for key, value in values.items():
+                    horizon_totals[key] += value
+            expected_totals = {
+                "games": games,
+                "resolved": resolved,
+                "censored": censored,
+                "direct_resolved": direct_resolved,
+                "direct_converted": direct_converted,
+            }
+            for key, expected in expected_totals.items():
+                if expected is None or horizon_totals[key] != expected:
+                    failures.append(f"bargaining horizon {key} counts are not additive")
     else:
         valid = _strict_count(metric.get("revenue_share_valid"))
         invalid = _strict_count(metric.get("revenue_share_invalid"))
@@ -919,7 +1221,9 @@ def _validate_affected_arm(metric: Mapping[str, Any], family: str) -> list[str]:
     return failures
 
 
-def _validate_itt_arm(metric: Mapping[str, Any], maturity_lag_s: int) -> list[str]:
+def _validate_itt_arm(
+    metric: Mapping[str, Any], maturity_lag_s: int, *, family: str
+) -> list[str]:
     failures: list[str] = []
     required_keys = (
         "games",
@@ -930,6 +1234,7 @@ def _validate_itt_arm(metric: Mapping[str, Any], maturity_lag_s: int) -> list[st
         "deadline_censored",
         "timely_valid_terminals",
         "deadline_zeroes",
+        "terminal_conflicts",
         "zero_sales",
     )
     counts = {key: _strict_count(metric.get(key)) for key in required_keys}
@@ -954,6 +1259,8 @@ def _validate_itt_arm(metric: Mapping[str, Any], maturity_lag_s: int) -> list[st
         failures.append("ITT deadline zeroes != censored + invalid")
     if invalid:
         failures.append("ITT contains invalid timely terminals")
+    if values["terminal_conflicts"]:
+        failures.append("ITT contains conflicting timely terminals")
     if values["zero_sales"] > values["matured"]:
         failures.append("ITT zero sales exceed matured")
     if not _validate_moment_bounds(
@@ -962,59 +1269,144 @@ def _validate_itt_arm(metric: Mapping[str, Any], maturity_lag_s: int) -> list[st
         values["matured"],
     ):
         failures.append("ITT moments invalid")
+
+    linked_count_fields = (
+        "games",
+        "matured",
+        "resolved",
+        "censored",
+        "invalid_terminals",
+        "terminal_conflicts",
+        "zero_sales",
+    )
+    linked_number_fields = (
+        "normalized_outcome_sum",
+        "normalized_outcome_sum_squares",
+    )
+
+    def linked_values(entry: Mapping[str, Any], label: str) -> dict[str, int | float] | None:
+        linked_counts = {
+            key: _strict_count(entry.get(key)) for key in linked_count_fields
+        }
+        linked_numbers = {key: _number(entry.get(key)) for key in linked_number_fields}
+        if any(value is None for value in (*linked_counts.values(), *linked_numbers.values())):
+            failures.append(f"{label} linked statistic missing/malformed")
+            return None
+        output: dict[str, int | float] = {
+            key: int(value) for key, value in linked_counts.items() if value is not None
+        }
+        output.update(
+            {key: float(value) for key, value in linked_numbers.items() if value is not None}
+        )
+        matured = int(output["matured"])
+        resolved = int(output["resolved"])
+        censored = int(output["censored"])
+        invalid_terminals = int(output["invalid_terminals"])
+        zero_sales = int(output["zero_sales"])
+        pending = _strict_count(entry.get("pending_maturation"))
+        if pending is None or int(output["games"]) != matured + pending:
+            failures.append(f"{label} games != matured + pending")
+        if matured != resolved + censored + invalid_terminals:
+            failures.append(f"{label} matured decomposition inconsistent")
+        if zero_sales > matured:
+            failures.append(f"{label} zero_sales exceed matured")
+        if not _validate_moment_bounds(
+            output["normalized_outcome_sum"],
+            output["normalized_outcome_sum_squares"],
+            matured,
+        ):
+            failures.append(f"{label} moments invalid")
+        return output
+
+    top_linked: dict[str, int | float] = {
+        "games": values["games"],
+        "matured": values["matured"],
+        "resolved": values["resolved"],
+        "censored": values["censored"],
+        "invalid_terminals": invalid,
+        "terminal_conflicts": values["terminal_conflicts"],
+        "zero_sales": values["zero_sales"],
+        "normalized_outcome_sum": _number(metric.get("normalized_outcome_sum"))
+        or 0.0,
+        "normalized_outcome_sum_squares": _number(
+            metric.get("normalized_outcome_sum_squares")
+        )
+        or 0.0,
+    }
+
+    def equal_stat(left: int | float, right: int | float, field: str) -> bool:
+        if field in linked_count_fields:
+            return left == right
+        return math.isclose(float(left), float(right), rel_tol=0.0, abs_tol=1e-9)
+
     cells = metric.get("cells")
+    cell_totals = {key: 0 for key in linked_count_fields}
+    cell_totals.update({key: 0.0 for key in linked_number_fields})
+    cells_by_p: dict[str, dict[str, int | float]] = {}
     if not isinstance(cells, Mapping):
         failures.append("ITT cells missing/malformed")
     else:
-        for key in ("games", "matured", "resolved", "censored"):
-            subtotal = 0
-            valid = True
-            for entry in cells.values():
-                count = _strict_count(entry.get(key)) if isinstance(entry, Mapping) else None
-                if count is None:
-                    valid = False
-                    break
-                subtotal += count
-            if not valid or subtotal != values[key]:
-                failures.append(f"ITT cell {key} counts are not additive")
-        total_sum = 0.0
-        total_sq = 0.0
-        moments_valid = True
-        for entry in cells.values():
-            raw_sum = _number(entry.get("normalized_outcome_sum"))
-            raw_sq = _number(entry.get("normalized_outcome_sum_squares"))
-            if raw_sum is None or raw_sq is None:
-                moments_valid = False
+        for raw_key, entry in cells.items():
+            if not isinstance(entry, Mapping) or not isinstance(entry.get("cell"), Mapping):
+                failures.append(f"ITT cell {raw_key!s} missing/malformed")
                 continue
-            total_sum += raw_sum
-            total_sq += raw_sq
-        top_sum = _number(metric.get("normalized_outcome_sum"))
-        top_sq = _number(metric.get("normalized_outcome_sum_squares"))
-        if (
-            not moments_valid
-            or top_sum is None
-            or not math.isclose(total_sum, top_sum, abs_tol=1e-9)
-        ):
-            failures.append("ITT cell sums are not additive")
-        if (
-            not moments_valid
-            or top_sq is None
-            or not math.isclose(total_sq, top_sq, abs_tol=1e-9)
-        ):
-            failures.append("ITT cell sums of squares are not additive")
+            linked = linked_values(entry, f"ITT cell {raw_key!s}")
+            if linked is None:
+                continue
+            for field, value in linked.items():
+                cell_totals[field] += value
+            if family == "persuasion":
+                p_key = _canonical_fixed_value("p", entry["cell"].get("p"))
+                p_totals = cells_by_p.setdefault(
+                    str(p_key),
+                    {
+                        **{key: 0 for key in linked_count_fields},
+                        **{key: 0.0 for key in linked_number_fields},
+                    },
+                )
+                for field, value in linked.items():
+                    p_totals[field] += value
+        for field, expected in top_linked.items():
+            if not equal_stat(cell_totals[field], expected, field):
+                failures.append(f"ITT cell {field} statistics are not additive")
+
     p_strata = metric.get("p_strata")
-    if isinstance(p_strata, Mapping) and p_strata:
-        for key in ("games", "matured", "resolved", "censored"):
-            subtotal = 0
-            valid = True
-            for entry in p_strata.values():
-                count = _strict_count(entry.get(key)) if isinstance(entry, Mapping) else None
-                if count is None:
-                    valid = False
-                    break
-                subtotal += count
-            if not valid or subtotal != values[key]:
-                failures.append(f"ITT p-stratum {key} counts are not additive")
+    if family == "persuasion":
+        expected_p = set(PERS_P_WEIGHTS)
+        if not isinstance(p_strata, Mapping):
+            failures.append("ITT persuasion p strata missing/malformed")
+        else:
+            actual_p = set(p_strata)
+            if actual_p != expected_p:
+                failures.append(
+                    "ITT persuasion p strata do not match the frozen expected set"
+                )
+            p_totals = {key: 0 for key in linked_count_fields}
+            p_totals.update({key: 0.0 for key in linked_number_fields})
+            for p_key in sorted(expected_p):
+                entry = p_strata.get(p_key)
+                if not isinstance(entry, Mapping):
+                    failures.append(f"ITT p stratum {p_key} missing/malformed")
+                    continue
+                linked = linked_values(entry, f"ITT p stratum {p_key}")
+                if linked is None:
+                    continue
+                for field, value in linked.items():
+                    p_totals[field] += value
+                cell_linked = cells_by_p.get(p_key)
+                if cell_linked is None:
+                    failures.append(f"ITT p stratum {p_key} has no linked cells")
+                    continue
+                for field, value in linked.items():
+                    if not equal_stat(cell_linked[field], value, field):
+                        failures.append(
+                            f"ITT p stratum {p_key} {field} does not match cells"
+                        )
+            for field, expected in top_linked.items():
+                if not equal_stat(p_totals[field], expected, field):
+                    failures.append(
+                        f"ITT p-stratum {field} statistics are not additive"
+                    )
     return failures
 
 
@@ -1141,49 +1533,243 @@ def _scheduled_censor_harm(
 
 
 def _causal_confirmation(experiment: Mapping[str, Any], family: str) -> dict:
-    evidence = experiment.get("randomization_evidence")
+    """Verify the reporter's prospective confirmation contract.
+
+    Legacy ``randomization_evidence`` booleans are intentionally ignored.  A
+    caller cannot promote by asserting conclusions: the reporter must expose
+    linked sufficient statistics and exact frozen identities that this
+    evaluator can recompute against the experiment's ITT population.
+    """
+    evidence = experiment.get("prospective_confirmation")
     evidence = evidence if isinstance(evidence, Mapping) else {}
-    blocks = evidence.get("agent_blocks")
+    contract = evidence.get("contract")
+    contract = contract if isinstance(contract, Mapping) else {}
+    linked_rows = evidence.get("linked_itt_rows")
+    linked_rows = linked_rows if isinstance(linked_rows, Mapping) else {}
+    blocks = evidence.get("labels")
     blocks = blocks if isinstance(blocks, Mapping) else {}
+    prefix = evidence.get("immutable_prefix")
+    prefix = prefix if isinstance(prefix, Mapping) else {}
+    scheduled_look = evidence.get("scheduled_look")
+    scheduled_look = scheduled_look if isinstance(scheduled_look, Mapping) else {}
+    expected_rule = _CONFIRMATION_RULES.get(family, {})
     labels = ("main", "test_a", "test_b", "test_c")
-    representation = 50 if family == "bargaining" else 150
+    treatment_representation = 50 if family == "bargaining" else 150
     control_representation = 150
+
+    def exact_literal(actual: Any, expected: Any) -> bool:
+        if isinstance(expected, Mapping):
+            return bool(
+                isinstance(actual, Mapping)
+                and set(actual) == set(expected)
+                and all(exact_literal(actual[key], value) for key, value in expected.items())
+            )
+        return type(actual) is type(expected) and actual == expected
+
+    def sha256_literal(value: Any) -> bool:
+        return bool(
+            isinstance(value, str)
+            and len(value) == 64
+            and value == value.lower()
+            and all(character in "0123456789abcdef" for character in value)
+        )
+
+    expected_contract = {
+        "artifact_sha256": _CONFIRMATION_PLAN_SHA256,
+        "plan_id": _CONFIRMATION_PLAN_ID,
+        "strategy_aggregate_sha256": _CONFIRMATION_STRATEGY_SHA256,
+        "activated_at": _CONFIRMATION_ACTIVATED_AT,
+        "expires_at": _CONFIRMATION_EXPIRES_AT,
+        "target_sha256": _CONFIRMATION_TARGET_SHA256,
+        "rule": expected_rule,
+    }
+
+    itt = experiment.get("itt")
+    itt = itt if isinstance(itt, Mapping) else {}
+    linked_counts = {
+        arm: _strict_count(linked_rows.get(arm)) for arm in ("treatment", "control")
+    }
+    itt_counts: dict[str, int | None] = {}
+    for arm in ("treatment", "control"):
+        metric = itt.get(arm)
+        metric = metric if isinstance(metric, Mapping) else {}
+        itt_counts[arm] = _strict_count(metric.get("games"))
+
     label_checks: dict[str, dict] = {}
+    label_row_totals = {"treatment": 0, "control": 0}
+    common_blocks_total = 0
     for label in labels:
         entry = blocks.get(label, {})
         entry = entry if isinstance(entry, Mapping) else {}
+        treatment_rows = _strict_count(entry.get("treatment_rows"))
+        control_rows = _strict_count(entry.get("control_rows"))
         treatment_blocks = _strict_count(entry.get("treatment_blocks"))
         control_blocks = _strict_count(entry.get("control_blocks"))
-        treatment_n = _strict_count(entry.get("treatment_n"))
-        control_n = _strict_count(entry.get("control_n"))
+        same_blocks = _strict_count(entry.get("same_30m_blocks"))
+        counts_valid = all(
+            value is not None
+            for value in (
+                treatment_rows,
+                control_rows,
+                treatment_blocks,
+                control_blocks,
+                same_blocks,
+            )
+        )
+        if counts_valid:
+            assert None not in (
+                treatment_rows,
+                control_rows,
+                treatment_blocks,
+                control_blocks,
+                same_blocks,
+            )
+            label_row_totals["treatment"] += treatment_rows
+            label_row_totals["control"] += control_rows
+            common_blocks_total += same_blocks
         label_checks[label] = {
-            "treatment_blocks_at_least_30": bool(
-                treatment_blocks is not None and treatment_blocks >= 30
-            ),
-            "control_blocks_at_least_30": bool(
-                control_blocks is not None and control_blocks >= 30
-            ),
+            "counts_valid": counts_valid,
             "treatment_representation": bool(
-                treatment_n is not None and treatment_n >= representation
+                treatment_rows is not None
+                and treatment_rows >= treatment_representation
             ),
             "control_representation": bool(
-                control_n is not None and control_n >= control_representation
+                control_rows is not None and control_rows >= control_representation
+            ),
+            "both_arms_have_blocks": bool(
+                treatment_blocks is not None
+                and treatment_blocks > 0
+                and control_blocks is not None
+                and control_blocks > 0
+            ),
+            "same_block_representation": bool(
+                same_blocks is not None
+                and same_blocks > 0
+                and treatment_blocks is not None
+                and control_blocks is not None
+                and same_blocks <= min(treatment_blocks, control_blocks)
             ),
         }
+
+    prospective_rows = _strict_count(evidence.get("prospective_rows"))
+    approved_rows = _strict_count(evidence.get("approved_rows"))
+    common_blocks_reported = _strict_count(
+        evidence.get("common_agent_30m_blocks")
+    )
+    linked_total = (
+        linked_counts["treatment"] + linked_counts["control"]
+        if linked_counts["treatment"] is not None
+        and linked_counts["control"] is not None
+        else None
+    )
+    first_enrollment_ts = _number(evidence.get("first_enrollment_ts"))
+    last_enrollment_ts = _number(evidence.get("last_enrollment_ts"))
+    analysis_as_of_ts = _number(experiment.get("analysis_as_of_ts"))
+
+    prefix_bytes = _strict_count(prefix.get("bytes"))
+    prefix_records = _strict_count(prefix.get("records"))
+    prefix_last_event_ts = _number(prefix.get("last_event_ts"))
+    prefix_sha256 = prefix.get("sha256")
+    scheduled_at_ts = _number(scheduled_look.get("scheduled_at_ts"))
+    declared_at_ts = _number(scheduled_look.get("declared_at_ts"))
+    scheduled_analysis_ts = _number(scheduled_look.get("analysis_as_of_ts"))
+
     design_checks = {
-        "manifest_backed": evidence.get("manifest_backed") is True,
-        "approved_manifest_identity": evidence.get("approved_manifest_identity") is True,
-        "within_game_randomization": evidence.get("within_game_randomization") is True,
-        "mirrored_simultaneous_periods": evidence.get("mirrored_simultaneous_periods") is True,
-        "strictly_post_v2_checkpoint": evidence.get("strictly_post_v2_checkpoint") is True,
+        "structured_reporter_contract": bool(
+            type(evidence.get("schema_version")) is int
+            and evidence.get("schema_version") == 2
+            and evidence.get("producer")
+            == "scripts.canary_report:prospective-confirmation-v2"
+        ),
+        "exact_plan_strategy_targets_and_family_rule": exact_literal(
+            contract, expected_contract
+        ),
+        "exact_itt_row_linkage": bool(
+            linked_total is not None
+            and linked_total > 0
+            and all(
+                linked_counts[arm] == itt_counts[arm]
+                for arm in ("treatment", "control")
+            )
+            and label_row_totals == linked_counts
+        ),
+        "all_prospective_rows_approved_and_linked": bool(
+            linked_total is not None
+            and prospective_rows == linked_total
+            and approved_rows == linked_total
+        ),
+        "strictly_within_frozen_activation_window": bool(
+            first_enrollment_ts is not None
+            and last_enrollment_ts is not None
+            and _CONFIRMATION_ACTIVATED_AT
+            <= first_enrollment_ts
+            <= last_enrollment_ts
+            < _CONFIRMATION_EXPIRES_AT
+        ),
+        "all_four_labels_exactly_reported": set(blocks) == set(labels),
+        "same_30m_blocks_all_labels": bool(
+            common_blocks_reported == common_blocks_total
+            and common_blocks_total >= 30
+            and all(
+                item["counts_valid"]
+                and item["treatment_representation"]
+                and item["control_representation"]
+                and item["both_arms_have_blocks"]
+                and item["same_block_representation"]
+                for item in label_checks.values()
+            )
+        ),
+        "immutable_prefix_identity": bool(
+            prefix.get("status") == "verified"
+            and prefix.get("algorithm") == "sha256"
+            and sha256_literal(prefix_sha256)
+            and prefix_bytes is not None
+            and prefix_bytes > 0
+            and prefix_records is not None
+            and linked_total is not None
+            and prefix_records >= linked_total
+            and prefix_last_event_ts is not None
+            and analysis_as_of_ts is not None
+            and prefix_last_event_ts == analysis_as_of_ts
+        ),
+        "predeclared_scheduled_look_linked_to_prefix": bool(
+            scheduled_look.get("status") == "verified"
+            and scheduled_look.get("plan_id") == _CONFIRMATION_PLAN_ID
+            and isinstance(scheduled_look.get("look_id"), str)
+            and bool(scheduled_look.get("look_id"))
+            and sha256_literal(scheduled_look.get("declaration_sha256"))
+            and declared_at_ts is not None
+            and declared_at_ts < _CONFIRMATION_ACTIVATED_AT
+            and scheduled_at_ts is not None
+            and _CONFIRMATION_ACTIVATED_AT
+            <= scheduled_at_ts
+            < _CONFIRMATION_EXPIRES_AT
+            and scheduled_analysis_ts is not None
+            and analysis_as_of_ts is not None
+            and scheduled_analysis_ts == analysis_as_of_ts
+            and scheduled_look.get("prefix_sha256") == prefix_sha256
+        ),
     }
     passed = all(design_checks.values()) and all(
         check for entry in label_checks.values() for check in entry.values()
     )
     return {
         "pass": passed,
+        "expected_contract": deepcopy(expected_contract),
         "design_checks": design_checks,
         "labels": label_checks,
+        "linked_itt_rows": linked_counts,
+        "legacy_randomization_evidence_ignored": "randomization_evidence"
+        in experiment,
+        "pending_confirmation_input": (
+            "reporter has not supplied verified immutable-prefix and scheduled-look "
+            "evidence"
+            if not (
+                design_checks["immutable_prefix_identity"]
+                and design_checks["predeclared_scheduled_look_linked_to_prefix"]
+            )
+            else None
+        ),
         "status_cap_without_pass": "screen_pass",
     }
 
@@ -1306,8 +1892,15 @@ def _health_guardrails(experiment: Mapping[str, Any]) -> dict:
         "invalid_results": totals["invalid_results"],
         "duplicate_turns": totals["duplicate_turns"],
     }
+    observed_hard_failures = {
+        key: value
+        for key, value in hard_failures.items()
+        if key != "missing_or_inconsistent_evidence"
+    }
     return {
         "passed": not any(hard_failures.values()),
+        "evidence_complete": not evidence_failures,
+        "observed_harm": any(observed_hard_failures.values()),
         "manual_review_required": bool(
             warnings["http_503"] or warnings["invalid_results"]
         ),
@@ -1417,6 +2010,9 @@ def _bargaining_gate(experiment: Mapping[str, Any]) -> dict:
             -0.010,
         ),
         "itt_raw_point_nonnegative": _check(raw_itt.get("difference"), ">=", 0.0),
+        "itt_raw_lower_bound": _check(
+            raw_itt.get("lower_95_one_sided"), ">", -0.010
+        ),
     }
     support_checks = {
         "affected_common_reference_mass": _check(
@@ -1431,8 +2027,12 @@ def _bargaining_gate(experiment: Mapping[str, Any]) -> dict:
     integrity_failures = {
         "treatment_affected": _validate_affected_arm(treatment, "bargaining"),
         "control_affected": _validate_affected_arm(control, "bargaining"),
-        "treatment_itt": _validate_itt_arm(itt_treatment, 1200),
-        "control_itt": _validate_itt_arm(itt_control, 1200),
+        "treatment_itt": _validate_itt_arm(
+            itt_treatment, 1200, family="bargaining"
+        ),
+        "control_itt": _validate_itt_arm(
+            itt_control, 1200, family="bargaining"
+        ),
     }
     unknown_assignments = _strict_count(
         (itt.get("integrity", {}) if isinstance(itt.get("integrity"), Mapping) else {}).get(
@@ -1452,11 +2052,19 @@ def _bargaining_gate(experiment: Mapping[str, Any]) -> dict:
     )
 
     rollback_triggers: list[str] = []
-    if not guardrails["passed"]:
+    if guardrails["observed_harm"]:
         rollback_triggers.append("health_or_routing_guardrail")
     treatment_direct = _strict_count(treatment.get("direct_resolved"))
+    treatment_converted = _strict_count(treatment.get("direct_converted"))
     control_direct = _strict_count(control.get("direct_resolved"))
-    treatment_direct_rate = _number(treatment.get("direct_conversion_rate"))
+    treatment_direct_rate = (
+        treatment_converted / treatment_direct
+        if treatment_direct is not None
+        and treatment_direct > 0
+        and treatment_converted is not None
+        and treatment_converted <= treatment_direct
+        else None
+    )
     if (
         treatment_direct is not None
         and control_direct is not None
@@ -1468,7 +2076,19 @@ def _bargaining_gate(experiment: Mapping[str, Any]) -> dict:
         rollback_triggers.append("scheduled affected direct conversion <= 0.08")
     itt_treatment_n = _strict_count(itt_treatment.get("matured"))
     itt_control_n = _strict_count(itt_control.get("matured"))
-    deadline_payoff = _bounded_mean(itt_treatment.get("mean_normalized_outcome"))
+    deadline_sum = _number(itt_treatment.get("normalized_outcome_sum"))
+    deadline_payoff = (
+        deadline_sum / itt_treatment_n
+        if itt_treatment_n is not None
+        and itt_treatment_n > 0
+        and deadline_sum is not None
+        and _validate_moment_bounds(
+            deadline_sum,
+            itt_treatment.get("normalized_outcome_sum_squares"),
+            itt_treatment_n,
+        )
+        else None
+    )
     if (
         itt_treatment_n is not None
         and itt_control_n is not None
@@ -1500,7 +2120,12 @@ def _bargaining_gate(experiment: Mapping[str, Any]) -> dict:
         and guardrails["passed"]
     )
     promotion_ready = screen_ready and causal["pass"]
-    if rollback_triggers:
+    binding_rollback = bool(
+        rollback_triggers
+        and data_integrity_pass
+        and guardrails["evidence_complete"]
+    )
+    if binding_rollback:
         decision = "rollback"
     elif screen_ready and guardrails["manual_review_required"]:
         decision = "manual_review"
@@ -1515,11 +2140,12 @@ def _bargaining_gate(experiment: Mapping[str, Any]) -> dict:
         "experiment": experiment.get("name", "barg_dis_anchor"),
         "family": "bargaining",
         "rule_version": RULE_VERSION,
-        "amendment_provenance": dict(AMENDMENT_PROVENANCE),
+        "amendment_provenance": deepcopy(AMENDMENT_PROVENANCE),
         "decision": decision,
         "screen_ready": screen_ready,
         "promotion_ready": promotion_ready,
         "rollback_triggers": rollback_triggers,
+        "binding_rollback": binding_rollback,
         "guardrails": guardrails,
         "arm_rate_guardrails": arm_rates,
         "censor_safety": censor_safety,
@@ -1659,17 +2285,48 @@ def _persuasion_gate(experiment: Mapping[str, Any]) -> dict:
         itt_control.get("zero_sales"),
         itt_control.get("matured"),
     )
+    fixed_zero_difference = _fixed_weight_risk_difference(
+        itt_treatment,
+        itt_control,
+        ("p", "message_type", "price", "total_rounds"),
+        PERS_CELL_WEIGHTS,
+    )
+    raw_zero_check = _check(
+        zero_difference.get("upper_95_one_sided"), "<=", 0.02
+    )
+    fixed_zero_check = _check(
+        fixed_zero_difference.get("missing_mass_conservative_upper_95_one_sided"),
+        "<=",
+        0.02,
+    )
+    zero_upper_bounds = (
+        zero_difference.get("upper_95_one_sided"),
+        fixed_zero_difference.get("missing_mass_conservative_upper_95_one_sided"),
+    )
+    binding_zero_upper = (
+        max(float(value) for value in zero_upper_bounds)
+        if all(_number(value) is not None for value in zero_upper_bounds)
+        else None
+    )
     zero_sale = {
         **zero_difference,
-        "check": _check(zero_difference.get("upper_95_one_sided"), "<=", 0.02),
+        "raw_newcombe": zero_difference,
+        "fixed_weight": fixed_zero_difference,
+        "raw_check": raw_zero_check,
+        "fixed_weight_check": fixed_zero_check,
+        "check": _check(binding_zero_upper, "<=", 0.02),
     }
     censor_safety = _censor_safety(itt, family="persuasion")
     causal = _causal_confirmation(experiment, "persuasion")
     integrity_failures = {
         "treatment_affected": _validate_affected_arm(treatment, "persuasion"),
         "control_affected": _validate_affected_arm(control, "persuasion"),
-        "treatment_itt": _validate_itt_arm(itt_treatment, 1800),
-        "control_itt": _validate_itt_arm(itt_control, 1800),
+        "treatment_itt": _validate_itt_arm(
+            itt_treatment, 1800, family="persuasion"
+        ),
+        "control_itt": _validate_itt_arm(
+            itt_control, 1800, family="persuasion"
+        ),
     }
     unknown_assignments = _strict_count(
         (itt.get("integrity", {}) if isinstance(itt.get("integrity"), Mapping) else {}).get(
@@ -1701,12 +2358,17 @@ def _persuasion_gate(experiment: Mapping[str, Any]) -> dict:
     promotion_ready = screen_ready and causal["pass"]
 
     rollback_triggers: list[str] = []
-    if not guardrails["passed"]:
+    if guardrails["observed_harm"]:
         rollback_triggers.append("health_or_routing_guardrail")
     rollback_triggers.extend(
         _scheduled_censor_harm(censor_safety, treatment_min=150, control_min=150)
     )
-    if rollback_triggers:
+    binding_rollback = bool(
+        rollback_triggers
+        and data_integrity_pass
+        and guardrails["evidence_complete"]
+    )
+    if binding_rollback:
         decision = "rollback"
     elif screen_ready and guardrails["manual_review_required"]:
         decision = "manual_review"
@@ -1721,11 +2383,12 @@ def _persuasion_gate(experiment: Mapping[str, Any]) -> dict:
         "experiment": experiment.get("name", "pers_blind_lie"),
         "family": "persuasion",
         "rule_version": RULE_VERSION,
-        "amendment_provenance": dict(AMENDMENT_PROVENANCE),
+        "amendment_provenance": deepcopy(AMENDMENT_PROVENANCE),
         "decision": decision,
         "screen_ready": screen_ready,
         "promotion_ready": promotion_ready,
         "rollback_triggers": rollback_triggers,
+        "binding_rollback": binding_rollback,
         "guardrails": guardrails,
         "arm_rate_guardrails": arm_rates,
         "censor_safety": censor_safety,

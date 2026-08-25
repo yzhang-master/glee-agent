@@ -39,9 +39,17 @@ from glee_agent.guard import guard  # noqa: E402
 from glee_agent.schema import parse_game  # noqa: E402
 
 if __package__:
-    from scripts.canary_gates import evaluate_report_gates
+    from scripts.canary_gates import (
+        _binomial_summary as _gate_binomial_summary,
+        _newcombe_difference as _gate_newcombe_difference,
+        evaluate_report_gates,
+    )
 else:  # direct ``python scripts/canary_report.py`` execution
-    from canary_gates import evaluate_report_gates
+    from canary_gates import (  # type: ignore[no-redef]
+        _binomial_summary as _gate_binomial_summary,
+        _newcombe_difference as _gate_newcombe_difference,
+        evaluate_report_gates,
+    )
 from glee_agent.theory.targets import (  # noqa: E402
     DEFAULT_PATH as TARGETS_PATH,
     config_key_negotiation,
@@ -172,9 +180,119 @@ _NEG_STATIC_ASSIGNMENT = {
     "control_agents": ("main", "test_b", "test_c"),
 }
 
+_NEG_MATURITY_LAG_S = 600
+_NEG_CENSOR_MARGINAL_CEILINGS = {
+    ("overall", "overall"): 0.05,
+    ("opponent_type", "agent"): 0.05,
+    ("opponent_type", "hidden"): 0.05,
+    ("own_value_grid", "80"): 0.06,
+    ("own_value_grid", "100"): 0.06,
+    ("own_value_grid", "120"): 0.04,
+    ("own_value_grid", "150"): 0.08,
+}
+_NEG_CENSOR_JOINT_CEILINGS = {
+    ("agent", "80"): 0.08,
+    ("agent", "100"): 0.07,
+    ("agent", "120"): 0.04,
+    ("agent", "150"): 0.10,
+    ("hidden", "80"): 0.06,
+    ("hidden", "100"): 0.07,
+    ("hidden", "120"): 0.06,
+    ("hidden", "150"): 0.08,
+}
+# Exact prospective artifact frozen before its future activation.  Runtime
+# evidence must match every field; it cannot choose its own cutoff after
+# outcomes are visible.
+_NEG_PROSPECTIVE_ASSIGNMENT = {
+    "status": "frozen",
+    "artifact_path": "data/canary_assignment.json",
+    "artifact_sha256": "b002b688d02df3233b7dd4f21a5595cf149b4cc8dd501a0bfc2ee5bccd11d745",
+    "artifact_bytes": 837,
+    "plan_id": "confirmation-v2-20260825-2100z",
+    "assignment_salt": "730f45c9167e0c39136c20b30dcbdda3",
+    "rule_id": "neg-terminal-confirm-v2",
+    "activated_at": 1787691600,
+    "activated_at_utc": "2026-08-25T21:00:00+00:00",
+    "expires_at": 1787950800,
+    "agents": ["main", "test_a", "test_b", "test_c"],
+    "assignment_algorithm": "sha256-u64-v1",
+    "strategy_aggregate_sha256": "631ef69862d572644ba855174a411f80a220b11ed5c20e30b43ffc31f1303388",
+    "target_sha256": {
+        "data/targets.json": "1d24a579ca2b611e3b30af4ddf7af5b84ad13e7198fa55b93a2f5e6617e65e25",
+        "data/live_targets.json": "3dcaff69f17175648e4b46499859bf183bba03b1321364de329d01bed0e618a3",
+    },
+    "control": False,
+    "treatment": True,
+    "treatment_probability": 0.5,
+    "rules": [
+        {
+            "family": "bargaining",
+            "rule_id": "barg-anchor-confirm-v2",
+            "knob": "barg_dis_anchor",
+            "control": 0.58,
+            "treatment": 0.5,
+            "treatment_probability": 0.25,
+        },
+        {
+            "family": "negotiation",
+            "rule_id": "neg-terminal-confirm-v2",
+            "knob": "neg_terminal_close",
+            "control": False,
+            "treatment": True,
+            "treatment_probability": 0.5,
+        },
+        {
+            "family": "persuasion",
+            "rule_id": "pers-blind-confirm-v2",
+            "knob": "pers_blind_lie",
+            "control": 1.0,
+            "treatment": 0.4,
+            "treatment_probability": 0.5,
+        },
+    ],
+}
+
+
+def _prospective_assignment_expected(experiment: Experiment) -> dict:
+    rule = next(
+        (
+            item
+            for item in _NEG_PROSPECTIVE_ASSIGNMENT["rules"]
+            if item["family"] == experiment.family
+        ),
+        {},
+    )
+    return {
+        **_NEG_PROSPECTIVE_ASSIGNMENT,
+        "rule_id": rule.get("rule_id"),
+        "control": rule.get("control"),
+        "treatment": rule.get("treatment"),
+        "treatment_probability": rule.get("treatment_probability"),
+    }
+
 NEG_TERMINAL_GATE_DESIGN = {
-    "version": "hidden-value-terminal-close-v2-frozen-2026-08-25",
-    "frozen_before_subsequent_outcomes": True,
+    "version": "hidden-value-terminal-close-amended-v2-prospective-2026-08-25",
+    "frozen_before_subsequent_outcomes": False,
+    "amendment_provenance": {
+        "live_outcomes_inspected_before_amendment": True,
+        "pre_amendment_observed": {
+            "treatment": {"unresolved": 1, "affected": 11},
+            "control": {"unresolved": 2, "affected": 33},
+            "raw_treatment_minus_control_unresolved_rate": 0.0303,
+        },
+        "reason": (
+            "young active games were incorrectly treated as censoring harm; "
+            "the amendment adds a pre-cut-derived maturation deadline and "
+            "prospective-only causal assignment"
+        ),
+        "prior_rows_status": "pilot_or_exploratory_screen_only",
+        "prospective_assignment": dict(_NEG_PROSPECTIVE_ASSIGNMENT),
+        "prospective_cutoff_status": "frozen before activation",
+        "prefix_and_scheduled_look_status": (
+            "pending; current reporter input has no immutable JSONL prefix identity, "
+            "so prospective efficacy remains nonbinding/screen-only"
+        ),
+    },
     "pilot_checkpoint": {
         "treatment": {"direct_converted": 0, "direct_resolved": 2},
         "control": {"direct_converted": 1, "direct_resolved": 6},
@@ -184,8 +302,8 @@ NEG_TERMINAL_GATE_DESIGN = {
             "used to set gates."
         ),
         "analysis_window": (
-            "The report retains all strictly enrolled games from the experiment "
-            "cutoff, including the disclosed pilot."
+            "The report retains prior rows as pilot/screen evidence; only a "
+            "future pinned manifest-backed assignment can be confirmatory."
         ),
     },
     "estimand": {
@@ -206,10 +324,19 @@ NEG_TERMINAL_GATE_DESIGN = {
             "a later treatment assignment never reclassifies earlier control rows."
         ),
         "causal_status_policy": (
-            "Fixed-label evidence can reach screen_pass only. Causal promote "
-            "requires two labels observed with meaningful treatment and control "
-            "support across a manifest-backed switchback."
+            "Legacy fixed-label and runtime-knob evidence can reach screen_pass "
+            "only. Causal promote requires a separately pinned prospective "
+            "per-game artifact, cutoff, and validated assignment receipts."
         ),
+        "maturity_policy": {
+            "clock_origin": "first observed strictly enrolled turn",
+            "lag_seconds": _NEG_MATURITY_LAG_S,
+            "timely_valid_terminal": "resolved",
+            "young_without_timely_valid_terminal": "pending and excluded",
+            "after_deadline_without_timely_valid_terminal": (
+                "permanently deadline_censored; a later terminal cannot reclassify"
+            ),
+        },
     },
     "reference_cells": [dict(cell) for cell in _NEG_TERMINAL_REFERENCE_CELLS],
     "static_assignment": {
@@ -239,10 +366,35 @@ NEG_TERMINAL_GATE_DESIGN = {
         "normalized_payoff_sd": 0.033679,
         "payoff_percentile_mean": 0.722626,
         "payoff_percentile_sd": 0.22869,
+        "maturation_derivation": {
+            "eligible": 1418,
+            "terminals": 1382,
+            "no_terminal": 36,
+            "divergence_to_terminal_seconds": {
+                "q50": 247.888,
+                "q90": 302.835,
+                "q95": 318.104,
+                "q99": 359.272,
+                "q99_5": 377.128,
+                "max": 492.004,
+            },
+            "frozen_lag_seconds": _NEG_MATURITY_LAG_S,
+            "note": (
+                "lag constants use only the pre-cut window; the prospective "
+                "clock starts earlier at the first observed turn"
+            ),
+        },
     },
     "thresholds": {
         "promotion_sample": {"treatment": 340, "control": 1020},
         "promotion_per_joint_cell": {"treatment": 15, "control": 45},
+        "prospective_sample_interpretation": (
+            "The asymmetric 340/1020 overall and 15/45 joint minima are retained "
+            "as conservative absolute minima from the predeclared legacy gate. "
+            "The 1:1 per-game plan is expected to collect roughly 1020/1020 "
+            "overall and 45/45 per joint cell before control minima are met; "
+            "no balanced-design threshold was tuned after outcomes."
+        ),
         "direct_uplift_min": 0.060,
         "direct_uplift_one_sided_95_lower_min": 0.0,
         "normalized_payoff_noninferiority_margin": -0.005,
@@ -269,6 +421,17 @@ NEG_TERMINAL_GATE_DESIGN = {
         "interim_2_conditional_power_futility": None,
         "treatment_error_rate_excess_max": 0.010,
         "affected_censor_rate_excess_max": 0.030,
+        "maturity_lag_seconds": _NEG_MATURITY_LAG_S,
+        "censor_rollback_min_mature": {"treatment": 50, "control": 150},
+        "censor_marginal_wilson_ceilings": {
+            f"{field}:{value}": ceiling
+            for (field, value), ceiling in _NEG_CENSOR_MARGINAL_CEILINGS.items()
+        },
+        "censor_joint_point_ceilings": {
+            f"{identity}:{value}": ceiling
+            for (identity, value), ceiling in _NEG_CENSOR_JOINT_CEILINGS.items()
+        },
+        "treatment_minus_control_censor_excess_max": 0.030,
     },
     "inference": {
         "confidence": "one-sided 95% promotion bounds; one-sided 90% futility upper bound",
@@ -281,6 +444,11 @@ NEG_TERMINAL_GATE_DESIGN = {
         "payoff_percentile_pool": (
             "pinned data/targets.json loaded with live=False; mutable live targets "
             "and the get_targets singleton are excluded"
+        ),
+        "censoring": (
+            "one-sided 95% Wilson arm bounds and Newcombe/MOVER independent-arm "
+            "risk-difference bounds; no censor rollback before the scheduled "
+            "mature T>=50/C>=150 look"
         ),
     },
 }
@@ -318,6 +486,7 @@ class Turn:
     action: dict
     corrections: list
     error: Any
+    canary_assignment: dict | None
 
 
 @dataclass
@@ -326,9 +495,14 @@ class ResultEvent:
     gid: str
     ts: float
     valid: Any
-    game_over: bool
+    game_over: bool | None
     error: Any
     result: dict
+    result_source: str | None
+    reaped: bool | None
+    result_is_dict: bool
+    prospective_schema_valid: bool
+    prospective_schema_failures: tuple[str, ...]
 
 
 @dataclass
@@ -339,11 +513,14 @@ class RuntimeEvent:
     knobs: dict
     git_head: str | None
     strategy_sha256: str | None
+    target_sha256: dict[str, str | None]
+    canary_assignment: dict | None
 
 
 @dataclass
 class ParsedRecords:
     turns: dict[tuple[str, str, int, str], Turn]
+    turn_events: list[Turn]
     first_turns: dict[tuple[str, str], Turn]
     results: list[ResultEvent]
     terminals: dict[tuple[str, str], ResultEvent]
@@ -369,6 +546,7 @@ def _record_agent(record: dict) -> str:
 
 def parse_records(records: Iterable[dict]) -> ParsedRecords:
     turns: dict[tuple[str, str, int, str], Turn] = {}
+    turn_events: list[Turn] = []
     first_turns: dict[tuple[str, str], Turn] = {}
     results: list[ResultEvent] = []
     terminals: dict[tuple[str, str], ResultEvent] = {}
@@ -389,6 +567,8 @@ def parse_records(records: Iterable[dict]) -> ParsedRecords:
             hashes = hashes if isinstance(hashes, dict) else {}
             strategy = hashes.get("strategy_python")
             strategy = strategy if isinstance(strategy, dict) else {}
+            targets = hashes.get("targets")
+            targets = targets if isinstance(targets, dict) else {}
             pid_value = _as_float(record.get("pid"))
             runtimes.append(
                 RuntimeEvent(
@@ -408,6 +588,20 @@ def parse_records(records: Iterable[dict]) -> ParsedRecords:
                     strategy_sha256=(
                         strategy.get("aggregate_sha256")
                         if isinstance(strategy.get("aggregate_sha256"), str)
+                        else None
+                    ),
+                    target_sha256={
+                        str(path): (
+                            identity.get("sha256")
+                            if isinstance(identity, dict)
+                            and isinstance(identity.get("sha256"), str)
+                            else None
+                        )
+                        for path, identity in targets.items()
+                    },
+                    canary_assignment=(
+                        record.get("canary_assignment")
+                        if isinstance(record.get("canary_assignment"), dict)
                         else None
                     ),
                 )
@@ -441,7 +635,13 @@ def parse_records(records: Iterable[dict]) -> ParsedRecords:
                     else []
                 ),
                 error=record.get("error"),
+                canary_assignment=(
+                    record.get("canary_assignment")
+                    if isinstance(record.get("canary_assignment"), dict)
+                    else None
+                ),
             )
+            turn_events.append(turn)
             game_key = (agent, gid)
             old_first = first_turns.get(game_key)
             if old_first is None or turn.ts < old_first.ts:
@@ -456,14 +656,51 @@ def parse_records(records: Iterable[dict]) -> ParsedRecords:
             gid = record.get("game_id")
             if not isinstance(gid, str):
                 continue
+            raw_source = record.get("result_source")
+            raw_reaped = record.get("reaped")
+            raw_game_over = record.get("game_over")
+            raw_valid = record.get("valid")
+            raw_result = record.get("result")
+            schema_failures: list[str] = []
+            if type(raw_game_over) is not bool:
+                schema_failures.append("game_over_not_literal_bool")
+            if raw_source not in ("move", "move_transport_error", "reaper"):
+                schema_failures.append("result_source_missing_or_invalid")
+            if type(raw_reaped) is not bool:
+                schema_failures.append("reaped_not_literal_bool")
+            if type(raw_valid) is not bool and raw_valid is not None:
+                schema_failures.append("valid_not_bool_or_null")
+            if raw_result is not None and not isinstance(raw_result, dict):
+                schema_failures.append("result_not_object_or_null")
+            if raw_source in ("move", "move_transport_error") and raw_reaped is not False:
+                schema_failures.append("move_source_reaped_mismatch")
+            if raw_source == "reaper" and raw_reaped is not True:
+                schema_failures.append("reaper_source_reaped_mismatch")
             event = ResultEvent(
                 agent=agent,
                 gid=gid,
                 ts=ts,
-                valid=record.get("valid"),
-                game_over=bool(record.get("game_over")),
+                valid=raw_valid,
+                game_over=(
+                    raw_game_over
+                    if type(raw_game_over) is bool
+                    else None
+                ),
                 error=record.get("error"),
-                result=record.get("result") if isinstance(record.get("result"), dict) else {},
+                result=raw_result if isinstance(raw_result, dict) else {},
+                result_source=(
+                    raw_source
+                    if raw_source in ("move", "move_transport_error", "reaper")
+                    else None
+                ),
+                reaped=(
+                    raw_reaped
+                    if type(raw_reaped) is bool
+                    else None
+                ),
+                result_is_dict=isinstance(raw_result, dict),
+                prospective_schema_valid=not schema_failures,
+                prospective_schema_failures=tuple(schema_failures),
             )
             results.append(event)
             if event.game_over:
@@ -482,6 +719,7 @@ def parse_records(records: Iterable[dict]) -> ParsedRecords:
 
     return ParsedRecords(
         turns=turns,
+        turn_events=turn_events,
         first_turns=first_turns,
         results=results,
         terminals=terminals,
@@ -521,6 +759,8 @@ def _arm_empty() -> dict:
             "checked": 0,
             "assigned_matches": 0,
             "replay_errors": 0,
+            "assignment_integrity_errors": 0,
+            "duplicate_causal_turn_conflicts": 0,
             "affected": 0,
             "affected_assigned_matches": 0,
             "affected_wrong_variant": 0,
@@ -762,7 +1002,7 @@ def _offer_outcomes(
         affected_by_game[(item["agent"], item["game_id"])].append(item)
 
     first_by_game: dict[tuple[str, str], Turn] = {}
-    for turn in parsed.turns.values():
+    for turn in parsed.turn_events:
         key = (turn.agent, turn.gid)
         if key not in enrolled or turn.family != experiment.family:
             continue
@@ -862,7 +1102,7 @@ def _offer_outcomes(
 
 def _analysis_timestamp(parsed: ParsedRecords) -> float:
     """Latest persisted event time, used as a deterministic censoring clock."""
-    timestamps = [turn.ts for turn in parsed.turns.values()]
+    timestamps = [turn.ts for turn in parsed.turn_events]
     timestamps.extend(event.ts for event in parsed.results)
     timestamps.extend(event.ts for event in parsed.runtimes)
     return max(timestamps, default=0.0)
@@ -879,6 +1119,7 @@ def _itt_leaf_empty() -> dict:
         "timely_valid_terminals": 0,
         "deadline_zeroes": 0,
         "late_terminals": 0,
+        "terminal_conflicts": 0,
         "invalid_terminals": 0,
         "normalized_outcome_sum": 0.0,
         "normalized_outcome_sum_squares": 0.0,
@@ -926,21 +1167,35 @@ def _finish_itt_metric(metric: dict) -> None:
 def _first_enrolled_turns(
     enrolled: set[tuple[str, str]], parsed: ParsedRecords, family: str
 ) -> dict[tuple[str, str], Turn]:
-    first: dict[tuple[str, str], Turn] = {}
-    for turn in parsed.turns.values():
-        key = (turn.agent, turn.gid)
-        if key not in enrolled or turn.family != family:
-            continue
-        old = first.get(key)
-        if old is None or turn.ts < old.ts:
-            first[key] = turn
-    return first
+    # ``parsed.turns`` keeps the latest duplicate for routing diagnostics.
+    # Maturity and arm assignment must instead use the immutable earliest raw
+    # sighting, otherwise a duplicate round-1 poll can move the deadline.
+    return {
+        key: turn
+        for key, turn in parsed.first_turns.items()
+        if key in enrolled and turn.family == family
+    }
 
 
 def _runtime_variant(
-    parsed: ParsedRecords, experiment: Experiment, agent: str, ts: float
+    parsed: ParsedRecords,
+    experiment: Experiment,
+    agent: str,
+    ts: float,
+    turn: Turn | None = None,
 ) -> str:
     """Resolve a non-negotiation arm from the latest available manifest."""
+    if turn is not None:
+        receipt = _neg_receipt_assignment(parsed, experiment, turn)
+        if receipt is not None:
+            evidence = receipt[3]
+            return (
+                receipt[0]
+                if receipt[0] in ("treatment", "control")
+                and evidence.get("valid") is True
+                and evidence.get("approved") is True
+                else "unknown"
+            )
     eligible = [
         event
         for event in parsed.runtimes
@@ -979,6 +1234,99 @@ def _itt_cell_persuasion(turn: Turn) -> dict:
     }
 
 
+def _itt_terminal_valid(turn: Turn, terminal: ResultEvent) -> bool:
+    prospective = bool(
+        isinstance(turn.canary_assignment, dict)
+        and turn.canary_assignment.get("status") == "assigned"
+    )
+    explicit_move = bool(
+        terminal.result_source == "move"
+        and terminal.reaped is False
+        and terminal.valid is True
+    )
+    explicit_reaper = bool(
+        terminal.result_source == "reaper"
+        and terminal.reaped is True
+        and terminal.valid is None
+    )
+    legacy_direct = bool(
+        not prospective
+        and terminal.result_source is None
+        and terminal.reaped is None
+        and terminal.valid is True
+    )
+    outcomes = (
+        {"completed", "timeout"}
+        if turn.family == "persuasion"
+        else {"agreement", "no_deal", "walked_away", "timeout"}
+    )
+    player = turn.game.get("your_player", "player_1")
+    payoff = terminal.result.get(f"{player}_payoff")
+    return bool(
+        terminal.game_over is True
+        and terminal.error is None
+        and terminal.result_is_dict
+        and (not prospective or terminal.prospective_schema_valid)
+        and terminal.result.get("outcome") in outcomes
+        and not isinstance(payoff, bool)
+        and isinstance(payoff, (int, float))
+        and math.isfinite(float(payoff))
+        and (explicit_move or explicit_reaper or legacy_direct)
+    )
+
+
+def _itt_deadline_terminal(
+    parsed: ParsedRecords,
+    key: tuple[str, str],
+    turn: Turn,
+    maturity_lag_s: int,
+) -> tuple[ResultEvent | None, bool, bool]:
+    deadline = turn.ts + maturity_lag_s
+    prospective = bool(
+        isinstance(turn.canary_assignment, dict)
+        and turn.canary_assignment.get("status") == "assigned"
+    )
+    game_events = [
+        event
+        for event in parsed.results
+        if (event.agent, event.gid) == key and turn.ts <= event.ts <= deadline
+    ]
+    malformed_prospective = bool(
+        prospective
+        and any(not event.prospective_schema_valid for event in game_events)
+    )
+    candidates = sorted(
+        (
+            event
+            for event in game_events
+            if event.game_over is True
+        ),
+        key=lambda event: event.ts,
+    )
+    valid = [event for event in candidates if _itt_terminal_valid(turn, event)]
+    signatures = {
+        (
+            event.result.get("outcome"),
+            tuple(
+                sorted(
+                    (key, value)
+                    for key, value in event.result.items()
+                    if key.endswith("_payoff")
+                )
+            ),
+        )
+        for event in valid
+    }
+    conflict = len(signatures) > 1
+    if conflict:
+        return None, True, malformed_prospective
+    return (
+        valid[0] if valid else candidates[0] if candidates else None,
+        False,
+        malformed_prospective,
+    )
+
+
 def _add_itt_observation(
     metric: dict,
     turn: Turn,
@@ -988,6 +1336,8 @@ def _add_itt_observation(
     cell: dict,
     denominator: float | None,
     p_key: str | None = None,
+    terminal_conflict: bool = False,
+    terminal_schema_failure: bool = False,
 ) -> None:
     cell_metric = metric["cells"].setdefault(
         _cell_key(cell), {"cell": cell, **_itt_leaf_empty()}
@@ -997,6 +1347,7 @@ def _add_itt_observation(
         targets.append(metric["p_strata"].setdefault(p_key, _itt_leaf_empty()))
     for target in targets:
         target["games"] += 1
+        target["terminal_conflicts"] += int(terminal_conflict)
 
     deadline = turn.ts + metric["maturity_lag_s"]
     if analysis_ts < deadline:
@@ -1005,12 +1356,14 @@ def _add_itt_observation(
         return
 
     payoff = _terminal_payoff(turn, terminal) if terminal is not None else None
-    terminal_timely = terminal is not None and terminal.ts <= deadline
+    # Conflicting source-valid records are timely evidence, but not a usable
+    # outcome.  Count them as invalid (and block integrity) rather than as
+    # deadline censoring.
+    terminal_timely = terminal_conflict or terminal_schema_failure or (
+        terminal is not None and terminal.ts <= deadline
+    )
     terminal_structured = bool(
-        terminal_timely
-        and (terminal.valid is True or terminal.valid is None)
-        and not terminal.error
-        and isinstance(terminal.result.get("outcome"), str)
+        terminal_timely and terminal is not None and _itt_terminal_valid(turn, terminal)
     )
     normalized_valid = (
         terminal_structured
@@ -1058,19 +1411,22 @@ def _bargaining_itt(
     }
     by_variant["integrity"] = {"unknown_assignment_games": 0}
     for key, turn in _first_enrolled_turns(enrolled, parsed, "bargaining").items():
-        variant = _runtime_variant(parsed, experiment, turn.agent, turn.ts)
+        variant = _validated_game_assignment(parsed, experiment, key)[0]
         if variant not in by_variant:
             by_variant["integrity"]["unknown_assignment_games"] += 1
             continue
         state = turn.game.get("game_state")
         state = state if isinstance(state, dict) else {}
+        terminal_result = _itt_deadline_terminal(parsed, key, turn, 1200)
         _add_itt_observation(
             by_variant[variant],
             turn,
-            parsed.terminals.get(key),
+            terminal_result[0],
             analysis_ts=analysis_ts,
             cell=_itt_cell_bargaining(turn),
             denominator=_as_float(state.get("money_to_divide")),
+            terminal_conflict=terminal_result[1],
+            terminal_schema_failure=terminal_result[2],
         )
     for arm in ("treatment", "control"):
         metric = by_variant[arm]
@@ -1102,7 +1458,7 @@ def _persuasion_itt(
         # the explicit blind-seller contract, not a post-hoc missing-v proxy.
         if not seller or state.get("is_seller_know_cv") is not False:
             continue
-        variant = _runtime_variant(parsed, experiment, turn.agent, turn.ts)
+        variant = _validated_game_assignment(parsed, experiment, key)[0]
         if variant not in by_variant:
             by_variant["integrity"]["unknown_assignment_games"] += 1
             continue
@@ -1113,14 +1469,17 @@ def _persuasion_itt(
             if price is not None and price > 0 and rounds_value is not None and rounds_value > 0
             else None
         )
+        terminal_result = _itt_deadline_terminal(parsed, key, turn, 1800)
         _add_itt_observation(
             by_variant[variant],
             turn,
-            parsed.terminals.get(key),
+            terminal_result[0],
             analysis_ts=analysis_ts,
             cell=_itt_cell_persuasion(turn),
             denominator=denominator,
             p_key=_p_key(state.get("p")),
+            terminal_conflict=terminal_result[1],
+            terminal_schema_failure=terminal_result[2],
         )
     for arm in ("treatment", "control"):
         metric = by_variant[arm]
@@ -1198,12 +1557,360 @@ def _neg_target_integrity(actual: dict | None = None) -> dict:
     }
 
 
+def _literal_finite_number(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    result = float(value)
+    return result if math.isfinite(result) else None
+
+
+def _literal_nonnegative_int(value: Any) -> int | None:
+    if type(value) is not int or value < 0:
+        return None
+    return value
+
+
+def _sha256_text(value: Any) -> str | None:
+    if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
+        return None
+    return value
+
+
+def _neg_receipt_assignment(
+    parsed: ParsedRecords,
+    experiment: Experiment,
+    turn: Turn,
+) -> tuple[str, str, str, dict] | None:
+    """Validate one final-schema per-game assignment against its startup manifest."""
+    metadata = turn.canary_assignment
+    if metadata is None:
+        return None
+    status = metadata.get("status")
+    if status == "unassigned":
+        # Disabled/missing prospective infrastructure leaves the legacy policy
+        # in force only before the frozen activation.  Once the confirmatory
+        # plan is active, an unassigned game is an integrity event and must not
+        # fall through to a static/runtime label.
+        if not isinstance(metadata.get("reason"), str):
+            return (
+                "unknown",
+                f"invalid-receipt:{turn.agent}:{turn.gid}",
+                "invalid_assignment_receipt",
+                {"prospective": True, "valid": False, "reason": "invalid_unassigned"},
+            )
+        activation = float(_NEG_PROSPECTIVE_ASSIGNMENT["activated_at"])
+        expiry = float(_NEG_PROSPECTIVE_ASSIGNMENT["expires_at"])
+        if turn.ts >= expiry:
+            return (
+                "unknown",
+                f"outside-confirmation-window:{turn.agent}:{turn.gid}",
+                "outside_confirmation_window",
+                {
+                    "prospective": False,
+                    "outside_confirmation": True,
+                    "valid": True,
+                    "approved": False,
+                    "reason": "first_seen_after_frozen_expiry",
+                },
+            )
+        if turn.ts >= activation:
+            return (
+                "unknown",
+                f"unassigned-after-activation:{turn.agent}:{turn.gid}",
+                "invalid_assignment_receipt",
+                {
+                    "prospective": True,
+                    "valid": False,
+                    "approved": False,
+                    "reason": "unassigned_after_frozen_activation",
+                },
+            )
+        return None
+    if status != "assigned":
+        return (
+            "unknown",
+            f"invalid-receipt:{turn.agent}:{turn.gid}",
+            "invalid_assignment_receipt",
+            {"prospective": True, "valid": False, "reason": "invalid_status"},
+        )
+
+    required = {
+        "status",
+        "reason",
+        "artifact_sha256",
+        "plan_id",
+        "rule_id",
+        "family",
+        "knob",
+        "arm",
+        "value",
+        "treatment_probability",
+        "assignment_algorithm",
+        "assignment_sha256",
+        "assignment_u64",
+        "treatment_threshold_u64",
+        "enrollment",
+        "enrolled_at",
+    }
+    failures: list[str] = []
+    if set(metadata) != required:
+        failures.append("receipt_fields")
+    if metadata.get("reason") != "eligible":
+        failures.append("reason")
+    artifact = _sha256_text(metadata.get("artifact_sha256"))
+    assignment_sha = _sha256_text(metadata.get("assignment_sha256"))
+    plan_id = metadata.get("plan_id")
+    rule_id = metadata.get("rule_id")
+    arm = metadata.get("arm")
+    probability = _literal_finite_number(metadata.get("treatment_probability"))
+    assignment_u64 = _literal_nonnegative_int(metadata.get("assignment_u64"))
+    threshold = _literal_nonnegative_int(metadata.get("treatment_threshold_u64"))
+    enrolled_at = _literal_finite_number(metadata.get("enrolled_at"))
+    if artifact is None or assignment_sha is None:
+        failures.append("receipt_hash")
+    if not isinstance(plan_id, str) or not plan_id:
+        failures.append("plan_id")
+    if not isinstance(rule_id, str) or not rule_id:
+        failures.append("rule_id")
+    if metadata.get("family") != experiment.family:
+        failures.append("family")
+    if metadata.get("knob") != experiment.knob:
+        failures.append("knob")
+    if arm not in ("treatment", "control"):
+        failures.append("arm")
+    expected_value = (
+        experiment.treatment_value if arm == "treatment" else experiment.control_value
+    )
+    if arm in ("treatment", "control") and not (
+        type(metadata.get("value")) is type(expected_value)
+        and metadata.get("value") == expected_value
+    ):
+        failures.append("value")
+    if probability is None or not 0 <= probability <= 1:
+        failures.append("treatment_probability")
+    if metadata.get("assignment_algorithm") != "sha256-u64-v1":
+        failures.append("algorithm")
+    if assignment_u64 is None or assignment_u64 >= 1 << 64:
+        failures.append("assignment_u64")
+    if threshold is None or threshold > 1 << 64:
+        failures.append("threshold")
+    if probability is not None and threshold != int(probability * (1 << 64)):
+        failures.append("threshold_probability")
+    if assignment_u64 is not None and threshold is not None:
+        derived_arm = "treatment" if assignment_u64 < threshold else "control"
+        if arm != derived_arm:
+            failures.append("derived_arm")
+    if metadata.get("enrollment") not in ("new", "recovered"):
+        failures.append("enrollment")
+    if enrolled_at is None:
+        failures.append("enrolled_at")
+    elif enrolled_at > turn.ts:
+        failures.append("enrolled_after_logged_turn")
+
+    runtime_candidates = [
+        event
+        for event in parsed.runtimes
+        if event.agent == turn.agent
+        and experiment.cutoff <= event.ts <= turn.ts
+    ]
+    runtime = max(runtime_candidates, key=lambda item: item.ts) if runtime_candidates else None
+    manifest = runtime.canary_assignment if runtime is not None else None
+    manifest = manifest if isinstance(manifest, dict) else {}
+    manifest_artifact = manifest.get("artifact")
+    manifest_artifact = manifest_artifact if isinstance(manifest_artifact, dict) else {}
+    contract = manifest.get("contract")
+    contract = contract if isinstance(contract, dict) else {}
+    receipt_store = manifest.get("receipt_store")
+    receipt_store = receipt_store if isinstance(receipt_store, dict) else {}
+    if set(manifest) != {
+        "loader_status",
+        "error_code",
+        "artifact",
+        "contract",
+        "receipt_store",
+    }:
+        failures.append("runtime_manifest_fields")
+    if set(manifest_artifact) != {"path", "available", "sha256", "bytes"}:
+        failures.append("runtime_artifact_fields")
+    if set(contract) != {
+        "schema_version",
+        "plan_id",
+        "assignment_salt",
+        "assignment_salt_visibility",
+        "activated_at",
+        "expires_at",
+        "agents",
+        "assignment_algorithm",
+        "enrollment",
+        "rules",
+    }:
+        failures.append("contract_fields")
+    if (
+        runtime is None
+        or manifest.get("loader_status") != "valid"
+        or manifest.get("error_code") is not None
+        or manifest_artifact.get("available") is not True
+        or manifest_artifact.get("sha256") != artifact
+        or _literal_nonnegative_int(manifest_artifact.get("bytes")) in (None, 0)
+        or _sha256_text(runtime.strategy_sha256 if runtime is not None else None) is None
+        or (runtime.target_sha256 if runtime is not None else {})
+        != _NEG_PROSPECTIVE_ASSIGNMENT["target_sha256"]
+    ):
+        failures.append("runtime_manifest")
+    if contract.get("schema_version") != 1:
+        failures.append("contract_schema")
+    if contract.get("plan_id") != plan_id:
+        failures.append("contract_plan")
+    if contract.get("assignment_algorithm") != "sha256-u64-v1":
+        failures.append("contract_algorithm")
+    if contract.get("assignment_salt_visibility") != "public_replay_seed":
+        failures.append("contract_salt_visibility")
+    if contract.get("enrollment") != {
+        "first_seen_round": 1,
+        "requires_empty_history": True,
+        "assigned_games_remain_stable_after_expiry": True,
+    }:
+        failures.append("contract_enrollment")
+    agents = contract.get("agents")
+    if not isinstance(agents, list) or turn.agent not in agents:
+        failures.append("contract_agent")
+    activated_at = _literal_finite_number(contract.get("activated_at"))
+    expires_at = _literal_finite_number(contract.get("expires_at"))
+    if (
+        activated_at is None
+        or expires_at is None
+        or enrolled_at is None
+        or not activated_at <= enrolled_at < expires_at
+    ):
+        failures.append("contract_window")
+    rules = contract.get("rules")
+    rules = rules if isinstance(rules, list) else []
+    matching_rules = [
+        rule
+        for rule in rules
+        if isinstance(rule, dict)
+        and rule.get("family") == experiment.family
+        and rule.get("rule_id") == rule_id
+    ]
+    if len(matching_rules) != 1:
+        failures.append("contract_rule")
+        rule = {}
+    else:
+        rule = matching_rules[0]
+    if (
+        rule.get("knob") != experiment.knob
+        or type(rule.get("control")) is not type(experiment.control_value)
+        or rule.get("control") != experiment.control_value
+        or type(rule.get("treatment")) is not type(experiment.treatment_value)
+        or rule.get("treatment") != experiment.treatment_value
+        or _literal_finite_number(rule.get("treatment_probability")) != probability
+    ):
+        failures.append("contract_rule_values")
+
+    salt = contract.get("assignment_salt")
+    if (
+        isinstance(salt, str)
+        and salt
+        and isinstance(plan_id, str)
+        and isinstance(rule_id, str)
+        and assignment_sha is not None
+    ):
+        components = (
+            "glee-canary-assignment-v1",
+            salt,
+            plan_id,
+            rule_id,
+            turn.agent,
+            experiment.family,
+            turn.gid,
+        )
+        digest = hashlib.sha256(
+            b"\0".join(component.encode("utf-8") for component in components)
+        ).digest()
+        if digest.hex() != assignment_sha or int.from_bytes(digest[:8], "big") != assignment_u64:
+            failures.append("assignment_digest")
+    else:
+        failures.append("assignment_salt")
+
+    if failures:
+        return (
+            "unknown",
+            f"invalid-receipt:{turn.agent}:{turn.gid}",
+            "invalid_assignment_receipt",
+            {
+                "prospective": True,
+                "valid": False,
+                "reason": ",".join(sorted(set(failures))),
+            },
+        )
+    assert artifact is not None and isinstance(plan_id, str) and isinstance(rule_id, str)
+    expected = _prospective_assignment_expected(experiment)
+    approved = bool(
+        expected["status"] == "frozen"
+        and expected["artifact_path"] == manifest_artifact.get("path")
+        and expected["artifact_sha256"] == artifact
+        and expected["artifact_bytes"] == manifest_artifact.get("bytes")
+        and expected["plan_id"] == plan_id
+        and expected["assignment_salt"] == salt
+        and expected["rule_id"] == rule_id
+        and expected["activated_at"] == activated_at
+        and expected["expires_at"] == expires_at
+        and agents == expected["agents"]
+        and expected["assignment_algorithm"] == contract.get("assignment_algorithm")
+        and expected["strategy_aggregate_sha256"] == runtime.strategy_sha256
+        and expected["control"] == rule.get("control")
+        and expected["treatment"] == rule.get("treatment")
+        and expected["treatment_probability"]
+        == _literal_finite_number(rule.get("treatment_probability"))
+        and rules == expected["rules"]
+        and receipt_store
+        == {
+            "format": "append-only-jsonl-v1",
+            "path": (
+                f"logs/canary-assignments/{turn.agent}/"
+                f"{artifact}.jsonl"
+            ),
+            "write_ahead_fsync": True,
+            "max_bytes": 64 * 1024 * 1024,
+        }
+        and enrolled_at is not None
+        and enrolled_at >= expected["activated_at"]
+        and turn.ts >= expected["activated_at"]
+    )
+    return (
+        str(arm),
+        f"receipt:{artifact[:12]}:{plan_id}:{rule_id}",
+        "manifest_assignment_receipt",
+        {
+            "prospective": True,
+            "valid": True,
+            "approved": approved,
+            "artifact_sha256": artifact,
+            "plan_id": plan_id,
+            "rule_id": rule_id,
+            "activated_at": activated_at,
+            "enrolled_at": enrolled_at,
+            "enrollment": metadata.get("enrollment"),
+            "runtime_ts": runtime.ts,
+            "runtime_pid": runtime.pid,
+            "assignment_sha256": assignment_sha,
+            "strategy_aggregate_sha256": runtime.strategy_sha256,
+            "target_sha256": dict(runtime.target_sha256),
+        },
+    )
+
+
 def _neg_gate_assignment(
     parsed: ParsedRecords,
     experiment: Experiment,
     agent: str,
     ts: float,
-) -> tuple[str, str, str]:
+    turn: Turn | None = None,
+) -> tuple[str, str, str, dict]:
+    if turn is not None:
+        receipt = _neg_receipt_assignment(parsed, experiment, turn)
+        if receipt is not None:
+            return receipt
     eligible = [
         event
         for event in parsed.runtimes
@@ -1233,7 +1940,12 @@ def _neg_gate_assignment(
                 variant = "unknown"
         identity = event.strategy_sha256 or event.git_head or "unknown"
         epoch_id = f"runtime:{agent}:{event.ts:.6f}:{event.pid}:{identity[:12]}"
-        return variant, epoch_id, "runtime_manifest"
+        return variant, epoch_id, "runtime_manifest", {
+            "prospective": False,
+            "valid": variant in ("treatment", "control"),
+            "approved": False,
+            "reason": "legacy_runtime_knob",
+        }
 
     if agent in _NEG_STATIC_ASSIGNMENT["treatment_agents"]:
         variant = "treatment"
@@ -1242,7 +1954,12 @@ def _neg_gate_assignment(
     else:
         variant = experiment.variant_for(agent)
     epoch_id = f"{_NEG_STATIC_ASSIGNMENT['epoch_id']}:{agent}:{variant}"
-    return variant, epoch_id, "frozen_static_assignment"
+    return variant, epoch_id, "frozen_static_assignment", {
+        "prospective": False,
+        "valid": variant in ("treatment", "control"),
+        "approved": False,
+        "reason": "legacy_static_label",
+    }
 
 
 def _neg_gate_payoff_percentile(
@@ -1289,6 +2006,299 @@ def _neg_gate_unsupported_reason(cell: dict) -> str:
     return "not_in_frozen_reference"
 
 
+def _neg_valid_terminal(
+    event: ResultEvent, turn: Turn, *, prospective_schema: bool
+) -> bool:
+    outcome = event.result.get("outcome")
+    player = turn.game.get("your_player", "player_1")
+    payoff = event.result.get(f"{player}_payoff")
+    payoff_valid = (
+        not isinstance(payoff, bool)
+        and isinstance(payoff, (int, float))
+        and math.isfinite(float(payoff))
+    )
+    explicit_move = bool(
+        event.result_source == "move"
+        and event.reaped is False
+        and event.valid is True
+    )
+    explicit_reaper = bool(
+        event.result_source == "reaper"
+        and event.reaped is True
+        and event.valid is None
+    )
+    legacy_direct = bool(
+        not prospective_schema
+        and event.result_source is None
+        and event.reaped is None
+        and event.valid is True
+    )
+    return bool(
+        event.game_over is True
+        and event.error is None
+        and event.result_is_dict
+        and (not prospective_schema or event.prospective_schema_valid)
+        and outcome in ("agreement", "no_deal", "walked_away", "timeout")
+        and payoff_valid
+        and (explicit_move or explicit_reaper or legacy_direct)
+    )
+
+
+def _neg_deadline_outcome(
+    parsed: ParsedRecords,
+    key: tuple[str, str],
+    first_observed_ts: float,
+    analysis_ts: float,
+    turn: Turn,
+    *,
+    prospective_schema: bool,
+) -> dict:
+    """Classify a game once by its fixed first-turn + 600 second deadline."""
+    deadline_ts = first_observed_ts + _NEG_MATURITY_LAG_S
+    game_events = sorted(
+        (
+            event
+            for event in parsed.results
+            if (event.agent, event.gid) == key
+        ),
+        key=lambda event: event.ts,
+    )
+    candidates = [event for event in game_events if event.game_over is True]
+    malformed_terminal_events = sum(
+        prospective_schema
+        and first_observed_ts <= event.ts <= deadline_ts
+        and not event.prospective_schema_valid
+        for event in game_events
+    )
+    timely_valid = [
+        event
+        for event in candidates
+        if first_observed_ts <= event.ts <= deadline_ts
+        and _neg_valid_terminal(event, turn, prospective_schema=prospective_schema)
+    ]
+    terminal_signatures = {
+        json.dumps(event.result, sort_keys=True, separators=(",", ":"))
+        for event in timely_valid
+    }
+    conflicting_timely = len(terminal_signatures) > 1
+    terminal = timely_valid[0] if timely_valid and not conflicting_timely else None
+    if terminal is not None:
+        status = "resolved"
+    elif analysis_ts < deadline_ts:
+        status = "pending"
+    else:
+        status = "deadline_censored"
+    return {
+        "status": status,
+        "terminal": terminal,
+        "first_observed_ts": first_observed_ts,
+        "deadline_ts": deadline_ts,
+        "analysis_ts": analysis_ts,
+        "resolved": status == "resolved",
+        "pending": status == "pending",
+        "censored": status == "deadline_censored",
+        "matured": status != "pending",
+        "invalid_timely_terminals": sum(
+            first_observed_ts <= event.ts <= deadline_ts
+            and not _neg_valid_terminal(
+                event, turn, prospective_schema=prospective_schema
+            )
+            for event in candidates
+        ),
+        "late_terminals": sum(event.ts > deadline_ts for event in candidates),
+        "conflicting_timely_terminals": conflicting_timely,
+        "malformed_terminal_events": malformed_terminal_events,
+    }
+
+
+def _neg_game_assignment_evidence(
+    parsed: ParsedRecords,
+    experiment: Experiment,
+    key: tuple[str, str],
+    first_observed: Turn,
+    selected: tuple[str, str, str, dict],
+) -> tuple[str, str, str, dict]:
+    variant, epoch_id, source, evidence = selected
+    if not evidence.get("prospective"):
+        return selected
+    game_turns = sorted(
+        (
+            turn
+            for turn in parsed.turn_events
+            if (turn.agent, turn.gid) == key and turn.family == experiment.family
+        ),
+        key=lambda turn: (turn.ts, turn.round, turn.phase),
+    )
+    validated = [
+        _neg_receipt_assignment(parsed, experiment, game_turn) for game_turn in game_turns
+    ]
+    enrollment_sequence = [
+        item[3].get("enrollment")
+        for item in validated
+        if item is not None and isinstance(item[3], dict)
+    ]
+    enrolled_times = {
+        item[3].get("enrolled_at")
+        for item in validated
+        if item is not None and isinstance(item[3], dict)
+    }
+    runtime_ids = [
+        (item[3].get("runtime_ts"), item[3].get("runtime_pid"))
+        for item in validated
+        if item is not None and isinstance(item[3], dict)
+    ]
+    recovered_index = next(
+        (
+            index
+            for index, enrollment in enumerate(enrollment_sequence)
+            if enrollment == "recovered"
+        ),
+        None,
+    )
+    enrollment_monotone = bool(
+        enrollment_sequence
+        and enrollment_sequence[0] == "new"
+        and len(enrolled_times) == 1
+        and (
+            recovered_index is None
+            or (
+                all(value == "new" for value in enrollment_sequence[:recovered_index])
+                and all(
+                    value == "recovered"
+                    for value in enrollment_sequence[recovered_index:]
+                )
+                and recovered_index > 0
+                and runtime_ids[recovered_index] != runtime_ids[recovered_index - 1]
+            )
+        )
+    )
+    consistent = bool(
+        game_turns
+        and game_turns[0] is first_observed
+        and all(item is not None for item in validated)
+        and enrollment_monotone
+        and all(
+            item is not None
+            and item[0] == variant
+            and item[1] == epoch_id
+            and item[2] == source
+            and item[3].get("assignment_sha256")
+            == evidence.get("assignment_sha256")
+            and item[3].get("valid") is True
+            for item in validated
+        )
+    )
+    first_metadata = first_observed.canary_assignment
+    first_assigned = bool(
+        isinstance(first_metadata, dict) and first_metadata.get("status") == "assigned"
+    )
+    enrolled_at = _literal_finite_number(evidence.get("enrolled_at"))
+    first_time_valid = bool(
+        enrolled_at is not None and enrolled_at <= first_observed.ts
+    )
+    complete = consistent and first_assigned and first_time_valid
+    enriched = {
+        **evidence,
+        "all_logged_turns_consistent": consistent,
+        "first_observed_turn_assigned": first_assigned,
+        "enrolled_at_not_after_first_log": first_time_valid,
+        "logged_turn_count": len(game_turns),
+        "enrollment_sequence": enrollment_sequence,
+        "enrollment_monotone_across_runtime_boundary": enrollment_monotone,
+        "receipt_file_validation_scope": (
+            "not read by reporter; logged new/recovered metadata is validated "
+            "against the startup manifest and deterministic assignment digest"
+        ),
+        "valid": evidence.get("valid") is True and complete,
+        "approved": evidence.get("approved") is True and complete,
+    }
+    if not enriched["valid"]:
+        return (
+            "unknown",
+            f"invalid-game-receipt:{key[0]}:{key[1]}",
+            "invalid_assignment_receipt",
+            enriched,
+        )
+    return variant, epoch_id, source, enriched
+
+
+def _validated_game_assignment(
+    parsed: ParsedRecords,
+    experiment: Experiment,
+    key: tuple[str, str],
+) -> tuple[str, str, str, dict]:
+    """Resolve one immutable arm and validate every logged turn receipt.
+
+    The prospective plan assigns at the first sighting.  Later turns may move
+    from ``new`` to ``recovered`` across a runtime boundary, but cannot change
+    any causal field.  Games first seen after activation without a complete
+    approved receipt are integrity-only and never fall back to static labels.
+    """
+    first = parsed.first_turns.get(key)
+    if first is None:
+        return (
+            "unknown",
+            f"missing-first-turn:{key[0]}:{key[1]}",
+            "missing_first_turn",
+            {
+                "prospective": False,
+                "valid": False,
+                "approved": False,
+                "reason": "missing_first_turn",
+            },
+        )
+    receipt = _neg_receipt_assignment(parsed, experiment, first)
+    if receipt is not None:
+        return _neg_game_assignment_evidence(
+            parsed, experiment, key, first, receipt
+        )
+    activation = float(_NEG_PROSPECTIVE_ASSIGNMENT["activated_at"])
+    expiry = float(_NEG_PROSPECTIVE_ASSIGNMENT["expires_at"])
+    if first.ts >= expiry:
+        return (
+            "unknown",
+            f"outside-confirmation-window:{key[0]}:{key[1]}",
+            "outside_confirmation_window",
+            {
+                "prospective": False,
+                "outside_confirmation": True,
+                "valid": True,
+                "approved": False,
+                "reason": "first_seen_after_frozen_expiry",
+            },
+        )
+    if first.ts >= activation:
+        return (
+            "unknown",
+            f"missing-receipt:{key[0]}:{key[1]}",
+            "missing_assignment_receipt",
+            {
+                "prospective": True,
+                "valid": False,
+                "approved": False,
+                "reason": "missing_receipt_after_frozen_activation",
+            },
+        )
+    if experiment.name == "neg_terminal_close":
+        return _neg_gate_assignment(
+            parsed, experiment, first.agent, first.ts, first
+        )
+    variant = _runtime_variant(
+        parsed, experiment, first.agent, first.ts, first
+    )
+    return (
+        variant,
+        f"legacy:{first.agent}:{variant}",
+        "legacy_runtime_or_static",
+        {
+            "prospective": False,
+            "valid": variant in ("treatment", "control"),
+            "approved": False,
+            "reason": "legacy_pre_activation_assignment",
+        },
+    )
+
+
 def _neg_terminal_gate_rows(
     affected: list[dict],
     enrolled: set[tuple[str, str]],
@@ -1312,6 +2322,7 @@ def _neg_terminal_gate_rows(
         load_targets(TARGETS_PATH, live=False) if target_integrity["pass"] else None
     )
     rows: list[dict] = []
+    analysis_ts = _analysis_timestamp(parsed)
     for key, items in sorted(affected_by_game.items()):
         first = min(items, key=lambda item: (item["ts"], item["round"], item["phase"]))
         turn = turn_index.get((key[0], key[1], first["round"], first["phase"]))
@@ -1336,7 +2347,21 @@ def _neg_terminal_gate_rows(
             "complete_information": bool(state.get("complete_information", False)),
         }
         cell_id = _neg_gate_cell_id(cell)
-        terminal = parsed.terminals.get(key)
+        first_observed = parsed.first_turns.get(key)
+        if first_observed is None:
+            continue
+        maturity = _neg_deadline_outcome(
+            parsed,
+            key,
+            first_observed.ts,
+            analysis_ts,
+            first_observed,
+            prospective_schema=bool(
+                isinstance(first_observed.canary_assignment, dict)
+                and first_observed.canary_assignment.get("status") == "assigned"
+            ),
+        )
+        terminal = maturity["terminal"]
         payoff = _terminal_payoff(turn, terminal) if terminal is not None else None
         normalized = (
             payoff / own_value
@@ -1358,15 +2383,15 @@ def _neg_terminal_gate_rows(
             ),
             None,
         )
-        variant, epoch_id, assignment_source = _neg_gate_assignment(
-            parsed, experiment, key[0], first["ts"]
-        )
+        assignment = _validated_game_assignment(parsed, experiment, key)
+        variant, epoch_id, assignment_source, assignment_evidence = assignment
         rows.append(
             {
                 "agent": key[0],
                 "variant": variant,
                 "assignment_epoch_id": epoch_id,
                 "assignment_source": assignment_source,
+                "assignment_evidence": assignment_evidence,
                 "game_id": key[1],
                 "cell": cell,
                 "cell_id": cell_id,
@@ -1374,8 +2399,23 @@ def _neg_terminal_gate_rows(
                 "unsupported_reason": (
                     None if cell_id in reference_ids else _neg_gate_unsupported_reason(cell)
                 ),
-                "resolved": terminal is not None,
-                "censored": terminal is None,
+                "maturity_status": maturity["status"],
+                "maturity_lag_s": _NEG_MATURITY_LAG_S,
+                "first_observed_ts": maturity["first_observed_ts"],
+                "deadline_ts": maturity["deadline_ts"],
+                "analysis_ts": maturity["analysis_ts"],
+                "matured": maturity["matured"],
+                "resolved": maturity["resolved"],
+                "pending_maturation": maturity["pending"],
+                "censored": maturity["censored"],
+                "invalid_timely_terminals": maturity["invalid_timely_terminals"],
+                "late_terminals": maturity["late_terminals"],
+                "conflicting_timely_terminals": maturity[
+                    "conflicting_timely_terminals"
+                ],
+                "malformed_terminal_events": maturity[
+                    "malformed_terminal_events"
+                ],
                 "terminal_reaped": terminal is not None and terminal.valid is None,
                 "direct": direct,
                 "effective_offer_round": offer_round,
@@ -1394,8 +2434,13 @@ def _neg_terminal_gate_rows(
 def _neg_gate_sample_empty() -> dict:
     return {
         "affected": 0,
+        "matured": 0,
         "resolved": 0,
         "censored": 0,
+        "pending_maturation": 0,
+        "invalid_timely_terminals": 0,
+        "late_terminals": 0,
+        "terminal_conflicts": 0,
         "terminal_reaped": 0,
         "direct_trials": 0,
         "direct_converted": 0,
@@ -1406,8 +2451,17 @@ def _neg_gate_sample_empty() -> dict:
 
 def _neg_gate_add_sample(sample: dict, row: dict) -> None:
     sample["affected"] += 1
+    sample["matured"] += int(row.get("matured") is True)
     sample["resolved"] += int(bool(row.get("resolved")))
     sample["censored"] += int(bool(row.get("censored")))
+    sample["pending_maturation"] += int(row.get("pending_maturation") is True)
+    invalid = _literal_nonnegative_int(row.get("invalid_timely_terminals"))
+    late = _literal_nonnegative_int(row.get("late_terminals"))
+    sample["invalid_timely_terminals"] += invalid or 0
+    sample["late_terminals"] += late or 0
+    sample["terminal_conflicts"] += int(
+        row.get("conflicting_timely_terminals") is True
+    )
     sample["terminal_reaped"] += int(bool(row.get("terminal_reaped")))
     if isinstance(row.get("direct"), bool):
         sample["direct_trials"] += 1
@@ -1473,6 +2527,231 @@ def _neg_gate_counts(rows: list[dict]) -> dict:
             "reasons": dict(sorted(unsupported_reasons.items())),
             "cells": dict(sorted(unsupported_cells.items())),
         },
+    }
+
+
+def _neg_gate_row_failures(row: Any) -> list[str]:
+    if not isinstance(row, dict):
+        return ["row is not an object"]
+    failures: list[str] = []
+    if row.get("variant") not in ("treatment", "control"):
+        failures.append("variant missing or invalid")
+    cell = row.get("cell")
+    if not isinstance(cell, dict):
+        failures.append("cell missing or malformed")
+    else:
+        cell_id = row.get("cell_id")
+        if not isinstance(cell_id, str) or cell_id != _neg_gate_cell_id(cell):
+            failures.append("cell_id mismatch")
+    for key in (
+        "supported",
+        "matured",
+        "resolved",
+        "pending_maturation",
+        "censored",
+        "terminal_reaped",
+        "direction_violation",
+        "assigned_match",
+        "conflicting_timely_terminals",
+    ):
+        if type(row.get(key)) is not bool:
+            failures.append(f"{key} must be a literal boolean")
+    status = row.get("maturity_status")
+    expected = {
+        "resolved": (True, True, False, False),
+        "pending": (False, False, True, False),
+        "deadline_censored": (True, False, False, True),
+    }.get(status)
+    observed = (
+        row.get("matured"),
+        row.get("resolved"),
+        row.get("pending_maturation"),
+        row.get("censored"),
+    )
+    if expected is None or observed != expected:
+        failures.append("maturity status/count flags inconsistent")
+    if _literal_nonnegative_int(row.get("maturity_lag_s")) != _NEG_MATURITY_LAG_S:
+        failures.append("maturity lag mismatch")
+    first_ts = _literal_finite_number(row.get("first_observed_ts"))
+    deadline_ts = _literal_finite_number(row.get("deadline_ts"))
+    analysis_ts = _literal_finite_number(row.get("analysis_ts"))
+    if (
+        first_ts is None
+        or deadline_ts is None
+        or analysis_ts is None
+        or not math.isclose(
+            deadline_ts,
+            first_ts + _NEG_MATURITY_LAG_S,
+            rel_tol=0.0,
+            abs_tol=1e-9,
+        )
+        or analysis_ts < first_ts
+    ):
+        failures.append("maturity timestamps invalid")
+    if status == "pending" and analysis_ts is not None and deadline_ts is not None:
+        if analysis_ts >= deadline_ts:
+            failures.append("pending row is already past deadline")
+    if status == "deadline_censored" and analysis_ts is not None and deadline_ts is not None:
+        if analysis_ts < deadline_ts:
+            failures.append("censored row has not reached deadline")
+    for key in (
+        "invalid_timely_terminals",
+        "late_terminals",
+        "malformed_terminal_events",
+    ):
+        if _literal_nonnegative_int(row.get(key)) is None:
+            failures.append(f"{key} must be a literal nonnegative integer")
+    if row.get("conflicting_timely_terminals") is True:
+        failures.append("conflicting timely valid terminals")
+    if _literal_nonnegative_int(row.get("malformed_terminal_events")) not in (0,):
+        failures.append("malformed prospective terminal schema")
+    if status == "resolved":
+        if type(row.get("direct")) is not bool:
+            failures.append("resolved row lacks a literal direct outcome")
+    elif any(
+        row.get(key) is not None
+        for key in ("direct", "normalized_payoff", "payoff_percentile")
+    ):
+        failures.append("pending/censored row contains post-deadline outcome")
+    for key in ("normalized_payoff", "payoff_percentile"):
+        value = row.get(key)
+        if value is not None and _literal_finite_number(value) is None:
+            failures.append(f"{key} is malformed")
+    evidence = row.get("assignment_evidence")
+    if not isinstance(evidence, dict) or type(evidence.get("prospective")) is not bool:
+        failures.append("assignment evidence missing or malformed")
+    elif evidence.get("valid") is not True:
+        failures.append("assignment evidence invalid")
+    return failures
+
+
+def _neg_censor_rows(
+    rows: list[dict], field: str | None = None, value: str | None = None
+) -> list[dict]:
+    return [
+        row
+        for row in rows
+        if row.get("supported") is True
+        and row.get("matured") is True
+        and (
+            field is None
+            or (
+                isinstance(row.get("cell"), dict)
+                and row["cell"].get(field) == value
+            )
+        )
+    ]
+
+
+def _neg_censor_safety(rows: list[dict]) -> dict:
+    marginal: dict[str, dict] = {}
+    for (field, value), ceiling in _NEG_CENSOR_MARGINAL_CEILINGS.items():
+        source = _neg_censor_rows(
+            rows, None if field == "overall" else field, None if field == "overall" else value
+        )
+        arms: dict[str, dict] = {}
+        for arm in ("treatment", "control"):
+            arm_rows = [row for row in source if row.get("variant") == arm]
+            summary = _gate_binomial_summary(
+                sum(row.get("censored") is True for row in arm_rows),
+                len(arm_rows),
+            )
+            summary["ceiling"] = ceiling
+            summary["promotion_pass"] = bool(
+                summary.get("upper_95_one_sided") is not None
+                and summary["upper_95_one_sided"] <= ceiling
+            )
+            arms[arm] = summary
+        label = "overall" if field == "overall" else f"{field}:{value}"
+        marginal[label] = {
+            "field": field,
+            "value": value,
+            "ceiling": ceiling,
+            **arms,
+            "promotion_pass": all(
+                arms[arm]["promotion_pass"] for arm in ("treatment", "control")
+            ),
+        }
+
+    joint: dict[str, dict] = {}
+    for (identity, value), ceiling in _NEG_CENSOR_JOINT_CEILINGS.items():
+        cell_rows = [
+            row
+            for row in _neg_censor_rows(rows)
+            if row["cell"].get("opponent_type") == identity
+            and row["cell"].get("own_value_grid") == value
+        ]
+        arms: dict[str, dict] = {}
+        for arm in ("treatment", "control"):
+            arm_rows = [row for row in cell_rows if row.get("variant") == arm]
+            n = len(arm_rows)
+            k = sum(row.get("censored") is True for row in arm_rows)
+            rate = k / n if n else None
+            arms[arm] = {
+                "censored": k,
+                "matured": n,
+                "rate": rate,
+                "ceiling": ceiling,
+                "promotion_pass": rate is not None and rate <= ceiling,
+            }
+        joint[f"{identity}:{value}"] = {
+            "opponent_type": identity,
+            "own_value_grid": value,
+            "ceiling": ceiling,
+            **arms,
+            "promotion_pass": all(
+                arms[arm]["promotion_pass"] for arm in ("treatment", "control")
+            ),
+        }
+
+    overall = marginal["overall"]
+    excess = _gate_newcombe_difference(
+        overall["treatment"].get("successes"),
+        overall["treatment"].get("trials"),
+        overall["control"].get("successes"),
+        overall["control"].get("trials"),
+    )
+    excess["ceiling"] = 0.03
+    excess["promotion_pass"] = bool(
+        excess.get("upper_95_one_sided") is not None
+        and excess["upper_95_one_sided"] <= 0.03
+    )
+    treatment_n = overall["treatment"].get("trials")
+    control_n = overall["control"].get("trials")
+    scheduled = bool(
+        type(treatment_n) is int
+        and type(control_n) is int
+        and treatment_n >= 50
+        and control_n >= 150
+    )
+    rollback_reasons: list[str] = []
+    if scheduled:
+        for label, entry in marginal.items():
+            for arm in ("treatment", "control"):
+                lower = entry[arm].get("lower_95_one_sided")
+                if lower is not None and lower > entry["ceiling"]:
+                    rollback_reasons.append(
+                        f"{label} {arm} censor Wilson lower exceeds {entry['ceiling']:.3f}"
+                    )
+        lower_excess = excess.get("lower_95_one_sided")
+        if lower_excess is not None and lower_excess > 0.03:
+            rollback_reasons.append(
+                "overall treatment-control censor Newcombe lower exceeds 0.030"
+            )
+    promotion_pass = bool(
+        all(entry["promotion_pass"] for entry in marginal.values())
+        and all(entry["promotion_pass"] for entry in joint.values())
+        and excess["promotion_pass"]
+    )
+    return {
+        "maturity_lag_s": _NEG_MATURITY_LAG_S,
+        "population": "supported affected games; pending rows excluded",
+        "marginal_wilson": marginal,
+        "joint_point_rates": joint,
+        "treatment_minus_control": excess,
+        "rollback_look_scheduled": scheduled,
+        "rollback_reasons": rollback_reasons,
+        "promotion_pass": promotion_pass,
     }
 
 
@@ -1731,54 +3010,44 @@ def _neg_gate_epoch_health(
     affected: list[dict],
     agent_data: dict[str, dict],
 ) -> dict[str, dict]:
-    by_variant = {
-        variant: {
-            "traffic_events": 0,
-            "errors": 0,
-            "invalid_results": 0,
-            "corrections": 0,
-            "replay_errors": 0,
-            "affected_wrong_variant": 0,
-            "affected_unknown": 0,
-            "direction_violations": 0,
-            "affected": 0,
-            "censored": 0,
+    by_cohort = {
+        cohort: {
+            variant: {
+                "traffic_events": 0,
+                "errors": 0,
+                "invalid_results": 0,
+                "corrections": 0,
+                "replay_errors": 0,
+                "affected_wrong_variant": 0,
+                "affected_unknown": 0,
+                "direction_violations": 0,
+                "affected": 0,
+                "censored": 0,
+            }
+            for variant in ("treatment", "control")
         }
-        for variant in ("treatment", "control")
+        for cohort in ("legacy", "prospective")
     }
-    for turn in parsed.turns.values():
-        if (
-            turn.agent not in experiment.agents
-            or turn.family != experiment.family
-            or turn.ts < experiment.cutoff
-        ):
-            continue
-        variant = _neg_gate_assignment(parsed, experiment, turn.agent, turn.ts)[0]
-        if variant not in by_variant:
-            continue
-        target = by_variant[variant]
-        target["traffic_events"] += 1
-        target["errors"] += int(bool(turn.error))
-        target["corrections"] += len(turn.corrections)
-    for event in parsed.results:
-        if (
-            event.agent not in experiment.agents
-            or event.ts < experiment.cutoff
-            or parsed.gid_family.get((event.agent, event.gid)) != experiment.family
-        ):
-            continue
-        variant = _neg_gate_assignment(parsed, experiment, event.agent, event.ts)[0]
-        if variant not in by_variant:
-            continue
-        target = by_variant[variant]
-        target["traffic_events"] += 1
-        target["errors"] += int(bool(event.error))
-        target["invalid_results"] += int(event.valid is False)
+    arm_health = _experiment_arm_health(parsed, experiment)
+    for cohort in ("legacy", "prospective"):
+        for variant in ("treatment", "control"):
+            source = arm_health["cohorts"][cohort][variant]
+            target = by_cohort[cohort][variant]
+            target["traffic_events"] = source["turn_events"] + source["result_events"]
+            target["errors"] = source["turn_errors"] + source["result_errors"]
+            target["invalid_results"] = source["invalid_results"]
+            target["corrections"] = source["corrections"]
     for item in affected:
         variant = item.get("variant")
-        if variant not in by_variant:
+        if variant not in ("treatment", "control"):
             continue
-        target = by_variant[variant]
+        evidence = item.get("assignment_evidence")
+        cohort = (
+            "prospective"
+            if isinstance(evidence, dict) and evidence.get("prospective") is True
+            else "legacy"
+        )
+        target = by_cohort[cohort][variant]
         target["affected_wrong_variant"] += int(
             not item.get("assigned_match") and item.get("other_variant_match")
         )
@@ -1786,13 +3055,29 @@ def _neg_gate_epoch_health(
             not item.get("assigned_match") and not item.get("other_variant_match")
         )
         target["direction_violations"] += int(bool(item.get("direction_violation")))
-    # Replay exceptions are global report-integrity failures. They cannot
-    # always be assigned to an epoch because no divergent row is then emitted.
-    by_variant["treatment"]["replay_errors"] = sum(
+    replay_errors = sum(
         data.get("routing", {}).get("replay_errors", 0)
         for data in agent_data.values()
     )
-    return by_variant
+    selected_cohort = "prospective" if any(
+        isinstance(item.get("assignment_evidence"), dict)
+        and item["assignment_evidence"].get("prospective") is True
+        for item in affected
+    ) else "legacy"
+    by_cohort[selected_cohort]["treatment"]["replay_errors"] = replay_errors
+    duplicate_causal_conflicts = sum(
+        data.get("routing", {}).get("duplicate_causal_turn_conflicts", 0)
+        for data in agent_data.values()
+    )
+    integrity = dict(arm_health["integrity"])
+    integrity["duplicate_causal_turn_conflicts"] = duplicate_causal_conflicts
+    return {
+        **by_cohort,
+        "integrity": integrity,
+        "integrity_pass": bool(
+            arm_health["integrity_pass"] and duplicate_causal_conflicts == 0
+        ),
+    }
 
 
 def _neg_gate_health(
@@ -1894,9 +3179,6 @@ def _neg_gate_health(
         "treatment_invalid_and_corrections_clean": treatment_validity_faults == 0,
         "treatment_error_rate_excess_within_0.01": (
             error_excess <= 0.010 if error_excess is not None else None
-        ),
-        "affected_censor_rate_excess_within_0.03": (
-            censor_excess <= 0.030 if censor_excess is not None else None
         ),
     }
     return {
@@ -2055,6 +3337,106 @@ def _neg_gate_switchback_confirmation(rows: list[dict]) -> dict:
     }
 
 
+def _neg_gate_prospective_confirmation(rows: list[dict]) -> dict:
+    expected = _NEG_PROSPECTIVE_ASSIGNMENT
+    prospective = [
+        row
+        for row in rows
+        if isinstance(row.get("assignment_evidence"), dict)
+        and row["assignment_evidence"].get("prospective") is True
+    ]
+    approved = [
+        row
+        for row in prospective
+        if row["assignment_evidence"].get("valid") is True
+        and row["assignment_evidence"].get("approved") is True
+    ]
+    labels = list(expected["agents"])
+    label_checks: dict[str, dict] = {}
+    common_label_blocks: set[tuple[str, int]] = set()
+    for label in labels:
+        label_rows = [row for row in approved if row.get("agent") == label]
+        arms = {
+            arm: [row for row in label_rows if row.get("variant") == arm]
+            for arm in ("treatment", "control")
+        }
+        arm_blocks = {
+            arm: {
+                int(float(row["first_observed_ts"]) // 1800)
+                for row in arm_rows
+                if _literal_finite_number(row.get("first_observed_ts")) is not None
+            }
+            for arm, arm_rows in arms.items()
+        }
+        common = arm_blocks["treatment"] & arm_blocks["control"]
+        common_label_blocks.update((label, block) for block in common)
+        label_checks[label] = {
+            "treatment_rows": len(arms["treatment"]),
+            "control_rows": len(arms["control"]),
+            "treatment_blocks": len(arm_blocks["treatment"]),
+            "control_blocks": len(arm_blocks["control"]),
+            "same_30m_blocks": len(common),
+            "both_arms": bool(arms["treatment"] and arms["control"]),
+            "same_block_representation": bool(common),
+        }
+    identities = {
+        (
+            row["assignment_evidence"].get("artifact_sha256"),
+            row["assignment_evidence"].get("plan_id"),
+            row["assignment_evidence"].get("rule_id"),
+            row["assignment_evidence"].get("activated_at"),
+        )
+        for row in approved
+    }
+    expected_identity = {
+        (
+            expected["artifact_sha256"],
+            expected["plan_id"],
+            expected["rule_id"],
+            float(expected["activated_at"]),
+        )
+    }
+    checks = {
+        "frozen_artifact": expected.get("status") == "frozen",
+        "all_prospective_rows_approved": bool(prospective)
+        and len(prospective) == len(approved),
+        "exact_artifact_plan_rule_cutoff": bool(approved)
+        and identities == expected_identity,
+        "strictly_within_frozen_window": bool(approved)
+        and all(
+            expected["activated_at"] <= row["first_observed_ts"] < expected["expires_at"]
+            for row in approved
+        ),
+        "all_four_labels_both_arms": all(
+            entry["both_arms"] for entry in label_checks.values()
+        ),
+        "all_four_labels_same_30m_block": all(
+            entry["same_block_representation"] for entry in label_checks.values()
+        ),
+        "at_least_30_common_agent_30m_blocks": len(common_label_blocks) >= 30,
+        "frozen_prefix_and_scheduled_look_identity": False,
+    }
+    return {
+        "pass": all(checks.values()),
+        "expected": json.loads(json.dumps(expected)),
+        "checks": checks,
+        "labels": label_checks,
+        "prospective_rows": len(prospective),
+        "approved_rows": len(approved),
+        "common_agent_30m_blocks": len(common_label_blocks),
+        "legacy_rows_excluded": len(rows) - len(prospective),
+        "receipt_scope": (
+            "reporter validates logged receipt metadata and deterministic linkage; "
+            "append-only receipt files are outside reporter scope"
+        ),
+        "pending_confirmation_input": (
+            "report input currently lacks a frozen JSONL prefix/file identity "
+            "and scheduled-look identifier; evidence therefore remains nonbinding"
+        ),
+        "status_cap_without_pass": "screen_pass",
+    }
+
+
 def _neg_terminal_gate_from_rows(
     rows: list[dict],
     agent_data: dict[str, dict] | None = None,
@@ -2063,12 +3445,64 @@ def _neg_terminal_gate_from_rows(
     epoch_health: dict[str, dict] | None = None,
 ) -> dict:
     """Pure deterministic evaluator for the frozen hidden terminal-close gate."""
+    original_rows = list(rows)
+    row_failures = {
+        str(index): failures
+        for index, row in enumerate(original_rows)
+        if (failures := _neg_gate_row_failures(row))
+    }
     unknown_assignment_rows = sum(
-        row.get("variant") not in ("treatment", "control") for row in rows
+        isinstance(row, dict)
+        and row.get("variant") not in ("treatment", "control")
+        for row in original_rows
     )
-    rows = [
-        row for row in rows if row.get("variant") in ("treatment", "control")
+    valid_rows = [
+        row
+        for index, row in enumerate(original_rows)
+        if str(index) not in row_failures
     ]
+    prospective_row_present = any(
+        isinstance(row, dict)
+        and isinstance(row.get("assignment_evidence"), dict)
+        and row["assignment_evidence"].get("prospective") is True
+        for row in original_rows
+    )
+    prospective_health_present = False
+    if isinstance(epoch_health, dict):
+        prospective_epoch = epoch_health.get("prospective")
+        if isinstance(prospective_epoch, dict):
+            prospective_health_present = any(
+                isinstance(prospective_epoch.get(arm), dict)
+                and _literal_nonnegative_int(
+                    prospective_epoch[arm].get("traffic_events")
+                )
+                not in (None, 0)
+                for arm in ("treatment", "control")
+            )
+        epoch_integrity_raw = epoch_health.get("integrity")
+        if isinstance(epoch_integrity_raw, dict):
+            prospective_health_present = prospective_health_present or any(
+                _literal_nonnegative_int(epoch_integrity_raw.get(key))
+                not in (None, 0)
+                for key in (
+                    "unassigned_or_missing_after_activation",
+                    "unknown_turn_events",
+                    "unknown_result_events",
+                )
+            )
+    prospective_present = prospective_row_present or prospective_health_present
+    approved_prospective_rows = [
+        row
+        for row in valid_rows
+        if row["assignment_evidence"].get("prospective") is True
+        and row["assignment_evidence"].get("approved") is True
+    ]
+    rows = approved_prospective_rows if prospective_present else valid_rows
+    cohort_basis = (
+        "approved_prospective_manifest_receipts"
+        if prospective_present
+        else "legacy_pilot_screen_only"
+    )
     counts = _neg_gate_counts(rows)
     direct = _neg_gate_standardized(rows, "direct", binary=True)
     normalized = _neg_gate_standardized(rows, "normalized_payoff", binary=False)
@@ -2078,15 +3512,33 @@ def _neg_terminal_gate_from_rows(
         "normalized_payoff": normalized,
         "payoff_percentile": percentile,
     }
-    health = _neg_gate_health(rows, agent_data, agent_variants, epoch_health)
+    selected_epoch_health = epoch_health
+    epoch_integrity_pass = True
+    epoch_integrity: dict = {}
+    if isinstance(epoch_health, dict) and (
+        "legacy" in epoch_health or "prospective" in epoch_health
+    ):
+        cohort_key = "prospective" if prospective_present else "legacy"
+        selected_epoch_health = epoch_health.get(cohort_key, {})
+        epoch_integrity_pass = epoch_health.get("integrity_pass") is True
+        raw_integrity = epoch_health.get("integrity")
+        epoch_integrity = raw_integrity if isinstance(raw_integrity, dict) else {}
+    health = _neg_gate_health(
+        rows, agent_data, agent_variants, selected_epoch_health
+    )
     health["unknown_assignment_rows"] = unknown_assignment_rows
-    if unknown_assignment_rows:
-        health["structural_faults"] += unknown_assignment_rows
+    health["malformed_gate_rows"] = len(row_failures)
+    if unknown_assignment_rows or row_failures or not epoch_integrity_pass:
         health["checks"]["assignment_evidence_complete"] = False
         health["pass"] = False
-        health["hard_fail"] = True
+        health["integrity_blocked"] = True
+    else:
+        health["integrity_blocked"] = False
+    health["assignment_integrity"] = epoch_integrity
     agent_confirmation = _neg_gate_agent_confirmation(rows)
     switchback_confirmation = _neg_gate_switchback_confirmation(rows)
+    prospective_confirmation = _neg_gate_prospective_confirmation(valid_rows)
+    censor_safety = _neg_censor_safety(rows)
     unsupported_safety = _neg_gate_unsupported_safety(rows)
     target_integrity = _neg_target_integrity(target_artifact_identity)
     primary = {
@@ -2118,6 +3570,7 @@ def _neg_terminal_gate_from_rows(
         interim_reasons.append("health or direction hard-fail")
     if unsupported_safety["harm_fail"]:
         interim_reasons.append("unsupported policy-affected slice failed noninferiority")
+    interim_reasons.extend(censor_safety["rollback_reasons"])
 
     final_sample = treatment_n >= 340 and control_n >= 1020
     per_cell_sample = all(
@@ -2169,17 +3622,28 @@ def _neg_terminal_gate_from_rows(
         ),
         "two_supported_nonnegative_treatment_epochs": agent_confirmation["pass"],
         "balanced_manifest_switchback": switchback_confirmation["pass"],
+        "approved_prospective_manifest_assignment": prospective_confirmation["pass"],
+        "deadline_censor_safety": censor_safety["promotion_pass"],
+        "gate_row_integrity": not row_failures,
         "payoff_target_artifact_matches_cutoff": target_integrity["pass"],
         "unsupported_policy_slices_noninferior": unsupported_safety["pass"],
         "health": health["pass"],
         "no_interim_rollback": not interim["rollback"],
     }
     failed = [name for name, passed in passes.items() if not passed]
-    if interim["rollback"]:
+    causal_checks = {
+        "two_supported_nonnegative_treatment_epochs",
+        "balanced_manifest_switchback",
+        "approved_prospective_manifest_assignment",
+    }
+    binding_rollback = bool(
+        interim["rollback"] and not health["integrity_blocked"]
+    )
+    if binding_rollback:
         status = "rollback"
     elif not failed:
         status = "promote"
-    elif failed == ["balanced_manifest_switchback"]:
+    elif failed and set(failed).issubset(causal_checks):
         status = "screen_pass"
     else:
         status = "continue"
@@ -2216,23 +3680,43 @@ def _neg_terminal_gate_from_rows(
     }
     return {
         "design": json.loads(json.dumps(NEG_TERMINAL_GATE_DESIGN)),
+        "cohort_basis": cohort_basis,
+        "data_integrity": {
+            "pass": not row_failures,
+            "row_failures": row_failures,
+            "raw_rows": len(original_rows),
+            "evaluated_rows": len(rows),
+        },
         "counts": counts,
         "standardized": standardized,
         "compatibility_diagnostic": compatibility,
         "payoff_target_integrity": target_integrity,
         "unsupported_safety": unsupported_safety,
         "health": health,
+        "censor_safety": censor_safety,
         "interim": interim,
         "agent_confirmation": agent_confirmation,
         "switchback_confirmation": switchback_confirmation,
+        "prospective_confirmation": prospective_confirmation,
         "promotion": {
             "status": status,
             "passes": passes,
             "failed_checks": failed,
+            "empirical_rollback_signal": interim["rollback"],
+            "binding_rollback": binding_rollback,
+            "integrity_blocked": health["integrity_blocked"],
             "reasons": (
                 interim_reasons
-                if status == "rollback"
-                else ["causal promotion capped pending balanced manifest switchback"]
+                if binding_rollback
+                else [
+                    "empirical signal is nonbinding because assignment/report "
+                    "integrity is incomplete"
+                ]
+                if interim["rollback"] and health["integrity_blocked"]
+                else [
+                    "causal promotion capped pending approved prospective "
+                    "manifest assignment and same-block representation"
+                ]
                 if status == "screen_pass"
                 else [f"waiting for {name}" for name in failed]
             ),
@@ -2398,6 +3882,138 @@ def _persuasion_outcomes(
 ReplayFn = Callable[[dict, Knobs], dict]
 
 
+def _empty_arm_health_counts() -> dict:
+    return {
+        "turn_events": 0,
+        "turn_errors": 0,
+        "corrections": 0,
+        "result_events": 0,
+        "result_errors": 0,
+        "invalid_results": 0,
+        "http_503": 0,
+    }
+
+
+def _experiment_arm_health(
+    parsed: ParsedRecords, experiment: Experiment
+) -> dict:
+    cohorts = {
+        cohort: {
+            arm: _empty_arm_health_counts()
+            for arm in ("treatment", "control")
+        }
+        for cohort in ("legacy", "prospective", "outside_confirmation")
+    }
+    integrity = {
+        "unknown_turn_events": 0,
+        "unknown_result_events": 0,
+        "unassigned_or_missing_after_activation": 0,
+        "outside_confirmation_turn_events": 0,
+        "outside_confirmation_result_events": 0,
+    }
+    activation = float(_NEG_PROSPECTIVE_ASSIGNMENT["activated_at"])
+
+    game_assignments: dict[tuple[str, str], tuple[str, str]] = {}
+    for key, turn in parsed.first_turns.items():
+        if (
+            turn.agent in experiment.agents
+            and turn.family == experiment.family
+            and turn.ts >= experiment.cutoff
+        ):
+            assignment = _validated_game_assignment(parsed, experiment, key)
+            evidence = assignment[3]
+            cohort = (
+                "outside_confirmation"
+                if evidence.get("outside_confirmation") is True
+                else
+                "prospective"
+                if evidence.get("prospective") is True
+                else "legacy"
+            )
+            variant = assignment[0]
+            game_assignments[key] = variant, cohort
+            if (
+                variant not in ("treatment", "control")
+                and turn.ts >= activation
+                and evidence.get("reason")
+                in {
+                    "unassigned_after_frozen_activation",
+                    "missing_receipt_after_frozen_activation",
+                }
+            ):
+                integrity["unassigned_or_missing_after_activation"] += 1
+
+    for turn in parsed.turn_events:
+        if (
+            turn.agent not in experiment.agents
+            or turn.family != experiment.family
+            or turn.ts < experiment.cutoff
+        ):
+            continue
+        variant, cohort = game_assignments.get(
+            (turn.agent, turn.gid), ("unknown", "legacy")
+        )
+        if cohort == "outside_confirmation":
+            integrity["outside_confirmation_turn_events"] += 1
+            continue
+        if variant not in ("treatment", "control"):
+            integrity["unknown_turn_events"] += 1
+            continue
+        target = cohorts[cohort][variant]
+        target["turn_events"] += 1
+        target["turn_errors"] += int(bool(turn.error))
+        target["corrections"] += len(turn.corrections)
+        target["http_503"] += int("503" in str(turn.error or ""))
+
+    for event in parsed.results:
+        key = (event.agent, event.gid)
+        if (
+            event.agent not in experiment.agents
+            or event.ts < experiment.cutoff
+            or parsed.gid_family.get(key) != experiment.family
+        ):
+            continue
+        assignment = game_assignments.get(key)
+        if assignment is None or assignment[0] not in ("treatment", "control"):
+            integrity["unknown_result_events"] += 1
+            continue
+        variant, cohort = assignment
+        if cohort == "outside_confirmation":
+            integrity["outside_confirmation_result_events"] += 1
+            continue
+        target = cohorts[cohort][variant]
+        target["result_events"] += 1
+        target["result_errors"] += int(bool(event.error))
+        target["invalid_results"] += int(
+            event.valid is False
+            or (cohort == "prospective" and not event.prospective_schema_valid)
+        )
+        target["http_503"] += int("503" in str(event.error or ""))
+
+    prospective_events = sum(
+        value
+        for arm in cohorts["prospective"].values()
+        for key, value in arm.items()
+        if key in ("turn_events", "result_events")
+    )
+    return {
+        "schema_version": 1,
+        "attribution": "immutable first-game assignment plus raw event occurrences",
+        "prospective_activation": activation,
+        "cohorts": cohorts,
+        "prospective_events": prospective_events,
+        "integrity": integrity,
+        "integrity_pass": not any(
+            integrity[key]
+            for key in (
+                "unknown_turn_events",
+                "unknown_result_events",
+                "unassigned_or_missing_after_activation",
+            )
+        ),
+    }
+
+
 def analyze_experiment(
     parsed: ParsedRecords,
     preexisting: set[tuple[str, str]],
@@ -2440,9 +4056,9 @@ def analyze_experiment(
                 if terminal.valid is None:
                     enrollment["terminal_reaped"] += 1
 
-    # Health is intentionally all matching arm traffic after the cut, not
-    # only enrolled games: a partial game can still expose invalids or 503s.
-    for turn in parsed.turns.values():
+    # Health is intentionally every raw occurrence after the cut, including
+    # duplicates: a later clean poll must not erase an earlier error.
+    for turn in parsed.turn_events:
         if (
             turn.agent not in experiment.agents
             or turn.family != experiment.family
@@ -2480,6 +4096,57 @@ def analyze_experiment(
 
     control_knobs = _knobs(experiment, "control")
     treatment_knobs = _knobs(experiment, "treatment")
+    game_assignments = {
+        key: _validated_game_assignment(parsed, experiment, key)
+        for key in enrolled
+    }
+    replay_cache: dict[int, tuple[dict, dict]] = {}
+
+    def replay_pair(turn: Turn) -> tuple[dict, dict]:
+        cached = replay_cache.get(id(turn))
+        if cached is not None:
+            return cached
+        routing = agent_data[turn.agent]["routing"]
+        try:
+            pair = (
+                replay(turn.game, control_knobs),
+                replay(turn.game, treatment_knobs),
+            )
+        except Exception as exc:  # report a replay bug as a routing miss
+            error_action = {"_replay_error": f"{type(exc).__name__}: {exc}"}
+            pair = error_action, error_action
+            routing["replay_errors"] += 1
+        replay_cache[id(turn)] = pair
+        return pair
+
+    raw_turn_groups: dict[tuple[str, str, int, str], list[Turn]] = defaultdict(list)
+    for raw_turn in parsed.turn_events:
+        raw_key = (raw_turn.agent, raw_turn.gid)
+        if raw_key in enrolled and raw_turn.ts >= experiment.cutoff:
+            raw_turn_groups[
+                (raw_turn.agent, raw_turn.gid, raw_turn.round, raw_turn.phase)
+            ].append(raw_turn)
+    for group in raw_turn_groups.values():
+        if len(group) < 2:
+            continue
+        signatures = {
+            json.dumps(
+                {
+                    "game": turn.game,
+                    "logged": turn.action,
+                    "control": replay_pair(turn)[0],
+                    "treatment": replay_pair(turn)[1],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                default=repr,
+            )
+            for turn in group
+        }
+        if len(signatures) > 1:
+            agent_data[group[0].agent]["routing"][
+                "duplicate_causal_turn_conflicts"
+            ] += 1
     affected: list[dict] = []
     games_with_divergence: set[tuple[str, str]] = set()
     for turn in sorted(parsed.turns.values(), key=lambda item: item.ts):
@@ -2487,21 +4154,25 @@ def analyze_experiment(
         if key not in enrolled or turn.ts < experiment.cutoff:
             continue
         routing = agent_data[turn.agent]["routing"]
-        try:
-            control_action = replay(turn.game, control_knobs)
-            treatment_action = replay(turn.game, treatment_knobs)
-        except Exception as exc:  # report a replay bug as a routing miss
-            control_action = {"_replay_error": f"{type(exc).__name__}: {exc}"}
-            treatment_action = control_action
-            routing["replay_errors"] += 1
-        if experiment.name == "neg_terminal_close":
-            assigned_variant = _neg_gate_assignment(
-                parsed, experiment, turn.agent, turn.ts
-            )[0]
-        else:
-            assigned_variant = experiment.variant_for(turn.agent)
+        control_action, treatment_action = replay_pair(turn)
+        assignment_result = game_assignments.get(
+            key,
+            (
+                "unknown",
+                f"missing-game-assignment:{turn.agent}:{turn.gid}",
+                "missing_game_assignment",
+                {
+                    "prospective": False,
+                    "valid": False,
+                    "approved": False,
+                },
+            ),
+        )
+        assigned_variant, assignment_epoch_id, assignment_source, assignment_evidence = (
+            assignment_result
+        )
         if assigned_variant not in ("treatment", "control"):
-            routing["replay_errors"] += 1
+            routing["assignment_integrity_errors"] += 1
             continue
         assigned_action = (
             treatment_action if assigned_variant == "treatment" else control_action
@@ -2529,6 +4200,9 @@ def analyze_experiment(
             {
                 "agent": turn.agent,
                 "variant": assigned_variant,
+                "assignment_epoch_id": assignment_epoch_id,
+                "assignment_source": assignment_source,
+                "assignment_evidence": assignment_evidence,
                 "game_id": turn.gid,
                 "ts": turn.ts,
                 "round": turn.round,
@@ -2612,6 +4286,7 @@ def analyze_experiment(
         ),
         "metrics": metrics,
         "itt": itt,
+        "arm_health": _experiment_arm_health(parsed, experiment),
         "affected_turns": affected,
     }
     if experiment.name == "neg_terminal_close":
@@ -2807,6 +4482,13 @@ def render_text(report: dict, detail_limit: int = 12) -> str:
                 f"direct_uplift={_fmt_delta(direct['uplift'])} "
                 f"lower95={_fmt_delta(direct['one_sided_95_lower'])} "
                 f"unsupported={gate['counts']['unsupported']['total']}"
+            )
+        root_gate = report.get("gates", {}).get(experiment["name"])
+        if isinstance(root_gate, dict):
+            lines.append(
+                f"  amended-v2 gate: {root_gate.get('decision', 'unavailable')} "
+                f"screen_ready={root_gate.get('screen_ready', False)} "
+                f"promotion_ready={root_gate.get('promotion_ready', False)}"
             )
         lines.append("  health/routing by agent:")
         for agent, data in experiment["agents"].items():

@@ -93,14 +93,20 @@ def _barg_arm(n, mean):
         "direct_conversion_rate": (converted_finite + converted_unlimited) / n,
         "horizon_strata": {
             "finite": {
+                "games": finite_n,
                 "resolved": finite_n,
+                "censored": 0,
                 "direct_resolved": finite_n,
                 "direct_converted": converted_finite,
+                "direct_conversion_rate": converted_finite / finite_n,
             },
             "unlimited": {
+                "games": unlimited_n,
                 "resolved": unlimited_n,
+                "censored": 0,
                 "direct_resolved": unlimited_n,
                 "direct_converted": converted_unlimited,
+                "direct_conversion_rate": converted_unlimited / unlimited_n,
             },
         },
         "cells": cells,
@@ -121,6 +127,7 @@ def _itt_leaf(n, mean, *, censored=0):
         "deadline_zeroes": censored,
         "late_terminals": 0,
         "invalid_terminals": 0,
+        "terminal_conflicts": 0,
         "normalized_outcome_sum": total,
         "normalized_outcome_sum_squares": resolved * mean * mean,
         "mean_normalized_outcome": total / n,
@@ -128,6 +135,46 @@ def _itt_leaf(n, mean, *, censored=0):
         "zero_sales": censored,
         "zero_sales_rate": censored / n,
     }
+
+
+def _allocate_count(total, sizes):
+    denominator = sum(sizes)
+    allocations = [total * size // denominator for size in sizes]
+    for index in range(total - sum(allocations)):
+        allocations[index % len(allocations)] += 1
+    return allocations
+
+
+def _aggregate_itt_entries(entries):
+    entries = list(entries)
+    count_fields = (
+        "games",
+        "matured",
+        "pending_maturation",
+        "resolved",
+        "censored",
+        "deadline_censored",
+        "timely_valid_terminals",
+        "deadline_zeroes",
+        "late_terminals",
+        "invalid_terminals",
+        "terminal_conflicts",
+        "zero_sales",
+    )
+    output = {key: sum(entry[key] for entry in entries) for key in count_fields}
+    output["normalized_outcome_sum"] = sum(
+        entry["normalized_outcome_sum"] for entry in entries
+    )
+    output["normalized_outcome_sum_squares"] = sum(
+        entry["normalized_outcome_sum_squares"] for entry in entries
+    )
+    matured = output["matured"]
+    output["mean_normalized_outcome"] = (
+        output["normalized_outcome_sum"] / matured if matured else None
+    )
+    output["sample_variance_normalized_outcome"] = None
+    output["zero_sales_rate"] = output["zero_sales"] / matured if matured else None
+    return output
 
 
 def _barg_itt(n, mean):
@@ -221,22 +268,28 @@ def _pers_itt(revenue, zero_sales, *, scale=1, censor_fraction=0.0):
     n = 1762 * scale
     censored = round(n * censor_fraction)
     metric = {
-        **_itt_leaf(n, revenue, censored=censored),
         "population": "all strictly enrolled explicit blind-seller games",
         "maturity_lag_s": 1800,
         "cells": {},
         "p_strata": {},
     }
-    # Keep the requested zero-sale sufficient statistic independent of the
-    # constant-payoff moments used by these synthetic fixtures.
-    metric["zero_sales"] = zero_sales if not censor_fraction else censored
-    metric["zero_sales_rate"] = metric["zero_sales"] / n
-    for index, ((p, message, price, rounds), weight) in enumerate(
-        PERS_CELL_WEIGHTS.items()
+    weighted_cells = list(PERS_CELL_WEIGHTS.items())
+    cell_sizes = [round(weight * 1762) * scale for _, weight in weighted_cells]
+    censored_by_cell = _allocate_count(censored, cell_sizes)
+    total_zero_sales = zero_sales if not censor_fraction else censored
+    zero_by_cell = _allocate_count(total_zero_sales, cell_sizes)
+    for index, (((p, message, price, rounds), _), count, cell_censored, cell_zero) in enumerate(
+        zip(
+            weighted_cells,
+            cell_sizes,
+            censored_by_cell,
+            zero_by_cell,
+            strict=True,
+        )
     ):
-        count = round(weight * 1762) * scale
-        cell_censored = round(count * censor_fraction)
         entry = _itt_leaf(count, revenue, censored=cell_censored)
+        entry["zero_sales"] = cell_zero
+        entry["zero_sales_rate"] = cell_zero / count
         metric["cells"][str(index)] = {
             "cell": {
                 "p": 1 / 3 if p == "0.333333" else float(p),
@@ -246,28 +299,30 @@ def _pers_itt(revenue, zero_sales, *, scale=1, censor_fraction=0.0):
             },
             **entry,
         }
-    # Correct any rounding residue in the last fixed cell.
-    last = metric["cells"][str(len(metric["cells"]) - 1)]
-    residue = n - sum(entry["games"] for entry in metric["cells"].values())
-    for key in ("games", "matured", "resolved", "timely_valid_terminals"):
-        last[key] += residue
-    last["normalized_outcome_sum"] += residue * revenue
-    last["normalized_outcome_sum_squares"] += residue * revenue * revenue
-    last["mean_normalized_outcome"] = (
-        last["normalized_outcome_sum"] / last["matured"]
-    )
-    for p, weight in PERS_P_WEIGHTS.items():
-        count = round(weight * n)
-        p_censored = round(count * censor_fraction)
-        metric["p_strata"][p] = _itt_leaf(count, revenue, censored=p_censored)
-    p_last = metric["p_strata"]["0.8"]
-    p_residue = n - sum(entry["games"] for entry in metric["p_strata"].values())
-    for key in ("games", "matured", "resolved", "timely_valid_terminals"):
-        p_last[key] += p_residue
-    p_last["normalized_outcome_sum"] += p_residue * revenue
-    p_last["normalized_outcome_sum_squares"] += p_residue * revenue * revenue
-    p_last["mean_normalized_outcome"] = p_last["normalized_outcome_sum"] / p_last["matured"]
+    for p in PERS_P_WEIGHTS:
+        p_entries = [
+            entry
+            for entry in metric["cells"].values()
+            if ("0.333333" if entry["cell"]["p"] == 1 / 3 else str(entry["cell"]["p"]))
+            == p
+        ]
+        metric["p_strata"][p] = _aggregate_itt_entries(p_entries)
+    metric.update(_aggregate_itt_entries(metric["cells"].values()))
+    assert metric["games"] == n
     return metric
+
+
+def _rebuild_pers_itt_from_cells(metric):
+    metric["p_strata"] = {}
+    for p in PERS_P_WEIGHTS:
+        p_entries = [
+            entry
+            for entry in metric["cells"].values()
+            if ("0.333333" if entry["cell"]["p"] == 1 / 3 else str(entry["cell"]["p"]))
+            == p
+        ]
+        metric["p_strata"][p] = _aggregate_itt_entries(p_entries)
+    metric.update(_aggregate_itt_entries(metric["cells"].values()))
 
 
 def _pers_experiment():
@@ -306,6 +361,7 @@ def test_bargaining_fixed_label_evidence_is_capped_at_screen_pass():
     assert standardized["lower_95_one_sided"] > 0
     assert standardized["support"]["common_mass"] == pytest.approx(1)
     assert gate["statistics"]["itt"]["available"] is True
+    assert gate["statistics"]["payoff_checks"]["itt_raw_lower_bound"]["passed"]
     assert gate["causal_confirmation"]["pass"] is False
 
 
@@ -319,20 +375,115 @@ def test_bargaining_fixed_label_evidence_is_capped_at_screen_pass():
 def test_bargaining_early_rollback_is_armed_at_100(rate, payoff, trigger):
     experiment = _barg_experiment()
     treatment = experiment["metrics"]["treatment"]
-    treatment["affected_games"] = 100
-    treatment["resolved"] = 100
     treatment["direct_resolved"] = 100
     treatment["direct_converted"] = round(100 * rate)
-    treatment["direct_conversion_rate"] = rate
+    converted_left = treatment["direct_converted"]
+    for index, horizon in enumerate(("finite", "unlimited")):
+        entry = treatment["horizon_strata"][horizon]
+        trials = 50
+        converted = converted_left if index else converted_left // 2
+        if index == 0:
+            converted_left -= converted
+        entry["direct_resolved"] = trials
+        entry["direct_converted"] = converted
+        entry["direct_conversion_rate"] = converted / trials
+    # The scheduled rollback must use the sufficient statistics, not this
+    # mutable precomputed convenience field.
+    treatment["direct_conversion_rate"] = 0.99 if rate <= 0.08 else rate
     treatment["mean_normalized_payoff"] = payoff
     if payoff <= 0.27:
-        experiment["itt"]["treatment"]["mean_normalized_outcome"] = payoff
+        itt_treatment = experiment["itt"]["treatment"]
+        matured = itt_treatment["matured"]
+        itt_treatment["mean_normalized_outcome"] = payoff
+        itt_treatment["normalized_outcome_sum"] = matured * payoff
+        itt_treatment["normalized_outcome_sum_squares"] = matured * payoff * payoff
+        for cell in itt_treatment["cells"].values():
+            cell_n = cell["matured"]
+            cell["mean_normalized_outcome"] = payoff
+            cell["normalized_outcome_sum"] = cell_n * payoff
+            cell["normalized_outcome_sum_squares"] = cell_n * payoff * payoff
 
     gate = evaluate_gate(experiment)
 
     assert gate is not None
-    assert gate["decision"] == "rollback"
     assert trigger in gate["rollback_triggers"]
+    if rate <= 0.08:
+        # The count-derived harm signal is retained, but the contradictory
+        # reported convenience rate makes it nonbinding.
+        assert gate["binding_rollback"] is False
+        assert gate["decision"] == "continue"
+    else:
+        assert gate["binding_rollback"] is True
+        assert gate["decision"] == "rollback"
+
+
+def test_bargaining_spoofed_rates_and_means_cannot_trigger_rollback():
+    experiment = _barg_experiment()
+    treatment = experiment["metrics"]["treatment"]
+    treatment["direct_conversion_rate"] = 0.0
+    experiment["itt"]["treatment"]["mean_normalized_outcome"] = 0.0
+
+    gate = evaluate_gate(experiment)
+
+    assert gate is not None
+    assert "scheduled affected direct conversion <= 0.08" not in gate["rollback_triggers"]
+    assert "scheduled treatment deadline payoff <= 0.27" not in gate["rollback_triggers"]
+    assert not gate["data_integrity"]["passed"]
+    assert "direct conversion rate inconsistent with counts" in gate["data_integrity"][
+        "failures"
+    ]["treatment_affected"]
+
+
+@pytest.mark.parametrize(
+    "mutation",
+    ["top_count_bound", "horizon_bound", "horizon_additivity"],
+)
+def test_bargaining_direct_conversion_integrity_is_fail_closed(mutation):
+    experiment = _barg_experiment()
+    treatment = experiment["metrics"]["treatment"]
+    if mutation == "top_count_bound":
+        treatment["direct_converted"] = treatment["direct_resolved"] + 1
+    elif mutation == "horizon_bound":
+        finite = treatment["horizon_strata"]["finite"]
+        finite["direct_converted"] = finite["direct_resolved"] + 1
+        finite["direct_conversion_rate"] = finite["direct_converted"] / finite[
+            "direct_resolved"
+        ]
+    else:
+        treatment["horizon_strata"]["finite"]["direct_resolved"] -= 1
+
+    gate = evaluate_gate(experiment)
+
+    assert gate is not None
+    assert gate["decision"] != "screen_pass"
+    assert not gate["data_integrity"]["passed"]
+
+
+def test_bargaining_raw_itt_lower_bound_is_binding():
+    experiment = _barg_experiment()
+    for arm, mean in (("treatment", 0.501), ("control", 0.5)):
+        metric = experiment["itt"][arm]
+        for entry in metric["cells"].values():
+            n = entry["matured"]
+            entry["normalized_outcome_sum"] = n * mean
+            entry["normalized_outcome_sum_squares"] = n * mean
+            entry["mean_normalized_outcome"] = mean
+        metric["normalized_outcome_sum"] = sum(
+            entry["normalized_outcome_sum"] for entry in metric["cells"].values()
+        )
+        metric["normalized_outcome_sum_squares"] = sum(
+            entry["normalized_outcome_sum_squares"]
+            for entry in metric["cells"].values()
+        )
+        metric["mean_normalized_outcome"] = mean
+
+    gate = evaluate_gate(experiment)
+
+    assert gate is not None
+    checks = gate["statistics"]["payoff_checks"]
+    assert checks["itt_raw_point_nonnegative"]["passed"]
+    assert not checks["itt_raw_lower_bound"]["passed"]
+    assert gate["decision"] == "continue"
 
 
 def test_hard_routing_failure_rolls_back_but_transport_requires_review():
@@ -352,6 +503,39 @@ def test_hard_routing_failure_rolls_back_but_transport_requires_review():
     assert gate["guardrails"]["manual_review_required"] is True
 
 
+@pytest.mark.parametrize("factory", [_barg_experiment, _pers_experiment])
+def test_legacy_injected_randomization_booleans_can_never_promote(factory):
+    experiment = factory()
+    experiment["randomization_evidence"] = {
+        "manifest_backed": True,
+        "approved_manifest_identity": True,
+        "within_game_randomization": True,
+        "mirrored_simultaneous_periods": True,
+        "strictly_post_v2_checkpoint": True,
+        "agent_blocks": {
+            label: {
+                "treatment_blocks": 100,
+                "control_blocks": 100,
+                "treatment_n": 10_000,
+                "control_n": 10_000,
+            }
+            for label in ("main", "test_a", "test_b", "test_c")
+        },
+    }
+
+    gate = evaluate_gate(experiment)
+
+    assert gate is not None
+    assert gate["screen_ready"] is True
+    assert gate["promotion_ready"] is False
+    assert gate["decision"] == "screen_pass"
+    causal = gate["causal_confirmation"]
+    assert causal["pass"] is False
+    assert causal["legacy_randomization_evidence_ignored"] is True
+    assert not causal["design_checks"]["structured_reporter_contract"]
+    assert not causal["design_checks"]["immutable_prefix_identity"]
+
+
 def test_persuasion_fixed_label_evidence_is_capped_at_screen_pass():
     gate = evaluate_gate(_pers_experiment())
 
@@ -365,6 +549,8 @@ def test_persuasion_fixed_label_evidence_is_capped_at_screen_pass():
     zero = gate["statistics"]["zero_sale_noninferiority"]
     assert zero["difference"] < 0
     assert zero["upper_95_one_sided"] <= 0.02
+    assert zero["raw_check"]["passed"]
+    assert zero["fixed_weight_check"]["passed"]
     assert all(
         check["passed"]
         for pair in gate["p_strata_checks"].values()
@@ -409,6 +595,69 @@ def test_persuasion_zero_sale_upper_bound_can_block_promotion():
     assert gate is not None
     assert gate["decision"] == "continue"
     assert not gate["statistics"]["zero_sale_noninferiority"]["check"]["passed"]
+
+
+@pytest.mark.parametrize(
+    ("field", "delta"),
+    [
+        ("games", 1),
+        ("matured", 1),
+        ("resolved", 1),
+        ("censored", 1),
+        ("invalid_terminals", 1),
+        ("zero_sales", 1),
+        ("normalized_outcome_sum", 0.1),
+        ("normalized_outcome_sum_squares", 0.1),
+    ],
+)
+def test_persuasion_p_strata_must_exactly_link_to_cells(field, delta):
+    experiment = _pers_experiment()
+    experiment["itt"]["treatment"]["p_strata"]["0.333333"][field] += delta
+
+    gate = evaluate_gate(experiment)
+
+    assert gate is not None
+    failures = gate["data_integrity"]["failures"]["treatment_itt"]
+    assert any(f"{field} does not match cells" in failure for failure in failures)
+    assert gate["decision"] != "screen_pass"
+
+
+def test_persuasion_zero_sales_must_add_from_cells_to_top():
+    experiment = _pers_experiment()
+    experiment["itt"]["treatment"]["cells"]["0"]["zero_sales"] += 1
+
+    gate = evaluate_gate(experiment)
+
+    assert gate is not None
+    failures = gate["data_integrity"]["failures"]["treatment_itt"]
+    assert "ITT cell zero_sales statistics are not additive" in failures
+    assert gate["decision"] != "screen_pass"
+
+
+def test_fixed_weight_zero_sale_guard_blocks_pooled_dilution_counterexample():
+    experiment = _pers_experiment()
+    for arm, mean in (("treatment", 0.60), ("control", 0.50)):
+        metric = experiment["itt"][arm]
+        for index, entry in metric["cells"].items():
+            cell = entry["cell"]
+            n = 10 if index == "0" else 200
+            entry.clear()
+            entry.update({"cell": cell, **_itt_leaf(n, mean)})
+        metric["cells"]["0"]["zero_sales"] = 5 if arm == "treatment" else 0
+        metric["cells"]["0"]["zero_sales_rate"] = (
+            metric["cells"]["0"]["zero_sales"] / 10
+        )
+        _rebuild_pers_itt_from_cells(metric)
+
+    gate = evaluate_gate(experiment)
+
+    assert gate is not None
+    zero = gate["statistics"]["zero_sale_noninferiority"]
+    assert gate["data_integrity"]["passed"]
+    assert zero["raw_check"]["passed"]
+    assert not zero["fixed_weight_check"]["passed"]
+    assert not zero["check"]["passed"]
+    assert gate["decision"] == "continue"
 
 
 def test_bargaining_tiny_favorable_common_support_cannot_promote():
@@ -475,6 +724,96 @@ def test_error_union_uses_treatment_upper_minus_control_lower():
     assert error_gate["control"]["rate_lower_bound"] == pytest.approx(2 / 200)
     assert error_gate["treatment_excess_upper_bound"] == pytest.approx(0.015)
     assert not error_gate["check"]["passed"]
+
+
+def test_reporter_arm_health_keeps_crossed_label_errors_in_treatment_arm():
+    experiment = _pers_experiment()
+    # Static labels would put main's errors in control.  The reporter contract
+    # attributes raw occurrences by immutable game assignment instead.
+    experiment["agents"]["main"] = _agent(errors=5)
+    experiment["agents"]["test_a"] = _agent(errors=0)
+    experiment["analysis_as_of_ts"] = 1787691601
+    empty = {
+        "turn_events": 0,
+        "result_events": 0,
+        "turn_errors": 0,
+        "result_errors": 0,
+        "invalid_results": 0,
+    }
+    experiment["arm_health"] = {
+        "schema_version": 1,
+        "attribution": "immutable first-game assignment plus raw event occurrences",
+        "prospective_activation": 1787691600.0,
+        "cohorts": {
+            "legacy": {"treatment": dict(empty), "control": dict(empty)},
+            "prospective": {
+                "treatment": {
+                    "turn_events": 1000,
+                    "result_events": 1000,
+                    "turn_errors": 5,
+                    "result_errors": 0,
+                    "invalid_results": 0,
+                },
+                "control": {
+                    "turn_events": 1000,
+                    "result_events": 1000,
+                    "turn_errors": 0,
+                    "result_errors": 0,
+                    "invalid_results": 0,
+                },
+            },
+        },
+        "integrity": {
+            "unknown_turn_events": 0,
+            "unknown_result_events": 0,
+            "unassigned_or_missing_after_activation": 0,
+        },
+        "integrity_pass": True,
+    }
+
+    gate = evaluate_gate(experiment)
+
+    assert gate is not None
+    errors = gate["arm_rate_guardrails"]["errors"]
+    assert errors["attribution"] == "reporter_game_arm:prospective"
+    assert errors["treatment"]["failures_lower_bound"] == 5
+    assert errors["treatment"]["failures_upper_bound"] == 5
+    assert errors["treatment"]["rate_upper_bound"] == pytest.approx(5 / 2000)
+    assert errors["control"]["failures_lower_bound"] == 0
+    assert errors["control"]["rate_lower_bound"] == 0
+
+
+def test_malformed_reporter_arm_health_cannot_downgrade_to_static_labels():
+    experiment = _pers_experiment()
+    experiment["analysis_as_of_ts"] = 1787691601
+    experiment["arm_health"] = {
+        "schema_version": True,
+        "cohorts": {},
+        "integrity_pass": True,
+    }
+
+    gate = evaluate_gate(experiment)
+
+    assert gate is not None
+    errors = gate["arm_rate_guardrails"]["errors"]
+    assert errors["attribution"] == "invalid_reporter_arm_health"
+    assert not errors["treatment"]["valid"]
+    assert not errors["control"]["valid"]
+    assert not errors["check"]["passed"]
+
+
+@pytest.mark.parametrize(
+    ("name", "family"),
+    (("barg_dis_anchor", "bargaining"), ("pers_blind_lie", "persuasion")),
+)
+def test_missing_or_malformed_evidence_never_masquerades_as_rollback(name, family):
+    gate = evaluate_gate({"name": name, "family": family})
+
+    assert gate is not None
+    assert gate["data_integrity"]["passed"] is False
+    assert gate["guardrails"]["evidence_complete"] is False
+    assert gate["binding_rollback"] is False
+    assert gate["decision"] == "continue"
 
 
 def test_bilateral_heavy_censoring_fails_absolute_maturation_gate():
@@ -580,3 +919,17 @@ def test_report_evaluation_is_deterministic_and_does_not_mutate_raw_report():
     assert first == second
     assert report == original
     assert set(first) == {"barg_dis_anchor", "pers_blind_lie"}
+
+    cutoff = first["barg_dis_anchor"]["amendment_provenance"][
+        "prospective_confirmatory_cutoff"
+    ]
+    assert "bargaining" not in cutoff
+    assert "persuasion" not in cutoff
+    cutoff["prior_rows_status"] = "mutated caller copy"
+    third = evaluate_report_gates(report)
+    assert (
+        third["barg_dis_anchor"]["amendment_provenance"][
+            "prospective_confirmatory_cutoff"
+        ]["prior_rows_status"]
+        == "pilot_or_exploratory_screen_only"
+    )
