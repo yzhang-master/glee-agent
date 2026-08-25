@@ -1,0 +1,122 @@
+{
+  "schema_version": 1,
+  "declaration_id": "confirmation-v2-final-look-20260828-2130z",
+  "declared_at": 1787685164,
+  "assignment": {
+    "artifact_path": "data/canary_assignment.json",
+    "artifact_sha256": "b002b688d02df3233b7dd4f21a5595cf149b4cc8dd501a0bfc2ee5bccd11d745",
+    "artifact_bytes": 837,
+    "plan_id": "confirmation-v2-20260825-2100z",
+    "activated_at": 1787691600,
+    "enrollment_cutoff_exclusive": 1787950800,
+    "assignment_algorithm": "sha256-u64-v1",
+    "agents": [
+      "main",
+      "test_a",
+      "test_b",
+      "test_c"
+    ],
+    "strategy_aggregate_sha256": "631ef69862d572644ba855174a411f80a220b11ed5c20e30b43ffc31f1303388",
+    "target_sha256": {
+      "data/targets.json": "1d24a579ca2b611e3b30af4ddf7af5b84ad13e7198fa55b93a2f5e6617e65e25",
+      "data/live_targets.json": "3dcaff69f17175648e4b46499859bf183bba03b1321364de329d01bed0e618a3"
+    }
+  },
+  "scheduled_look": {
+    "look_id": "final-confirmatory-expiry-plus-persuasion-maturity-v1",
+    "analysis_as_of": 1787952600,
+    "assignment_enrollment_cutoff_exclusive": 1787950800,
+    "kind": "single_final_confirmatory",
+    "efficacy_binding": true,
+    "promotion_binding": true,
+    "only_efficacy_look": true
+  },
+  "continuous_monitoring": {
+    "scope": "safety_only",
+    "efficacy_binding": false,
+    "promotion_binding": false,
+    "optional_stopping_for_efficacy": false,
+    "permitted_decisions": [
+      "continue",
+      "rollback_for_predeclared_safety_harm"
+    ]
+  },
+  "families": {
+    "bargaining": {
+      "rule_id": "barg-anchor-confirm-v2",
+      "population_id": "all-strictly-enrolled-bargaining-games",
+      "population": "all games first observed at round 1 with empty history, assigned by the frozen bargaining rule, and enrolled before the exclusive assignment cutoff",
+      "maturity_lag_seconds": 1200,
+      "outcome_deadline_policy": "first_observed_ts plus maturity_lag_seconds; missing, late, conflicting, or invalid terminals are zero and block integrity when malformed"
+    },
+    "negotiation": {
+      "rule_id": "neg-terminal-confirm-v2",
+      "population_id": "supported-first-divergence-hidden-value-terminal-close-games",
+      "population": "strictly enrolled negotiation games at their first exact action-level divergence in the frozen buyer round-9 hidden-value max-rounds-10 reference cells",
+      "maturity_lag_seconds": 600,
+      "outcome_deadline_policy": "first_observed_ts plus maturity_lag_seconds; pending games are excluded until mature and later terminals never repair a fixed deadline outcome"
+    },
+    "persuasion": {
+      "rule_id": "pers-blind-confirm-v2",
+      "population_id": "all-strictly-enrolled-explicit-blind-seller-games",
+      "population": "all games first observed at round 1 with empty history, assigned by the frozen persuasion rule, with seller role and is_seller_know_cv exactly false",
+      "maturity_lag_seconds": 1800,
+      "outcome_deadline_policy": "first_observed_ts plus maturity_lag_seconds; missing, late, conflicting, or invalid terminals are zero and block integrity when malformed"
+    }
+  },
+  "prefix_manifest": {
+    "procedure_version": "ordered-physical-jsonl-prefix-v1",
+    "materialize_at": 1787952600,
+    "path_order": "ascending UTF-8 byte order of project-relative POSIX paths",
+    "event_log_paths": {
+      "path_template": "logs/{agent}-{utc_date}.jsonl",
+      "agents": [
+        "main",
+        "test_a",
+        "test_b",
+        "test_c"
+      ],
+      "utc_dates": [
+        "20260825",
+        "20260826",
+        "20260827",
+        "20260828"
+      ],
+      "all_expanded_paths_required": true,
+      "maximum_bytes_per_file": 2147483648,
+      "prefix_rule": "from byte zero through the newline ending the last contiguous record whose literal numeric top-level ts is at most analysis_as_of; timestamps must be nondecreasing and every included record must be strict UTF-8 JSON"
+    },
+    "assignment_receipt_paths": {
+      "path_template": "logs/canary-assignments/{agent}/b002b688d02df3233b7dd4f21a5595cf149b4cc8dd501a0bfc2ee5bccd11d745.jsonl",
+      "agents": [
+        "main",
+        "test_a",
+        "test_b",
+        "test_c"
+      ],
+      "all_expanded_paths_required": true,
+      "maximum_bytes_per_file": 67108864,
+      "prefix_rule": "the complete newline-terminated physical file snapshot; every record must pin the declared artifact and plan and have enrolled_at in the half-open assignment window"
+    },
+    "physical_read": {
+      "root": ".",
+      "follow_symlinks": false,
+      "require_regular_files": true,
+      "open_mode": "component-wise dirfd walk with O_NOFOLLOW, then O_RDONLY|O_CLOEXEC|O_NOFOLLOW",
+      "snapshot": "capture device, inode, and size from the opened descriptor; read no more than the declared per-file bound; reject a changed descriptor identity or a non-newline-terminated selected prefix"
+    },
+    "entry_schema": [
+      "path",
+      "kind",
+      "device",
+      "inode",
+      "snapshot_bytes",
+      "prefix_bytes",
+      "records",
+      "first_timestamp",
+      "last_timestamp",
+      "sha256"
+    ],
+    "aggregate_identity": "sha256 of UTF-8 canonical JSON for the exact ordered entry array, using sorted object keys and separators comma and colon, prefixed by confirmation-prefix-manifest-v1 plus a NUL byte"
+  }
+}
