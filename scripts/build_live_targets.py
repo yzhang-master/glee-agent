@@ -67,9 +67,11 @@ def build_accept_curves(con, neg_state) -> tuple[dict, dict]:
     This is the half of the answer key that matters most: the optimizers in
     both families pick an offer by maximising `payoff x P(accept)`, and the
     dataset curve is 2-4x optimistic here (a bargaining give of 0.25 is
-    priced at 14.8% by the dataset and realizes 3.7% live). An offer is
-    counted as accepted when the game ended in agreement on the very next
-    round after we made it.
+    priced at 14.8% by the dataset and realizes 3.7% live). Standalone offer
+    turns are already stamped with their offer round. Negotiation counters
+    are emitted by a RejectOffer decision and become the following round's
+    offer. In either case an offer is accepted only when the game's agreement
+    is stamped with that normalized offer round.
     """
     games = {}
     for r in con.execute(
@@ -93,11 +95,27 @@ def build_accept_curves(con, neg_state) -> tuple[dict, dict]:
             cfg = json.loads(g["config_json"])
         except Exception:
             continue
+        try:
+            turn_round = int(r["round"])
+        except (TypeError, ValueError):
+            continue
+        if r["action_type"] == "offer":
+            offer_round = turn_round
+        elif (r["family"] == "negotiation"
+              and act.get("decision") == "RejectOffer"):
+            # The counter is made during round r's decision but is recorded
+            # by the platform as the offer for round r + 1.
+            offer_round = turn_round + 1
+        else:
+            # Accept/reject/walk-away decisions are outcomes of someone
+            # else's offer, not additional offer observations of our own.
+            continue
         accepted = int(g["outcome"] == "agreement"
-                       and (g["agreed_round"] or -1) == (r["round"] or 0) + 1)
+                       and (g["agreed_round"] or -1) == offer_round)
         human = (r["opp_type"] or g["opp_type"]) == "human"
         max_rounds = cfg.get("max_rounds")
-        left = None if max_rounds is None else max(int(max_rounds) - int(r["round"] or 1), 0)
+        left = (None if max_rounds is None
+                else int(max_rounds) - offer_round + 1)
         rl = T._rounds_left_bucket(left)
 
         if r["family"] == "bargaining":
