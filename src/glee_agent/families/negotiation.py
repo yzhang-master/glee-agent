@@ -159,6 +159,30 @@ def _feasible_price(price: float, n, eps_frac: float = 0.01) -> float:
     return max(min(price, n.my_value), n.opp_value + eps)
 
 
+def _emit_price(price: float, n) -> float:
+    """Round to cents unless doing so leaves a public reservation interval.
+
+    Live values sit on an integer grid, so normal actions remain byte-for-byte
+    unchanged.  Defensive callers may still supply a positive public surplus
+    narrower than one cent; in that case retain the feasible sub-cent price
+    rather than rounding it below the seller's value or above the buyer's.
+    """
+    nonnegative = max(price, 0.0)
+    rounded = round(nonnegative, 2)
+    if n.my_value is None or n.opp_value is None:
+        return rounded
+
+    if n.my_role == "seller":
+        seller_value, buyer_value = n.my_value, n.opp_value
+    else:
+        seller_value, buyer_value = n.opp_value, n.my_value
+    lower = max(seller_value, 0.0)
+    if buyer_value > lower and lower <= nonnegative <= buyer_value:
+        if not lower <= rounded <= buyer_value:
+            return nonnegative
+    return rounded
+
+
 def _ci_ultimatum_price(n, knobs: Knobs) -> float | None:
     """Direct surplus price for a one-round complete-info offer.
 
@@ -551,7 +575,7 @@ def decide(view: GameView, knobs: Knobs) -> dict:
         # the actual surplus. Do not replace that with the generic 1%-of-value
         # epsilon, which can consume most of a thin surplus.
         price = _feasible_price(price, n, eps_frac=0.0 if direct_ultimatum is not None else 0.01)
-        out = {"product_price": round(max(price, 0.0), 2)}
+        out = {"product_price": _emit_price(price, n)}
         if view.messages_allowed:
             mine = _my_offer_prices(view)
             conceded = bool(mine) and (
@@ -569,7 +593,7 @@ def decide(view: GameView, knobs: Knobs) -> dict:
     # Decision phase.
     offer = n.last_offer_price
     if offer is None:
-        return {"decision": "RejectOffer", "product_price": round(value, 2)}
+        return {"decision": "RejectOffer", "product_price": _emit_price(value, n)}
 
     payoff = _my_payoff(n.my_role, value, offer)
     final = _is_final_round(view)
@@ -655,7 +679,7 @@ def decide(view: GameView, knobs: Knobs) -> dict:
     if best is not None:
         counter = max(counter, best) if n.my_role == "seller" else min(counter, best)
     counter = _feasible_price(counter, n)
-    out = {"decision": "RejectOffer", "product_price": round(max(counter, 0.0), 2)}
+    out = {"decision": "RejectOffer", "product_price": _emit_price(counter, n)}
     if view.messages_allowed:
         mine = _my_offer_prices(view)
         conceded = bool(mine) and (

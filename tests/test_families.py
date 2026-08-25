@@ -969,6 +969,41 @@ class TestNegotiationInvariants:
         assert action["product_price"] == round(action["product_price"], 2)
         assert seller_value <= action["product_price"] <= buyer_value
 
+    @pytest.mark.parametrize("action_type", ["offer", "counter"])
+    @pytest.mark.parametrize("role", ["seller", "buyer"])
+    def test_subcent_surplus_retains_only_needed_precision(self, action_type, role):
+        from fixtures import negotiation_decision
+
+        seller_value, buyer_value = 1000.001, 1000.005
+        state = {
+            "complete_information": True,
+            "round": 2 if action_type == "offer" else 1,
+            "max_rounds": 2,
+            "messages_allowed": False,
+            "player_1_value": seller_value,
+            "player_2_value": buyer_value,
+        }
+        if action_type == "offer":
+            game = negotiation_game(role=role, game_state=state)
+        else:
+            incoming = (
+                seller_value - 0.001
+                if role == "seller"
+                else buyer_value + 0.001
+            )
+            game = negotiation_decision(
+                role=role, offer_price=incoming, game_state=state
+            )
+
+        action = negotiation.decide(parse_game(game), Knobs(llm_enabled=False))
+
+        if action_type == "counter":
+            assert action["decision"] == "RejectOffer"
+        price = action["product_price"]
+        assert seller_value < price < buyer_value
+        assert price == pytest.approx(1000.003)
+        assert price != round(price, 2)
+
     @pytest.mark.parametrize(
         ("role", "my_value", "opp_value"),
         [("seller", 1005.0, 1000.0), ("buyer", 1000.0, 1005.0)],

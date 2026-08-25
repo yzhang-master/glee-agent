@@ -217,6 +217,92 @@ class TestGuardBasics:
         assert action["product_price"] == expected
         assert any(note in correction for correction in notes)
 
+    @pytest.mark.parametrize("action_type", ["offer", "counter"])
+    @pytest.mark.parametrize(
+        ("role", "proposed", "expected", "note"),
+        [
+            ("seller", 1000.006, 1000.005, "buyer reservation"),
+            ("buyer", 1000.0, 1000.001, "seller reservation"),
+        ],
+    )
+    def test_negotiation_guard_enforces_public_opponent_reservation(
+        self, action_type, role, proposed, expected, note
+    ):
+        state = {
+            "complete_information": True,
+            "round": 1,
+            "max_rounds": 2,
+            "messages_allowed": False,
+            "player_1_value": 1000.001,
+            "player_2_value": 1000.005,
+        }
+        if action_type == "offer":
+            game = negotiation_game(role=role, game_state=state)
+            proposed_action = {"product_price": proposed}
+        else:
+            incoming = 1000.0 if role == "seller" else 1000.006
+            game = negotiation_decision(
+                role=role, offer_price=incoming, game_state=state
+            )
+            proposed_action = {
+                "decision": "RejectOffer",
+                "product_price": proposed,
+            }
+
+        action, notes = guard(proposed_action, parse_game(game))
+
+        assert action["product_price"] == expected
+        assert any(note in correction for correction in notes)
+
+    @pytest.mark.parametrize("action_type", ["offer", "counter"])
+    @pytest.mark.parametrize("role", ["seller", "buyer"])
+    def test_dispatcher_preserves_subcent_feasible_price(
+        self, monkeypatch, action_type, role
+    ):
+        seller_value, buyer_value = 1000.001, 1000.005
+        state = {
+            "complete_information": True,
+            "round": 2 if action_type == "offer" else 1,
+            "max_rounds": 2,
+            "messages_allowed": False,
+            "player_1_value": seller_value,
+            "player_2_value": buyer_value,
+        }
+        if action_type == "offer":
+            game = negotiation_game(role=role, game_state=state)
+        else:
+            incoming = (
+                seller_value - 0.001
+                if role == "seller"
+                else buyer_value + 0.001
+            )
+            game = negotiation_decision(
+                role=role, offer_price=incoming, game_state=state
+            )
+
+        logged = []
+        monkeypatch.setattr(
+            dispatcher,
+            "log_turn",
+            lambda *args, **kwargs: logged.append((args, kwargs)),
+        )
+        strategy = dispatcher.build_strategy(
+            SimpleNamespace(
+                knobs=Knobs(llm_enabled=False),
+                agent_label="subcent-test",
+            )
+        )
+
+        action = strategy(game)
+
+        if action_type == "counter":
+            assert action["decision"] == "RejectOffer"
+        price = action["product_price"]
+        assert seller_value < price < buyer_value
+        assert price == pytest.approx(1000.003)
+        assert price != round(price, 2)
+        assert logged[0][0][3] == []
+
 
 class TestGuardFuzz:
     def test_dispatcher_handles_nonfinite_game_numbers(self, monkeypatch):

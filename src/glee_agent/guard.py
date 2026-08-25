@@ -85,11 +85,11 @@ def _negotiation_fallback(view: GameView) -> dict:
         if n.my_value is not None and not _is_final_round(view):
             return {
                 "decision": "RejectOffer",
-                "product_price": round(max(n.my_value, 0.0), 2),
+                "product_price": _round_negotiation_price(n.my_value, n),
             }
         return {"decision": "RejectOffer"}
     value = max(n.my_value, 0.0) if n.my_value is not None else 100.0
-    return {"product_price": round(value, 2)}
+    return {"product_price": _round_negotiation_price(value, n)}
 
 
 def _persuasion_fallback(view: GameView) -> dict:
@@ -246,8 +246,9 @@ def _guard_negotiation(action: dict, view: GameView, corrections: list[str]) -> 
 def _guard_negotiation_price(
     price: float, n, corrections: list[str], label: str
 ) -> float:
-    """Enforce nonnegative and own-reservation bounds on an emitted price."""
-    cleaned = round(max(price, 0.0), 2)
+    """Enforce nonnegative and reservation bounds on an emitted price."""
+    nonnegative = max(price, 0.0)
+    cleaned = _round_negotiation_price(nonnegative, n)
     if price < 0:
         corrections.append(f"clamped negotiation {label} to nonnegative")
 
@@ -260,7 +261,41 @@ def _guard_negotiation_price(
     if n.my_role == "buyer" and cleaned > reservation:
         corrections.append(f"lowered buyer {label} to own reservation")
         return reservation
+
+    # With both values public and compatible, a defensive guard also keeps
+    # the price on the opponent's non-loss side.  Strategy output already
+    # satisfies this, so the branch is correction-only for malformed input.
+    if n.opp_value is not None:
+        if (
+            n.my_role == "seller"
+            and n.opp_value > reservation
+            and cleaned > n.opp_value
+        ):
+            corrections.append(f"lowered seller {label} to buyer reservation")
+            return n.opp_value
+        if n.my_role == "buyer":
+            seller_reservation = max(n.opp_value, 0.0)
+            if reservation > seller_reservation and cleaned < seller_reservation:
+                corrections.append(f"raised buyer {label} to seller reservation")
+                return seller_reservation
     return cleaned
+
+
+def _round_negotiation_price(price: float, n) -> float:
+    """Round normally, retaining sub-cent precision only when required."""
+    nonnegative = max(price, 0.0)
+    rounded = round(nonnegative, 2)
+    if n.my_value is None or n.opp_value is None:
+        return rounded
+    if n.my_role == "seller":
+        seller_value, buyer_value = n.my_value, n.opp_value
+    else:
+        seller_value, buyer_value = n.opp_value, n.my_value
+    lower = max(seller_value, 0.0)
+    if buyer_value > lower and lower <= nonnegative <= buyer_value:
+        if not lower <= rounded <= buyer_value:
+            return nonnegative
+    return rounded
 
 
 def _guard_persuasion(action: dict, view: GameView, corrections: list[str]) -> dict:
