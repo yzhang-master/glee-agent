@@ -23,6 +23,17 @@ _lock = threading.Lock()
 _telemetry_lock = threading.Lock()
 
 
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    directory = os.open(path, flags)
+    try:
+        os.fsync(directory)
+    finally:
+        os.close(directory)
+
+
 def log_turn(
     agent_label: str,
     game: dict,
@@ -51,8 +62,18 @@ def log_turn(
             ),
         }
         line = json.dumps(record, ensure_ascii=False, default=str)
-        with _lock, path.open("a", encoding="utf-8") as f:
-            f.write(line + "\n")
+        durable = (
+            isinstance(canary_assignment, dict)
+            and canary_assignment.get("status") == "assigned"
+        )
+        with _lock:
+            with path.open("a", encoding="utf-8") as f:
+                f.write(line + "\n")
+                if durable:
+                    f.flush()
+                    os.fsync(f.fileno())
+            if durable:
+                _fsync_directory(LOG_DIR)
         return True
     except Exception:  # noqa: BLE001 — logging must never break play
         return False
@@ -71,14 +92,7 @@ def _append(prefix: str, record: dict, *, durable: bool = False) -> bool:
                 f.flush()
                 os.fsync(f.fileno())
         if durable:
-            flags = os.O_RDONLY
-            if hasattr(os, "O_DIRECTORY"):
-                flags |= os.O_DIRECTORY
-            directory = os.open(LOG_DIR, flags)
-            try:
-                os.fsync(directory)
-            finally:
-                os.close(directory)
+            _fsync_directory(LOG_DIR)
         return True
     except Exception:  # noqa: BLE001 — logging must never break play
         return False

@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import stat
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from types import SimpleNamespace
@@ -407,10 +408,10 @@ def test_write_ahead_receipt_recovers_arm_after_process_restart(tmp_path):
 
 def test_receipt_failure_or_corruption_disables_assignment(tmp_path):
     loaded, _ = _write_plan(tmp_path)
-    blocker = tmp_path / "blocker"
-    blocker.write_text("not a directory")
     unwritable = CanaryAssigner(loaded, "test_a", clock=lambda: 150)
-    unwritable._receipt_path = blocker / "receipt.jsonl"
+    unwritable._open_receipt_parent = lambda **_kwargs: (_ for _ in ()).throw(
+        OSError("injected parent failure")
+    )
 
     failed = unwritable.assignment_for(
         _turn(bargaining_game(), game_id="cannot-persist")
@@ -434,6 +435,8 @@ def test_complete_append_is_rolled_back_when_first_fsync_fails(
 ):
     loaded, _ = _write_plan(tmp_path)
     assigner = CanaryAssigner(loaded, "test_a", clock=lambda: 150)
+    receipt = tmp_path / receipt_relative_path("test_a", loaded.artifact_sha256)
+    receipt.parent.mkdir(parents=True, exist_ok=True)
     real_fsync = canary_assignment_module.os.fsync
     calls = [0]
 
@@ -450,7 +453,6 @@ def test_complete_append_is_rolled_back_when_first_fsync_fails(
 
     assert not assignment.assigned
     assert assignment.reason == "receipt_persistence_failed"
-    receipt = tmp_path / receipt_relative_path("test_a", loaded.artifact_sha256)
     assert receipt.read_bytes() == b""
 
     restarted = CanaryAssigner(loaded, "test_a", clock=lambda: 150)
@@ -471,6 +473,8 @@ def test_uncertain_append_and_rollback_fail_stops_before_play(
 ):
     loaded, _ = _write_plan(tmp_path)
     assigner = CanaryAssigner(loaded, "test_a", clock=lambda: 150)
+    receipt = tmp_path / receipt_relative_path("test_a", loaded.artifact_sha256)
+    receipt.parent.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(
         canary_assignment_module.os,
         "fsync",
@@ -589,6 +593,69 @@ def test_receipt_parent_symlink_and_recursive_json_fail_closed(
     assert recursive.assignment_for(
         _turn(bargaining_game(), game_id="recursive-json")
     ).reason == "receipt_store_invalid"
+
+
+def test_forged_receipt_cannot_expand_plan_agent_scope(tmp_path):
+    loaded, _ = _write_plan(tmp_path)
+    assert loaded.plan is not None
+    forger = CanaryAssigner(loaded, "test_c", clock=lambda: 150)
+    rule = loaded.plan.rule_for("bargaining")
+    assert rule is not None
+    forged = forger._make_assignment(
+        loaded.plan, rule, "forged-public-salt", 150.0, "new"
+    )
+    receipt = tmp_path / receipt_relative_path("test_c", loaded.artifact_sha256)
+    receipt.parent.mkdir(parents=True)
+    receipt.write_text(
+        json.dumps(
+            forger._receipt_record("forged-public-salt", forged),
+            separators=(",", ":"),
+            sort_keys=True,
+        )
+        + "\n"
+    )
+
+    restarted = CanaryAssigner(loaded, "test_c", clock=lambda: 150)
+    rejected = restarted.assignment_for(
+        _turn(
+            bargaining_game(),
+            game_id="forged-public-salt",
+            round_=2,
+            history=[{"round": 1}],
+        )
+    )
+
+    assert not rejected.assigned
+    assert rejected.reason == "agent_not_enrolled"
+
+
+def test_new_receipt_directory_chain_and_file_are_fsynced(
+    tmp_path, monkeypatch
+):
+    loaded, _ = _write_plan(tmp_path)
+    assigner = CanaryAssigner(loaded, "test_a", clock=lambda: 150)
+    real_fsync = canary_assignment_module.os.fsync
+    directory_fsyncs = []
+    file_fsyncs = []
+
+    def record_fsync(descriptor):
+        mode = canary_assignment_module.os.fstat(descriptor).st_mode
+        if stat.S_ISDIR(mode):
+            directory_fsyncs.append(descriptor)
+        else:
+            file_fsyncs.append(descriptor)
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(canary_assignment_module.os, "fsync", record_fsync)
+    assignment = assigner.assignment_for(
+        _turn(bargaining_game(), game_id="durable-directory-chain")
+    )
+
+    assert assignment.assigned
+    # project root, logs, canary-assignments, and agent directory entries;
+    # the receipt file itself is independently fsynced before assignment.
+    assert len(directory_fsyncs) >= 4
+    assert file_fsyncs
 
 
 def test_runtime_manifest_failure_disables_only_valid_plan(tmp_path):

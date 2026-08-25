@@ -514,25 +514,68 @@ class CanaryAssigner:
         self._clock = clock
         self._cache: dict[tuple[str, str], GameAssignment] = {}
         self._lock = threading.Lock()
-        self._receipt_path = (
-            loaded.project_root.resolve(strict=False)
-            / receipt_relative_path(self.agent_label, loaded.artifact_sha256)
+        relative_receipt = receipt_relative_path(
+            self.agent_label, loaded.artifact_sha256
         )
+        self._receipt_parent_parts = relative_receipt.parts[:-1]
+        self._receipt_filename = relative_receipt.name
         self._receipt_store_healthy = True
         self._persistence_uncertain = False
-        if not self._receipt_path_is_bounded():
-            self._receipt_store_healthy = False
         self._load_receipts()
 
-    def _receipt_path_is_bounded(self) -> bool:
+    @staticmethod
+    def _directory_flags() -> int:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        return flags
+
+    def _open_receipt_parent(self, *, create: bool) -> int | None:
+        """Walk from the resolved project root without following symlinks.
+
+        Every newly created directory entry is fsynced in its already-open
+        parent before traversal continues.  Returning the final directory fd
+        lets callers use ``openat`` semantics and closes the containment TOCTOU
+        left by resolving an absolute path and opening it later.
+        """
+        descriptor: int | None = None
+        flags = self._directory_flags()
         try:
-            root = self.loaded.project_root.resolve(strict=False)
-            expected = root / "logs" / "canary-assignments"
-            resolved = self._receipt_path.resolve(strict=False)
-            resolved.relative_to(expected)
-            return not self._receipt_path.is_symlink()
-        except (OSError, RuntimeError, ValueError):
-            return False
+            descriptor = os.open(
+                self.loaded.project_root.resolve(strict=False), flags
+            )
+            for component in self._receipt_parent_parts:
+                try:
+                    child = os.open(component, flags, dir_fd=descriptor)
+                except FileNotFoundError:
+                    if not create:
+                        closing = descriptor
+                        descriptor = None
+                        os.close(closing)
+                        return None
+                    try:
+                        os.mkdir(component, 0o700, dir_fd=descriptor)
+                    except FileExistsError:
+                        # A concurrent creator is accepted only if the no-follow
+                        # directory open below validates what appeared.
+                        pass
+                    else:
+                        os.fsync(descriptor)
+                    child = os.open(component, flags, dir_fd=descriptor)
+                closing = descriptor
+                descriptor = child
+                os.close(closing)
+            result = descriptor
+            descriptor = None
+            return result
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
 
     def assignment_for(self, view: GameView) -> GameAssignment:
         game_id = view.game_id
@@ -648,10 +691,10 @@ class CanaryAssigner:
         if not self._receipt_store_healthy:
             return False
         descriptor: int | None = None
+        parent_descriptor: int | None = None
         starting_size: int | None = None
         created = False
         try:
-            self._receipt_path.parent.mkdir(parents=True, exist_ok=True)
             line = json.dumps(
                 self._receipt_record(game_id, assignment),
                 ensure_ascii=True,
@@ -660,18 +703,24 @@ class CanaryAssigner:
                 sort_keys=True,
             )
             payload = (line + "\n").encode("utf-8")
+            parent_descriptor = self._open_receipt_parent(create=True)
+            if parent_descriptor is None:
+                raise OSError("receipt parent unavailable")
             flags = os.O_WRONLY | os.O_APPEND
             if hasattr(os, "O_NOFOLLOW"):
                 flags |= os.O_NOFOLLOW
             try:
                 descriptor = os.open(
-                    self._receipt_path,
+                    self._receipt_filename,
                     flags | os.O_CREAT | os.O_EXCL,
                     0o600,
+                    dir_fd=parent_descriptor,
                 )
                 created = True
             except FileExistsError:
-                descriptor = os.open(self._receipt_path, flags)
+                descriptor = os.open(
+                    self._receipt_filename, flags, dir_fd=parent_descriptor
+                )
             fcntl.flock(descriptor, fcntl.LOCK_EX)
             starting_size = os.fstat(descriptor).st_size
             if starting_size + len(payload) > MAX_RECEIPT_BYTES:
@@ -685,7 +734,7 @@ class CanaryAssigner:
                 written += count
             os.fsync(descriptor)
             if created:
-                self._fsync_directory(self._receipt_path.parent)
+                os.fsync(parent_descriptor)
             return True
         except (OSError, TypeError, ValueError, OverflowError):
             self._receipt_store_healthy = False
@@ -694,7 +743,9 @@ class CanaryAssigner:
                     os.ftruncate(descriptor, starting_size)
                     os.fsync(descriptor)
                     if created:
-                        self._fsync_directory(self._receipt_path.parent)
+                        if parent_descriptor is None:
+                            raise OSError("receipt parent unavailable for rollback")
+                        os.fsync(parent_descriptor)
                 except OSError as rollback_error:
                     self._persistence_uncertain = True
                     raise ReceiptPersistenceUncertain(
@@ -707,35 +758,9 @@ class CanaryAssigner:
                     os.close(descriptor)
                 except OSError:
                     pass
-
-    @staticmethod
-    def _fsync_directory(path: Path) -> None:
-        flags = os.O_RDONLY
-        if hasattr(os, "O_DIRECTORY"):
-            flags |= os.O_DIRECTORY
-        descriptor = os.open(path, flags)
-        try:
-            os.fsync(descriptor)
-        finally:
-            os.close(descriptor)
-
-    def _truncate_receipt_tail(self, size: int) -> bool:
-        descriptor: int | None = None
-        try:
-            flags = os.O_WRONLY
-            if hasattr(os, "O_NOFOLLOW"):
-                flags |= os.O_NOFOLLOW
-            descriptor = os.open(self._receipt_path, flags)
-            fcntl.flock(descriptor, fcntl.LOCK_EX)
-            os.ftruncate(descriptor, size)
-            os.fsync(descriptor)
-            return True
-        except OSError:
-            return False
-        finally:
-            if descriptor is not None:
+            if parent_descriptor is not None:
                 try:
-                    os.close(descriptor)
+                    os.close(parent_descriptor)
                 except OSError:
                     pass
 
@@ -743,28 +768,62 @@ class CanaryAssigner:
         plan = self.loaded.plan
         if self.loaded.status != "valid" or plan is None:
             return
+        if self.agent_label not in plan.agents:
+            # A receipt is never authority to expand a plan's agent scope.
+            return
         if not self._receipt_store_healthy:
             return
+        descriptor: int | None = None
+        parent_descriptor: int | None = None
         try:
-            if not self._receipt_path.exists():
+            parent_descriptor = self._open_receipt_parent(create=False)
+            if parent_descriptor is None:
                 return
-            if self._receipt_path.stat().st_size > MAX_RECEIPT_BYTES:
+            flags = os.O_RDWR
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            try:
+                descriptor = os.open(
+                    self._receipt_filename, flags, dir_fd=parent_descriptor
+                )
+            except FileNotFoundError:
+                return
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            size = os.fstat(descriptor).st_size
+            if size > MAX_RECEIPT_BYTES:
                 self._receipt_store_healthy = False
                 return
-            raw = self._receipt_path.read_bytes()
+            chunks: list[bytes] = []
+            remaining = size
+            while remaining:
+                chunk = os.read(descriptor, min(remaining, 1024 * 1024))
+                if not chunk:
+                    raise OSError("receipt journal ended before its stated size")
+                chunks.append(chunk)
+                remaining -= len(chunk)
+            raw = b"".join(chunks)
+            # An interrupted final append is safe to discard: the writer only
+            # returns an assigned arm after the full line is file-fsynced.
+            if raw and not raw.endswith(b"\n"):
+                cutoff = raw.rfind(b"\n") + 1
+                os.ftruncate(descriptor, cutoff)
+                os.fsync(descriptor)
+                raw = raw[:cutoff]
         except OSError:
             self._receipt_store_healthy = False
             return
-        # An interrupted final append is safe to ignore: the writer only
-        # returns an assigned arm after the full line has been flushed/fsynced.
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            if parent_descriptor is not None:
+                try:
+                    os.close(parent_descriptor)
+                except OSError:
+                    pass
         lines = raw.splitlines()
-        if raw and not raw.endswith(b"\n"):
-            cutoff = raw.rfind(b"\n") + 1
-            if not self._truncate_receipt_tail(cutoff):
-                self._receipt_store_healthy = False
-                return
-            raw = raw[:cutoff]
-            lines = raw.splitlines()
         recovered: dict[tuple[str, str], GameAssignment] = {}
         try:
             for line in lines:
@@ -799,6 +858,8 @@ class CanaryAssigner:
     def _validate_receipt(
         self, record: Any, plan: AssignmentPlan
     ) -> GameAssignment:
+        if self.agent_label not in plan.agents:
+            raise _PlanError("receipt_agent_not_enrolled")
         expected_fields = {
             "schema_version",
             "record_type",

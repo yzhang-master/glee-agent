@@ -96,6 +96,64 @@ def test_log_turn_persists_canary_assignment_metadata(log_dir):
     assert record["canary_assignment"] == assignment
 
 
+def test_only_assigned_canary_turns_are_fsynced_before_return(
+    log_dir, monkeypatch
+):
+    real_fsync = logging_.os.fsync
+    calls = []
+
+    def record_fsync(descriptor):
+        calls.append(descriptor)
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(logging_.os, "fsync", record_fsync)
+
+    assert logging_.log_turn(
+        "test_a",
+        {"game_id": "base"},
+        {"decision": "accept"},
+        [],
+        0.01,
+        canary_assignment={"status": "unassigned", "reason": "plan_missing"},
+    )
+    assert calls == []
+
+    assert logging_.log_turn(
+        "test_a",
+        {"game_id": "canary"},
+        {"decision": "accept"},
+        [],
+        0.01,
+        canary_assignment={"status": "assigned", "arm": "treatment"},
+    )
+    assert len(calls) >= 2  # turn file plus its directory entry
+
+
+def test_assigned_turn_fsync_failure_is_reported(log_dir, monkeypatch):
+    monkeypatch.setattr(
+        logging_.os,
+        "fsync",
+        lambda _descriptor: (_ for _ in ()).throw(OSError("injected")),
+    )
+
+    assert logging_.log_turn(
+        "test_a",
+        {"game_id": "canary"},
+        {"decision": "accept"},
+        [],
+        0.01,
+        canary_assignment={"status": "assigned", "arm": "treatment"},
+    ) is False
+    assert logging_.log_turn(
+        "test_a",
+        {"game_id": "base"},
+        {"decision": "accept"},
+        [],
+        0.01,
+        canary_assignment={"status": "unassigned"},
+    ) is True
+
+
 def test_log_snapshot_shape(log_dir):
     stats = {
         "agent_id": "abc",
