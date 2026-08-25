@@ -96,12 +96,14 @@ def reset_cache() -> None:
         _LIVE_BOOK = None
 
 
-def profile(name: str | None) -> dict | None:
+def profile(name: str | None, *, include_live: bool = True) -> dict | None:
     """Merged behavioral profile for a live opponent name, or None.
 
     Keys (when present): ``model`` plus the dataset stats for the matched
     model (barg_n, barg_accept_rate_when_offered_lt40pct, ...), and
-    ``live_n`` / ``live_share_to_me`` from the live book. Never raises.
+    ``live_n`` / ``live_share_to_me`` from the live book. Pass
+    ``include_live=False`` when only dataset stats are needed; this avoids
+    loading the live book. Never raises.
     """
     try:
         if not isinstance(name, str) or not name.strip():
@@ -120,9 +122,10 @@ def profile(name: str | None) -> dict | None:
                 merged.update(models[best_key])
                 merged["model"] = str(best_key)
 
-        live = _live_book().get(lower)
-        if isinstance(live, dict):
-            merged.update(live)
+        if include_live:
+            live = _live_book().get(lower)
+            if isinstance(live, dict):
+                merged.update(live)
 
         return merged or None
     except Exception:  # noqa: BLE001 — lookups must never raise

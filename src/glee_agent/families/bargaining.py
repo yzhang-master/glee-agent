@@ -128,7 +128,9 @@ def _profile_adjust(view: GameView) -> dict:
     opponent who behaves as if undiscounted (stingy toward lowballs).
     """
     adj = {"floor": 0.0, "anchor": 0.0, "give": 0.0, "patient": False}
-    prof = opponents.profile(view.opponent_name)
+    # The strategy below consumes only static target-dataset fields. Loading
+    # the live book here would scan agent.db on the first named opponent.
+    prof = opponents.profile(view.opponent_name, include_live=False)
     if not prof:
         return adj
     rate = prof.get("barg_accept_rate_when_offered_lt40pct")

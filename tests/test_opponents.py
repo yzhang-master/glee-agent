@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from types import SimpleNamespace
 
 import pytest
 
@@ -72,6 +73,38 @@ class TestDatasetMatch:
     def test_no_models_dict_is_none(self):
         T.set_targets(T.Targets.null())
         assert O.profile("gpt-4o") is None
+
+    def test_dataset_only_lookup_skips_live_book(self, monkeypatch):
+        loads = []
+        monkeypatch.setattr(O, "_load_live_book", lambda path: loads.append(path) or {})
+
+        prof = O.profile("gpt-4o", include_live=False)
+
+        assert prof is not None
+        assert prof["barg_n"] == 100
+        assert loads == []
+
+    def test_bargaining_hot_path_skips_live_book_and_uses_dataset(self, monkeypatch):
+        from glee_agent.families import bargaining
+
+        T.set_targets(T.Targets({"models": {
+            "gpt-4o": {
+                "barg_n": 5000,
+                "barg_accept_rate_when_offered_lt40pct": 0.25,
+            },
+        }}))
+        loads = []
+        monkeypatch.setattr(O, "_load_live_book", lambda path: loads.append(path) or {})
+
+        adj = bargaining._profile_adjust(SimpleNamespace(opponent_name="gpt-4o"))
+
+        assert adj == {
+            "floor": pytest.approx(0.05),
+            "anchor": 0.0,
+            "give": pytest.approx(-0.05),
+            "patient": False,
+        }
+        assert loads == []
 
 
 class TestLiveBook:
