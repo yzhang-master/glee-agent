@@ -211,4 +211,5 @@ def test_log_functions_never_raise_when_log_dir_unwritable(tmp_path, monkeypatch
     logging_.log_result("main", "g", {"valid": True})
     logging_.log_snapshot("main", {"scores": {}, "active_games": 0})
     logging_.log_lb_snapshot("negotiation", [], None)
-    logging_.log_turn("main", {}, {}, [], 0.1)
+    assert logging_.log_turn("main", {}, {}, [], 0.1) is False
+    assert logging_.log_runtime("main", {"pid": 1}) is False

@@ -136,9 +136,9 @@ def test_append_writes_one_runtime_record_and_is_fail_open(tmp_path, monkeypatch
     monkeypatch.setattr(logging_, "LOG_DIR", tmp_path / "logs")
     monkeypatch.setattr(runtime_manifest, "_git_head", lambda _root: "b" * 40)
 
-    runtime_manifest.append_runtime_manifest(
+    assert runtime_manifest.append_runtime_manifest(
         "test_b", Knobs(llm_enabled=False), project_root=tmp_path
-    )
+    ) is True
 
     records = _records(tmp_path / "logs", "test_b")
     assert len(records) == 1
@@ -147,10 +147,23 @@ def test_append_writes_one_runtime_record_and_is_fail_open(tmp_path, monkeypatch
     assert records[0]["pid"] > 0
     assert isinstance(records[0]["ts"], float)
 
+    monkeypatch.setattr(runtime_manifest, "log_runtime", lambda *_args, **_kwargs: False)
+    assert (
+        runtime_manifest.append_runtime_manifest(
+            "test_b", Knobs(), project_root=tmp_path
+        )
+        is False
+    )
+
     monkeypatch.setattr(
         runtime_manifest,
         "build_runtime_manifest",
         lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("hash failed")),
     )
-    runtime_manifest.append_runtime_manifest("test_b", Knobs(), project_root=tmp_path)
+    assert (
+        runtime_manifest.append_runtime_manifest(
+            "test_b", Knobs(), project_root=tmp_path
+        )
+        is False
+    )
     assert len(_records(tmp_path / "logs", "test_b")) == 1

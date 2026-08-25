@@ -13,6 +13,7 @@ within the process; silently enrolling partial games would bias a canary.
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import math
@@ -70,6 +71,10 @@ class _PlanError(ValueError):
     def __init__(self, code: str):
         super().__init__(code)
         self.code = code
+
+
+class ReceiptPersistenceUncertain(RuntimeError):
+    """Raised before play when a failed append cannot be durably rolled back."""
 
 
 @dataclass(frozen=True)
@@ -385,11 +390,42 @@ def load_assignment_plan(
     root = project_root.resolve(strict=False)
     path = root / relative
     try:
-        raw = path.read_bytes()
+        resolved_path = path.resolve(strict=True)
     except FileNotFoundError:
         return LoadedAssignmentPlan(
             "missing", artifact_path, None, None, project_root=root
         )
+    except (OSError, ValueError):
+        return LoadedAssignmentPlan(
+            "invalid",
+            artifact_path,
+            None,
+            None,
+            error_code="artifact_unreadable",
+            project_root=root,
+        )
+    try:
+        resolved_path.relative_to(root)
+    except ValueError:
+        return LoadedAssignmentPlan(
+            "invalid",
+            artifact_path,
+            None,
+            None,
+            error_code="artifact_path_escape",
+            project_root=root,
+        )
+    if not resolved_path.is_file():
+        return LoadedAssignmentPlan(
+            "invalid",
+            artifact_path,
+            None,
+            None,
+            error_code="artifact_not_regular_file",
+            project_root=root,
+        )
+    try:
+        raw = resolved_path.read_bytes()
     except (OSError, ValueError):
         return LoadedAssignmentPlan(
             "invalid",
@@ -447,6 +483,22 @@ def disabled_assignment(reason: str, loaded: LoadedAssignmentPlan) -> GameAssign
     )
 
 
+def require_runtime_manifest(
+    loaded: LoadedAssignmentPlan, manifest_persisted: bool
+) -> LoadedAssignmentPlan:
+    """Disable a valid plan unless its startup provenance was durable."""
+    if loaded.status != "valid" or manifest_persisted:
+        return loaded
+    return LoadedAssignmentPlan(
+        status="invalid",
+        artifact_path=loaded.artifact_path,
+        artifact_sha256=loaded.artifact_sha256,
+        artifact_bytes=loaded.artifact_bytes,
+        error_code="runtime_manifest_unavailable",
+        project_root=loaded.project_root,
+    )
+
+
 class CanaryAssigner:
     """Thread-safe, process-local game assignment and decision cache."""
 
@@ -467,7 +519,20 @@ class CanaryAssigner:
             / receipt_relative_path(self.agent_label, loaded.artifact_sha256)
         )
         self._receipt_store_healthy = True
+        self._persistence_uncertain = False
+        if not self._receipt_path_is_bounded():
+            self._receipt_store_healthy = False
         self._load_receipts()
+
+    def _receipt_path_is_bounded(self) -> bool:
+        try:
+            root = self.loaded.project_root.resolve(strict=False)
+            expected = root / "logs" / "canary-assignments"
+            resolved = self._receipt_path.resolve(strict=False)
+            resolved.relative_to(expected)
+            return not self._receipt_path.is_symlink()
+        except (OSError, RuntimeError, ValueError):
+            return False
 
     def assignment_for(self, view: GameView) -> GameAssignment:
         game_id = view.game_id
@@ -476,6 +541,10 @@ class CanaryAssigner:
             return disabled_assignment("invalid_game_id", self.loaded)
         key = (family, game_id)
         with self._lock:
+            if self._persistence_uncertain:
+                raise ReceiptPersistenceUncertain(
+                    "canary receipt durability remains indeterminate"
+                )
             cached = self._cache.get(key)
             if cached is not None:
                 return cached
@@ -485,6 +554,10 @@ class CanaryAssigner:
                     assignment = disabled_assignment(
                         "receipt_persistence_failed", self.loaded
                     )
+            except ReceiptPersistenceUncertain:
+                # Returning the base policy here could cross arms after a
+                # restart if the uncertain receipt survived.  Stop this move.
+                raise
             except Exception:  # noqa: BLE001 - assignment must be fail-closed
                 assignment = disabled_assignment("assignment_error", self.loaded)
             self._cache[key] = assignment
@@ -574,6 +647,9 @@ class CanaryAssigner:
     def _persist_receipt(self, game_id: str, assignment: GameAssignment) -> bool:
         if not self._receipt_store_healthy:
             return False
+        descriptor: int | None = None
+        starting_size: int | None = None
+        created = False
         try:
             self._receipt_path.parent.mkdir(parents=True, exist_ok=True)
             line = json.dumps(
@@ -583,25 +659,91 @@ class CanaryAssigner:
                 separators=(",", ":"),
                 sort_keys=True,
             )
+            payload = (line + "\n").encode("utf-8")
+            flags = os.O_WRONLY | os.O_APPEND
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
             try:
-                current_size = self._receipt_path.stat().st_size
-            except FileNotFoundError:
-                current_size = 0
-            if current_size + len(line.encode("utf-8")) + 1 > MAX_RECEIPT_BYTES:
+                descriptor = os.open(
+                    self._receipt_path,
+                    flags | os.O_CREAT | os.O_EXCL,
+                    0o600,
+                )
+                created = True
+            except FileExistsError:
+                descriptor = os.open(self._receipt_path, flags)
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            starting_size = os.fstat(descriptor).st_size
+            if starting_size + len(payload) > MAX_RECEIPT_BYTES:
                 self._receipt_store_healthy = False
                 return False
-            with self._receipt_path.open("a", encoding="utf-8") as handle:
-                handle.write(line + "\n")
-                handle.flush()
-                os.fsync(handle.fileno())
+            written = 0
+            while written < len(payload):
+                count = os.write(descriptor, payload[written:])
+                if count <= 0:
+                    raise OSError("receipt append made no progress")
+                written += count
+            os.fsync(descriptor)
+            if created:
+                self._fsync_directory(self._receipt_path.parent)
             return True
         except (OSError, TypeError, ValueError, OverflowError):
             self._receipt_store_healthy = False
+            if descriptor is not None and starting_size is not None:
+                try:
+                    os.ftruncate(descriptor, starting_size)
+                    os.fsync(descriptor)
+                    if created:
+                        self._fsync_directory(self._receipt_path.parent)
+                except OSError as rollback_error:
+                    self._persistence_uncertain = True
+                    raise ReceiptPersistenceUncertain(
+                        "canary receipt append and rollback were both uncertain"
+                    ) from rollback_error
             return False
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            flags |= os.O_DIRECTORY
+        descriptor = os.open(path, flags)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+
+    def _truncate_receipt_tail(self, size: int) -> bool:
+        descriptor: int | None = None
+        try:
+            flags = os.O_WRONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                flags |= os.O_NOFOLLOW
+            descriptor = os.open(self._receipt_path, flags)
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            os.ftruncate(descriptor, size)
+            os.fsync(descriptor)
+            return True
+        except OSError:
+            return False
+        finally:
+            if descriptor is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
 
     def _load_receipts(self) -> None:
         plan = self.loaded.plan
         if self.loaded.status != "valid" or plan is None:
+            return
+        if not self._receipt_store_healthy:
             return
         try:
             if not self._receipt_path.exists():
@@ -617,7 +759,12 @@ class CanaryAssigner:
         # returns an assigned arm after the full line has been flushed/fsynced.
         lines = raw.splitlines()
         if raw and not raw.endswith(b"\n"):
-            lines = lines[:-1]
+            cutoff = raw.rfind(b"\n") + 1
+            if not self._truncate_receipt_tail(cutoff):
+                self._receipt_store_healthy = False
+                return
+            raw = raw[:cutoff]
+            lines = raw.splitlines()
         recovered: dict[tuple[str, str], GameAssignment] = {}
         try:
             for line in lines:
@@ -642,6 +789,7 @@ class CanaryAssigner:
             TypeError,
             ValueError,
             OverflowError,
+            RecursionError,
         ):
             self._receipt_store_healthy = False
             self._cache.clear()

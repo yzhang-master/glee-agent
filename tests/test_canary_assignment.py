@@ -18,8 +18,10 @@ from glee_agent.canary_assignment import (
     MAX_RECEIPT_BYTES,
     CanaryAssigner,
     LoadedAssignmentPlan,
+    ReceiptPersistenceUncertain,
     load_assignment_plan,
     receipt_relative_path,
+    require_runtime_manifest,
 )
 from glee_agent.config import Knobs
 from glee_agent.runtime_manifest import build_runtime_manifest
@@ -187,6 +189,19 @@ def test_absolute_parent_paths_and_noninteger_timestamps_are_rejected(tmp_path):
     assert loaded.error_code == "invalid_activated_at"
 
 
+def test_artifact_symlink_cannot_escape_project_root(tmp_path):
+    outside = tmp_path.parent / f"{tmp_path.name}-outside-plan.json"
+    outside.write_text(json.dumps(_document()))
+    path = tmp_path / "data/canary_assignment.json"
+    path.parent.mkdir(parents=True)
+    path.symlink_to(outside)
+
+    loaded = load_assignment_plan(project_root=tmp_path)
+
+    assert loaded.status == "invalid"
+    assert loaded.error_code == "artifact_path_escape"
+
+
 def test_assignment_is_stable_across_turns_and_after_expiry(tmp_path):
     loaded, _ = _write_plan(tmp_path)
     now = [150.0]
@@ -304,6 +319,39 @@ def test_cache_is_thread_safe(tmp_path):
     assert len(receipt.read_text().splitlines()) == 1
 
 
+def test_concurrent_distinct_games_append_recoverable_receipts(tmp_path):
+    loaded, _ = _write_plan(tmp_path)
+    assigner = CanaryAssigner(loaded, "test_a", clock=lambda: 150)
+    views = [
+        _turn(bargaining_game(), game_id=f"concurrent-{index}")
+        for index in range(32)
+    ]
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        assignments = list(pool.map(assigner.assignment_for, views))
+
+    assert all(assignment.assigned for assignment in assignments)
+    receipt = tmp_path / receipt_relative_path("test_a", loaded.artifact_sha256)
+    assert len(receipt.read_text().splitlines()) == len(views)
+
+    restarted = CanaryAssigner(loaded, "test_a", clock=lambda: 5_000_000_000)
+    recovered = [
+        restarted.assignment_for(
+            _turn(
+                bargaining_game(),
+                game_id=f"concurrent-{index}",
+                round_=2,
+                history=[{"round": 1}],
+            )
+        )
+        for index in range(32)
+    ]
+    assert [item.assignment_sha256 for item in recovered] == [
+        item.assignment_sha256 for item in assignments
+    ]
+    assert all(item.enrollment == "recovered" for item in recovered)
+
+
 def test_receipt_capacity_covers_twice_projected_72_hour_volume(tmp_path):
     loaded, _ = _write_plan(tmp_path)
     assigner = CanaryAssigner(loaded, "test_a", clock=lambda: 150)
@@ -381,6 +429,64 @@ def test_receipt_failure_or_corruption_disables_assignment(tmp_path):
     assert disabled.reason == "receipt_store_invalid"
 
 
+def test_complete_append_is_rolled_back_when_first_fsync_fails(
+    tmp_path, monkeypatch
+):
+    loaded, _ = _write_plan(tmp_path)
+    assigner = CanaryAssigner(loaded, "test_a", clock=lambda: 150)
+    real_fsync = canary_assignment_module.os.fsync
+    calls = [0]
+
+    def fail_first_fsync(descriptor):
+        calls[0] += 1
+        if calls[0] == 1:
+            raise OSError("injected receipt fsync failure")
+        return real_fsync(descriptor)
+
+    monkeypatch.setattr(canary_assignment_module.os, "fsync", fail_first_fsync)
+    assignment = assigner.assignment_for(
+        _turn(bargaining_game(), game_id="rolled-back")
+    )
+
+    assert not assignment.assigned
+    assert assignment.reason == "receipt_persistence_failed"
+    receipt = tmp_path / receipt_relative_path("test_a", loaded.artifact_sha256)
+    assert receipt.read_bytes() == b""
+
+    restarted = CanaryAssigner(loaded, "test_a", clock=lambda: 150)
+    partial = restarted.assignment_for(
+        _turn(
+            bargaining_game(),
+            game_id="rolled-back",
+            round_=2,
+            history=[{"round": 1}],
+        )
+    )
+    assert not partial.assigned
+    assert partial.reason == "partial_game"
+
+
+def test_uncertain_append_and_rollback_fail_stops_before_play(
+    tmp_path, monkeypatch
+):
+    loaded, _ = _write_plan(tmp_path)
+    assigner = CanaryAssigner(loaded, "test_a", clock=lambda: 150)
+    monkeypatch.setattr(
+        canary_assignment_module.os,
+        "fsync",
+        lambda _descriptor: (_ for _ in ()).throw(OSError("always fails")),
+    )
+
+    with pytest.raises(ReceiptPersistenceUncertain):
+        assigner.assignment_for(
+            _turn(bargaining_game(), game_id="uncertain-write")
+        )
+    with pytest.raises(ReceiptPersistenceUncertain):
+        assigner.assignment_for(
+            _turn(bargaining_game(), game_id="uncertain-write")
+        )
+
+
 def test_truncated_receipt_tail_is_ignored_but_conflicts_fail_closed(tmp_path):
     loaded, _ = _write_plan(tmp_path)
     initial = CanaryAssigner(loaded, "test_a", clock=lambda: 150)
@@ -392,7 +498,8 @@ def test_truncated_receipt_tail_is_ignored_but_conflicts_fail_closed(tmp_path):
 
     with receipt.open("ab") as handle:
         handle.write(b'{"interrupted":')
-    recovered = CanaryAssigner(loaded, "test_a", clock=lambda: 150).assignment_for(
+    restarted = CanaryAssigner(loaded, "test_a", clock=lambda: 150)
+    recovered = restarted.assignment_for(
         _turn(
             bargaining_game(),
             game_id="receipt-integrity",
@@ -403,6 +510,21 @@ def test_truncated_receipt_tail_is_ignored_but_conflicts_fail_closed(tmp_path):
     assert recovered.assigned
     assert recovered.arm == enrolled.arm
     assert recovered.enrollment == "recovered"
+    assert receipt.read_bytes().endswith(b"\n")
+
+    newly_enrolled = restarted.assignment_for(
+        _turn(bargaining_game(), game_id="after-truncated-tail")
+    )
+    assert newly_enrolled.assigned
+    second_restart = CanaryAssigner(loaded, "test_a", clock=lambda: 150)
+    assert second_restart.assignment_for(
+        _turn(
+            bargaining_game(),
+            game_id="after-truncated-tail",
+            round_=2,
+            history=[{"round": 1}],
+        )
+    ).assignment_sha256 == newly_enrolled.assignment_sha256
 
     conflict = json.loads(valid_line)
     conflict["enrolled_at"] += 1
@@ -436,6 +558,53 @@ def test_oversized_receipt_store_and_paths_fail_closed(
     assert ".." not in bounded.parts
 
 
+def test_receipt_parent_symlink_and_recursive_json_fail_closed(
+    tmp_path, monkeypatch
+):
+    loaded, _ = _write_plan(tmp_path)
+    outside = tmp_path / "outside-receipts"
+    outside.mkdir()
+    receipt_root = tmp_path / "logs/canary-assignments"
+    receipt_root.parent.mkdir(parents=True)
+    receipt_root.symlink_to(outside, target_is_directory=True)
+
+    escaped = CanaryAssigner(loaded, "test_a", clock=lambda: 150)
+    assignment = escaped.assignment_for(
+        _turn(bargaining_game(), game_id="symlink-escape")
+    )
+    assert not assignment.assigned
+    assert assignment.reason == "receipt_store_invalid"
+    assert list(outside.rglob("*")) == []
+
+    receipt_root.unlink()
+    receipt = tmp_path / receipt_relative_path("test_a", loaded.artifact_sha256)
+    receipt.parent.mkdir(parents=True)
+    receipt.write_text("{}\n")
+    monkeypatch.setattr(
+        canary_assignment_module.json,
+        "loads",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RecursionError()),
+    )
+    recursive = CanaryAssigner(loaded, "test_a", clock=lambda: 150)
+    assert recursive.assignment_for(
+        _turn(bargaining_game(), game_id="recursive-json")
+    ).reason == "receipt_store_invalid"
+
+
+def test_runtime_manifest_failure_disables_only_valid_plan(tmp_path):
+    valid, _ = _write_plan(tmp_path)
+    disabled = require_runtime_manifest(valid, False)
+
+    assert disabled.status == "invalid"
+    assert disabled.plan is None
+    assert disabled.error_code == "runtime_manifest_unavailable"
+    assert disabled.artifact_sha256 == valid.artifact_sha256
+    assert require_runtime_manifest(valid, True) is valid
+
+    missing = load_assignment_plan(project_root=tmp_path / "missing-project")
+    assert require_runtime_manifest(missing, False) is missing
+
+
 @pytest.mark.parametrize(
     ("family", "game", "knob"),
     [
@@ -461,7 +630,9 @@ def test_dispatcher_applies_family_override_and_logs_assignment(
 
     monkeypatch.setitem(dispatcher.FAMILIES, family, decide)
     monkeypatch.setattr(
-        dispatcher, "log_turn", lambda *args, **kwargs: logged.append((args, kwargs))
+        dispatcher,
+        "log_turn",
+        lambda *args, **kwargs: (logged.append((args, kwargs)) or True),
     )
     base = replace(
         Knobs(llm_enabled=False),
@@ -485,6 +656,34 @@ def test_dispatcher_applies_family_override_and_logs_assignment(
     assert captured_knobs[0] == captured_knobs[1]
     for other in {"barg_dis_anchor", "neg_terminal_close", "pers_blind_lie"} - {knob}:
         assert getattr(captured_knobs[0], other) == getattr(base, other)
+
+
+def test_dispatcher_withholds_assigned_move_when_turn_audit_fails(
+    tmp_path, monkeypatch
+):
+    loaded, _ = _write_plan(tmp_path)
+    monkeypatch.setitem(
+        dispatcher.FAMILIES,
+        "bargaining",
+        lambda _view, _knobs: {"alice_gain": 500, "bob_gain": 500},
+    )
+    monkeypatch.setattr(dispatcher, "log_turn", lambda *_args, **_kwargs: False)
+    strategy = dispatcher.build_strategy(
+        SimpleNamespace(knobs=Knobs(llm_enabled=False), agent_label="test_a"),
+        canary_assignment=loaded,
+    )
+
+    with pytest.raises(dispatcher.CanaryTelemetryUnavailable):
+        strategy(bargaining_game())
+
+    # The receipt was committed before the withheld move.  A retry/restart
+    # therefore recovers the same arm instead of silently falling to base.
+    recovered = CanaryAssigner(loaded, "test_a", clock=lambda: 5_000_000_000)
+    assignment = recovered.assignment_for(
+        _turn(bargaining_game(), round_=2, history=[{"round": 1}])
+    )
+    assert assignment.assigned
+    assert assignment.enrollment == "recovered"
 
 
 def test_runtime_manifest_pins_artifact_and_parsed_contract(tmp_path, monkeypatch):

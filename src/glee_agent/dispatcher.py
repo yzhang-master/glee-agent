@@ -1,8 +1,10 @@
 """The strategy entrypoint handed to GleeClient.run().
 
-Pipeline per turn: parse -> family strategy -> guard -> log -> return.
-The whole pipeline is wrapped so it can never raise and never exceed the
-turn budget by much (family strategies are pure computation, microseconds).
+Pipeline per turn: parse -> assignment -> family strategy -> guard -> log ->
+return.  Ordinary strategy failures are wrapped and guarded.  An assigned
+canary move is intentionally withheld (by raising) only when its write-ahead
+receipt is indeterminate or its turn audit cannot be written; returning the
+base policy in either case could switch experiment arms mid-game.
 """
 
 from __future__ import annotations
@@ -19,6 +21,11 @@ from .logging_ import log_turn
 from .schema import parse_game
 
 logger = logging.getLogger("glee_agent")
+
+
+class CanaryTelemetryUnavailable(RuntimeError):
+    """An assigned canary move is withheld when its turn audit cannot land."""
+
 
 FAMILIES = {
     "bargaining": bargaining.decide,
@@ -68,7 +75,7 @@ def build_strategy(
             )
 
         elapsed = time.monotonic() - start
-        log_turn(
+        logged = log_turn(
             settings.agent_label,
             game,
             action,
@@ -77,6 +84,10 @@ def build_strategy(
             error=error,
             canary_assignment=assignment.log_metadata(),
         )
+        if assignment.assigned and not logged:
+            raise CanaryTelemetryUnavailable(
+                f"canary assignment telemetry unavailable for game {view.game_id!r}"
+            )
         return action
 
     return strategy

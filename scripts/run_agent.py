@@ -17,7 +17,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 from glee_sdk import GleeClient  # noqa: E402
 
-from glee_agent.canary_assignment import load_assignment_plan  # noqa: E402
+from glee_agent.canary_assignment import (  # noqa: E402
+    load_assignment_plan,
+    require_runtime_manifest,
+)
 from glee_agent.capture import (  # noqa: E402
     LoggingGleeClient,
     start_leaderboard_thread,
@@ -80,10 +83,13 @@ def main() -> None:
     settings = load_settings(args.agent)
     _lock = acquire_instance_lock(settings.agent_label)  # noqa: F841 — held for process lifetime
     canary_assignment = load_assignment_plan()
-    append_runtime_manifest(
+    manifest_persisted = append_runtime_manifest(
         settings.agent_label,
         settings.knobs,
         canary_assignment=canary_assignment,
+    )
+    canary_assignment = require_runtime_manifest(
+        canary_assignment, manifest_persisted
     )
     concurrency = args.concurrency or settings.concurrency
     families = args.families.split(",") if args.families else None

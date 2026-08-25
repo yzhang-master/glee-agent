@@ -135,10 +135,10 @@ def append_runtime_manifest(
     *,
     project_root: Path = PROJECT_ROOT,
     canary_assignment: LoadedAssignmentPlan | None = None,
-) -> None:
+) -> bool:
     """Build and append one startup manifest; never interfere with play."""
     try:
-        log_runtime(
+        return log_runtime(
             agent_label,
             build_runtime_manifest(
                 agent_label,
@@ -148,4 +148,4 @@ def append_runtime_manifest(
             ),
         )
     except Exception:  # noqa: BLE001 - runtime provenance is strictly fail-open
-        pass
+        return False

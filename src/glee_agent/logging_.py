@@ -8,6 +8,7 @@ exceptions because observability must never raise into the game loop.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from datetime import datetime, timezone
@@ -31,7 +32,7 @@ def log_turn(
     move_result: dict | None = None,
     error: str | None = None,
     canary_assignment: dict | None = None,
-) -> None:
+) -> bool:
     try:
         LOG_DIR.mkdir(exist_ok=True)
         day = datetime.now(timezone.utc).strftime("%Y%m%d")
@@ -52,11 +53,12 @@ def log_turn(
         line = json.dumps(record, ensure_ascii=False, default=str)
         with _lock, path.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
+        return True
     except Exception:  # noqa: BLE001 — logging must never break play
-        pass
+        return False
 
 
-def _append(prefix: str, record: dict) -> None:
+def _append(prefix: str, record: dict, *, durable: bool = False) -> bool:
     """Append one JSON record to logs/<prefix>-<YYYYMMDD>.jsonl. Never raises."""
     try:
         LOG_DIR.mkdir(exist_ok=True)
@@ -65,8 +67,21 @@ def _append(prefix: str, record: dict) -> None:
         line = json.dumps(record, ensure_ascii=False, default=str)
         with _telemetry_lock, path.open("a", encoding="utf-8") as f:
             f.write(line + "\n")
+            if durable:
+                f.flush()
+                os.fsync(f.fileno())
+        if durable:
+            flags = os.O_RDONLY
+            if hasattr(os, "O_DIRECTORY"):
+                flags |= os.O_DIRECTORY
+            directory = os.open(LOG_DIR, flags)
+            try:
+                os.fsync(directory)
+            finally:
+                os.close(directory)
+        return True
     except Exception:  # noqa: BLE001 — logging must never break play
-        pass
+        return False
 
 
 def log_result(
@@ -97,7 +112,7 @@ def log_result(
         pass
 
 
-def log_runtime(agent_label: str, manifest: dict) -> None:
+def log_runtime(agent_label: str, manifest: dict) -> bool:
     """Append one startup policy manifest as a ``type=runtime`` record."""
     try:
         body = manifest if isinstance(manifest, dict) else {}
@@ -109,9 +124,9 @@ def log_runtime(agent_label: str, manifest: dict) -> None:
             "ts": time.time(),
             "agent": agent_label,
         }
-        _append(agent_label, record)
+        return _append(agent_label, record, durable=True)
     except Exception:  # noqa: BLE001 — logging must never break play
-        pass
+        return False
 
 
 def log_snapshot(agent_label: str, stats: dict) -> None:
