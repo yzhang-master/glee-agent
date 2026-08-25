@@ -1,0 +1,36 @@
+{
+  "schema_version": 1,
+  "plan_id": "confirmation-v2-20260825-2100z",
+  "assignment_salt": "730f45c9167e0c39136c20b30dcbdda3",
+  "activated_at": 1787691600,
+  "expires_at": 1787950800,
+  "agents": [
+    "main",
+    "test_a",
+    "test_b",
+    "test_c"
+  ],
+  "rules": {
+    "bargaining": {
+      "rule_id": "barg-anchor-confirm-v2",
+      "knob": "barg_dis_anchor",
+      "control": 0.58,
+      "treatment": 0.5,
+      "treatment_probability": 0.25
+    },
+    "negotiation": {
+      "rule_id": "neg-terminal-confirm-v2",
+      "knob": "neg_terminal_close",
+      "control": false,
+      "treatment": true,
+      "treatment_probability": 0.5
+    },
+    "persuasion": {
+      "rule_id": "pers-blind-confirm-v2",
+      "knob": "pers_blind_lie",
+      "control": 1.0,
+      "treatment": 0.4,
+      "treatment_probability": 0.5
+    }
+  }
+}
