@@ -7,6 +7,7 @@ logger to pick up. Strategies read ONLY from these views.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -14,14 +15,15 @@ from typing import Any
 def _num(value: Any, default: float | None = None) -> float | None:
     if isinstance(value, bool):
         return default
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        cleaned = value.replace("$", "").replace(",", "").strip()
+    if isinstance(value, (int, float, str)):
+        candidate = value
+        if isinstance(value, str):
+            candidate = value.replace("$", "").replace(",", "").strip()
         try:
-            return float(cleaned)
-        except ValueError:
+            number = float(candidate)
+        except (TypeError, ValueError, OverflowError):
             return default
+        return number if math.isfinite(number) else default
     return default
 
 

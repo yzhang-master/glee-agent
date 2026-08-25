@@ -3,7 +3,9 @@ Includes a deterministic fuzz over mutated/garbage game dicts."""
 
 import copy
 import json
+import math
 import random
+from types import SimpleNamespace
 
 from fixtures import (
     bargaining_decision,
@@ -13,6 +15,8 @@ from fixtures import (
     persuasion_game,
 )
 
+from glee_agent.config import Knobs
+from glee_agent.dispatcher import build_strategy
 from glee_agent.guard import MAX_MESSAGE, fallback_action, guard
 from glee_agent.schema import parse_game
 
@@ -35,7 +39,7 @@ def check_valid(action: dict, game: dict) -> None:
         a, b = action.get("alice_gain"), action.get("bob_gain")
         assert isinstance(a, (int, float)) and isinstance(b, (int, float))
         assert a >= 0 and b >= 0
-        if isinstance(pot, (int, float)) and pot > 0:
+        if isinstance(pot, (int, float)) and math.isfinite(pot) and pot > 0:
             assert abs((a + b) - pot) < 1e-6, f"gains {a}+{b} != pot {pot}"
     elif atype == "offer" and family == "negotiation":
         assert isinstance(action.get("product_price"), (int, float))
@@ -128,6 +132,48 @@ class TestGuardBasics:
 
 
 class TestGuardFuzz:
+    def test_dispatcher_handles_nonfinite_game_numbers(self, monkeypatch):
+        monkeypatch.setattr("glee_agent.dispatcher.log_turn", lambda *args, **kwargs: None)
+        strategy = build_strategy(
+            SimpleNamespace(knobs=Knobs(llm_enabled=False), agent_label="test")
+        )
+        cases = [
+            (
+                bargaining_game,
+                ["round", "max_rounds", "money_to_divide", "delta_1", "delta_2"],
+            ),
+            (
+                negotiation_game,
+                ["round", "max_rounds", "player_1_value", "player_2_value"],
+            ),
+            (
+                lambda: persuasion_game(actor="buyer"),
+                [
+                    "round",
+                    "max_rounds",
+                    "product_price",
+                    "p",
+                    "v",
+                    "u",
+                    "total_rounds",
+                    "buyer_total_payoff",
+                ],
+            ),
+        ]
+
+        for raw in (float("nan"), float("inf"), float("-inf"), "nan", "inf", "-inf"):
+            for factory, fields in cases:
+                game = factory()
+                game["game_state"].update({field: raw for field in fields})
+
+                action = strategy(game)
+
+                check_valid(action, game)
+                json.dumps(action, allow_nan=False)
+                for value in action.values():
+                    if isinstance(value, float):
+                        assert math.isfinite(value)
+
     def test_garbage_actions_never_raise(self):
         garbage = [
             None, 42, "accept", [], {}, {"decision": None}, {"decision": 7},
