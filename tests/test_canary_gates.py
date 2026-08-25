@@ -13,8 +13,10 @@ def _agent(*, route_miss=0, errors=0, http_503=0, invalid=0):
     checked = 10
     return {
         "health": {
+            "turns": 100,
             "turn_errors": errors,
             "corrections": 0,
+            "result_events": 100,
             "result_errors": 0,
             "invalid_results": invalid,
             "http_503": http_503,
@@ -54,6 +56,7 @@ def _barg_arm(n, mean, conversions, finite_n, unlimited_n):
     return {
         "affected_games": n,
         "resolved": n,
+        "censored": 0,
         "mean_normalized_payoff": mean,
         "direct_resolved": n,
         "direct_converted": finite_conversions + unlimited_conversions,
@@ -78,6 +81,10 @@ def _barg_experiment():
     return {
         "name": "barg_dis_anchor",
         "family": "bargaining",
+        "assignment": {
+            "treatment_agents": ["test_b"],
+            "control_agents": ["main"],
+        },
         "agents": {"test_b": _agent(), "main": _agent()},
         "metrics": {
             "treatment": _barg_arm(300, 0.60, (60, 60), 150, 150),
@@ -104,7 +111,9 @@ def _pers_arm(n, revenue, zero_sales):
         }
         p_strata[p] = {"resolved": n // 2}
     return {
+        "blind_seller_games": n,
         "resolved": n,
+        "censored": 0,
         "mean_revenue_share": revenue,
         "zero_sales": zero_sales,
         "p_strata": p_strata,
@@ -118,6 +127,10 @@ def _pers_experiment():
     return {
         "name": "pers_blind_lie",
         "family": "persuasion",
+        "assignment": {
+            "treatment_agents": ["test_a"],
+            "control_agents": ["main"],
+        },
         "agents": {"test_a": _agent(), "main": _agent()},
         "metrics": {
             "treatment": _pers_arm(1000, 0.60, 100),
@@ -200,6 +213,24 @@ def test_persuasion_promotes_with_standardized_lift_and_zero_sale_safety():
         for pair in gate["p_strata_checks"].values()
         for check in pair.values()
     )
+    assert "start_block_15m" not in revenue["support"]["dimensions"]
+
+
+def test_persuasion_time_blocks_do_not_fragment_configuration_support():
+    experiment = _pers_experiment()
+    for cell in experiment["metrics"]["control"]["cells"].values():
+        cell["cell"]["start_block_15m"] = 99
+
+    gate = evaluate_gate(experiment)
+
+    assert gate is not None
+    assert gate["decision"] == "promote"
+    support = gate["statistics"]["standardized_revenue"]["support"]
+    assert support["common_groups"] == 2
+    assert support["treatment_common_fraction"] == 1
+    assert support["control_common_fraction"] == 1
+    temporal = gate["statistics"]["temporal_support_diagnostic"]
+    assert temporal["common_groups"] == 0
 
 
 def test_persuasion_waits_for_each_arm_in_every_observed_p_stratum():
@@ -223,6 +254,116 @@ def test_persuasion_zero_sale_upper_bound_can_block_promotion():
     assert gate is not None
     assert gate["decision"] == "continue"
     assert not gate["statistics"]["zero_sale_noninferiority"]["check"]["passed"]
+
+
+def _barg_cell(role, horizon, phase, maximum, resolved, mean):
+    return {
+        "cell": {
+            "role": role,
+            "horizon": horizon,
+            "phase": phase,
+            "max_rounds": maximum,
+        },
+        "resolved": resolved,
+        "mean_normalized_payoff": mean,
+    }
+
+
+def test_bargaining_tiny_favorable_common_support_cannot_promote():
+    experiment = _barg_experiment()
+    experiment["metrics"]["treatment"]["cells"] = {
+        "common": _barg_cell("player_1", "finite", "offer", "6", 30, 0.9),
+        "t-only": _barg_cell(
+            "player_2", "unlimited", "offer", "unlimited", 270, 0.9
+        ),
+    }
+    experiment["metrics"]["control"]["cells"] = {
+        "common": _barg_cell("player_1", "finite", "offer", "6", 90, 0.1),
+        "c-only": _barg_cell(
+            "player_1", "unlimited", "decision", "unlimited", 810, 0.1
+        ),
+    }
+
+    gate = evaluate_gate(experiment)
+
+    assert gate is not None
+    standardized = gate["statistics"]["standardized_payoff"]
+    assert standardized["difference"] == pytest.approx(0.8)
+    assert standardized["lower_95_one_sided"] > 0
+    assert gate["decision"] == "continue"
+    assert not gate["statistics"]["support_checks"][
+        "treatment_common_coverage"
+    ]["passed"]
+    assert not gate["statistics"]["support_checks"][
+        "control_common_coverage"
+    ]["passed"]
+
+
+def test_persuasion_tiny_favorable_common_support_cannot_promote():
+    experiment = _pers_experiment()
+    base = {
+        "p": 0.25,
+        "price": 100.0,
+        "total_rounds": 10,
+        "opponent_type": "hidden",
+        "start_block_15m": 0,
+    }
+    experiment["metrics"]["treatment"]["cells"] = {
+        "common": {
+            "cell": {**base, "message_type": "common"},
+            "resolved": 100,
+            "mean_revenue_share": 0.9,
+        },
+        "t-only": {
+            "cell": {**base, "message_type": "treatment-only"},
+            "resolved": 900,
+            "mean_revenue_share": 0.9,
+        },
+    }
+    experiment["metrics"]["control"]["cells"] = {
+        "common": {
+            "cell": {**base, "message_type": "common"},
+            "resolved": 100,
+            "mean_revenue_share": 0.1,
+        },
+        "c-only": {
+            "cell": {**base, "message_type": "control-only"},
+            "resolved": 900,
+            "mean_revenue_share": 0.1,
+        },
+    }
+
+    gate = evaluate_gate(experiment)
+
+    assert gate is not None
+    standardized = gate["statistics"]["standardized_revenue"]
+    assert standardized["difference"] == pytest.approx(0.8)
+    assert standardized["lower_95_one_sided"] > 0
+    assert gate["decision"] == "continue"
+    assert not all(
+        check["passed"]
+        for check in gate["statistics"]["support_checks"].values()
+    )
+
+
+def test_arm_censor_and_error_excess_guardrails_are_explicit():
+    censor = _pers_experiment()
+    censor["metrics"]["treatment"]["censored"] = 100
+    gate = evaluate_gate(censor)
+    assert gate is not None
+    censor_gate = gate["arm_rate_guardrails"]["censoring"]
+    assert censor_gate["treatment"]["rate"] == pytest.approx(100 / 1100)
+    assert not censor_gate["check"]["passed"]
+    assert gate["decision"] == "continue"
+
+    error = _pers_experiment()
+    error["agents"]["test_a"] = _agent(errors=3)
+    gate = evaluate_gate(error)
+    assert gate is not None
+    error_gate = gate["arm_rate_guardrails"]["errors"]
+    assert error_gate["treatment"]["rate_upper_bound"] == pytest.approx(3 / 200)
+    assert error_gate["control"]["rate_upper_bound"] == 0
+    assert not error_gate["check"]["passed"]
 
 
 def test_report_evaluation_is_deterministic_and_does_not_mutate_raw_report():

@@ -201,8 +201,13 @@ def _standardized_difference(
     tg = _aggregate_cells(treatment, fields)
     cg = _aggregate_cells(control, fields)
     common = sorted(set(tg) & set(cg), key=repr)
-    total_t = sum(int(group["resolved"]) for group in tg.values())
-    total_c = sum(int(group["resolved"]) for group in cg.values())
+    grouped_t = sum(int(group["resolved"]) for group in tg.values())
+    grouped_c = sum(int(group["resolved"]) for group in cg.values())
+    # An invalid or unkeyed row must not disappear and make common support
+    # look better than it is.  Fall back only for old synthetic inputs that do
+    # not carry the arm-level resolved count.
+    total_t = max(_count(treatment.get("resolved")), grouped_t)
+    total_c = max(_count(control.get("resolved")), grouped_c)
     common_t = sum(int(tg[key]["resolved"]) for key in common)
     common_c = sum(int(cg[key]["resolved"]) for key in common)
     pooled = common_t + common_c
@@ -214,6 +219,8 @@ def _standardized_difference(
         "common_groups": len(common),
         "treatment_resolved": total_t,
         "control_resolved": total_c,
+        "treatment_grouped_resolved": grouped_t,
+        "control_grouped_resolved": grouped_c,
         "treatment_common_resolved": common_t,
         "control_common_resolved": common_c,
         "treatment_common_fraction": common_t / total_t if total_t else None,
@@ -273,6 +280,98 @@ def _standardized_difference(
         "method": "pooled_common_support_bounded_normal",
         "support": support,
         "cells": cells,
+    }
+
+
+def _arm_rate_guardrails(experiment: Mapping[str, Any]) -> dict:
+    """Compare treatment/control censor and logged-error event rates.
+
+    Censoring is exact in the arm outcome metrics.  The health schema does not
+    retain event IDs, so ``result_errors`` and ``invalid_results`` can overlap;
+    summing them is a conservative upper bound on the error-event count.
+    """
+    metrics = experiment.get("metrics", {})
+    metrics = metrics if isinstance(metrics, Mapping) else {}
+
+    censor: dict[str, dict] = {}
+    for arm in ("treatment", "control"):
+        metric = metrics.get(arm, {})
+        metric = metric if isinstance(metric, Mapping) else {}
+        censored = _count(metric.get("censored"))
+        observed = _count(metric.get("resolved")) + censored
+        censor[arm] = {
+            "censored": censored,
+            "observed": observed,
+            "rate": censored / observed if observed else None,
+        }
+    censor_excess = (
+        censor["treatment"]["rate"] - censor["control"]["rate"]
+        if censor["treatment"]["rate"] is not None
+        and censor["control"]["rate"] is not None
+        else None
+    )
+
+    assignment = experiment.get("assignment", {})
+    assignment = assignment if isinstance(assignment, Mapping) else {}
+    agents = experiment.get("agents", {})
+    agents = agents if isinstance(agents, Mapping) else {}
+    errors: dict[str, dict] = {}
+    for arm in ("treatment", "control"):
+        labels = assignment.get(f"{arm}_agents", [])
+        labels = labels if isinstance(labels, (list, tuple)) else []
+        events = 0
+        failures = 0
+        for label in labels:
+            agent = agents.get(label, {})
+            agent = agent if isinstance(agent, Mapping) else {}
+            health = agent.get("health", {})
+            health = health if isinstance(health, Mapping) else {}
+            turns = _count(health.get("turns"))
+            results = _count(health.get("result_events"))
+            events += turns + results
+            failures += _count(health.get("turn_errors"))
+            # This sum is intentionally an upper bound because an invalid
+            # result can also have a persisted error string.
+            failures += _count(health.get("result_errors"))
+            failures += _count(health.get("invalid_results"))
+        failures = min(failures, events) if events else failures
+        errors[arm] = {
+            "failures_upper_bound": failures,
+            "events": events,
+            "rate_upper_bound": failures / events if events else None,
+        }
+    error_excess = (
+        errors["treatment"]["rate_upper_bound"]
+        - errors["control"]["rate_upper_bound"]
+        if errors["treatment"]["rate_upper_bound"] is not None
+        and errors["control"]["rate_upper_bound"] is not None
+        else None
+    )
+    return {
+        "censoring": {
+            **censor,
+            "treatment_excess": censor_excess,
+            "check": _check(censor_excess, "<=", 0.03),
+        },
+        "errors": {
+            **errors,
+            "treatment_excess_upper_bound": error_excess,
+            "check": _check(error_excess, "<=", 0.01),
+            "method": "logged_event_union_upper_bound",
+        },
+    }
+
+
+def _support_checks(standardized: Mapping[str, Any]) -> dict:
+    support = standardized.get("support", {})
+    support = support if isinstance(support, Mapping) else {}
+    return {
+        "treatment_common_coverage": _check(
+            support.get("treatment_common_fraction"), ">=", 0.90
+        ),
+        "control_common_coverage": _check(
+            support.get("control_common_fraction"), ">=", 0.90
+        ),
     }
 
 
@@ -366,6 +465,7 @@ def _bargaining_gate(experiment: Mapping[str, Any]) -> dict:
     treatment = treatment if isinstance(treatment, Mapping) else {}
     control = control if isinstance(control, Mapping) else {}
     guardrails = _health_guardrails(experiment)
+    arm_rates = _arm_rate_guardrails(experiment)
 
     sample_checks = {
         "treatment_affected": _check(treatment.get("affected_games"), ">=", 300),
@@ -421,6 +521,7 @@ def _bargaining_gate(experiment: Mapping[str, Any]) -> dict:
             standardized.get("lower_95_one_sided"), ">", 0.0
         ),
     }
+    support_checks = _support_checks(standardized)
     affected_unstandardized = _difference_summary(
         treatment.get("mean_normalized_payoff"),
         treatment.get("resolved"),
@@ -457,6 +558,9 @@ def _bargaining_gate(experiment: Mapping[str, Any]) -> dict:
         )
         and all(item["passed"] for item in conversion.values())
         and all(check["passed"] for check in payoff_checks.values())
+        and all(check["passed"] for check in support_checks.values())
+        and arm_rates["censoring"]["check"]["passed"]
+        and arm_rates["errors"]["check"]["passed"]
         and standardized["available"]
         and guardrails["passed"]
     )
@@ -477,12 +581,14 @@ def _bargaining_gate(experiment: Mapping[str, Any]) -> dict:
         "promotion_ready": promotion_ready,
         "rollback_triggers": rollback_triggers,
         "guardrails": guardrails,
+        "arm_rate_guardrails": arm_rates,
         "sample_checks": sample_checks,
         "horizon_checks": horizon_metrics,
         "statistics": {
             "direct_conversion": conversion,
             "standardized_payoff": standardized,
             "payoff_checks": payoff_checks,
+            "support_checks": support_checks,
             # This is useful but is not true all-enrolled ITT: the current raw
             # bargaining metric contains only games with an exact divergence.
             "affected_unstandardized_payoff": affected_unstandardized,
@@ -496,7 +602,7 @@ def _bargaining_gate(experiment: Mapping[str, Any]) -> dict:
         },
         "notes": [
             "finite and unlimited minimums are required in both arms",
-            "cell support is diagnostic; no favorable coverage threshold was invented",
+            "at least 90% of resolved observations in each arm must be on common support",
         ],
     }
 
@@ -509,6 +615,7 @@ def _persuasion_gate(experiment: Mapping[str, Any]) -> dict:
     treatment = treatment if isinstance(treatment, Mapping) else {}
     control = control if isinstance(control, Mapping) else {}
     guardrails = _health_guardrails(experiment)
+    arm_rates = _arm_rate_guardrails(experiment)
 
     sample_checks = {
         "treatment_completed": _check(treatment.get("resolved"), ">=", 1000),
@@ -539,7 +646,6 @@ def _persuasion_gate(experiment: Mapping[str, Any]) -> dict:
             "price",
             "total_rounds",
             "opponent_type",
-            "start_block_15m",
         ),
     )
     revenue_checks = {
@@ -548,6 +654,19 @@ def _persuasion_gate(experiment: Mapping[str, Any]) -> dict:
             standardized.get("lower_95_one_sided"), ">", 0.0
         ),
     }
+    support_checks = _support_checks(standardized)
+    temporal = _standardized_difference(
+        treatment,
+        control,
+        (
+            "p",
+            "message_type",
+            "price",
+            "total_rounds",
+            "opponent_type",
+            "start_block_15m",
+        ),
+    )
 
     t_zero = _binomial_summary(
         treatment.get("zero_sales"), treatment.get("resolved")
@@ -586,7 +705,10 @@ def _persuasion_gate(experiment: Mapping[str, Any]) -> dict:
         and p_ready
         and standardized["available"]
         and all(check["passed"] for check in revenue_checks.values())
+        and all(check["passed"] for check in support_checks.values())
         and zero_sale["check"]["passed"]
+        and arm_rates["censoring"]["check"]["passed"]
+        and arm_rates["errors"]["check"]["passed"]
         and guardrails["passed"]
     )
 
@@ -610,17 +732,21 @@ def _persuasion_gate(experiment: Mapping[str, Any]) -> dict:
         "promotion_ready": promotion_ready,
         "rollback_triggers": rollback_triggers,
         "guardrails": guardrails,
+        "arm_rate_guardrails": arm_rates,
         "sample_checks": sample_checks,
         "p_strata_checks": p_checks,
         "statistics": {
             "standardized_revenue": standardized,
             "revenue_checks": revenue_checks,
+            "support_checks": support_checks,
+            "temporal_support_diagnostic": temporal["support"],
             "zero_sale_noninferiority": zero_sale,
             "itt_revenue": {"available": itt_revenue["available"], **itt_revenue},
         },
         "notes": [
             "150 completed games are required in each arm for every observed p stratum",
-            "cell support is diagnostic; no favorable coverage threshold was invented",
+            "time blocks are diagnostics, not configuration-standardization dimensions",
+            "at least 90% of resolved observations in each arm must be on common support",
             "no efficacy rollback boundary was frozen for persuasion",
         ],
     }
