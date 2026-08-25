@@ -107,6 +107,42 @@ def config_key_bargaining(state: dict) -> str | None:
         return None
 
 
+def config_key_bargaining_marginal(state: dict, role: str) -> str | None:
+    """Visible-information key for incomplete-information bargaining.
+
+    The live player sees its own discount factor but not its opponent's.  An
+    exact config key is therefore intentionally unbuildable for these games;
+    this key marginalizes only that hidden opponent factor.  It is kept
+    separate from :func:`config_key_bargaining` so live strategy code cannot
+    start consuming the coarser pool accidentally.
+    """
+    try:
+        if role not in ("player_1", "player_2"):
+            return None
+        if bool(state.get("complete_information", False)):
+            return None
+        money = _num(state.get("money_to_divide"))
+        my_delta = _num(state.get("delta_1" if role == "player_1" else "delta_2"))
+        if money is None or my_delta is None:
+            return None
+        max_rounds = _int_or_none(state.get("max_rounds"))
+        if max_rounds is None:
+            max_rounds, horizon_known = 99, True
+        else:
+            horizon_known = bool(state.get("horizon_known", True))
+        return _dumps({
+            "role": role,
+            "money_to_divide": money,
+            "my_delta": my_delta,
+            "max_rounds": max_rounds,
+            "horizon_known": horizon_known,
+            "messages_allowed": bool(state.get("messages_allowed", True)),
+            "complete_information": False,
+        })
+    except Exception:  # noqa: BLE001
+        return None
+
+
 def config_key_negotiation(
     state: dict, my_role: str, my_value: float | None
 ) -> tuple[str | None, str | None]:
@@ -169,6 +205,38 @@ def config_key_persuasion(state: dict) -> str | None:
             "u": u,
             "total_rounds": total_rounds,
             "seller_message_type": str(state.get("seller_message_type", "text")),
+        })
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def config_key_persuasion_marginal(state: dict, role: str) -> str | None:
+    """Visible-information key for a seller who cannot observe ``v``/``u``.
+
+    Dataset builders still hold the latent values, so ``is_seller_know_cv``
+    is authoritative there.  Stored live seller configs predate that flag;
+    both values being redacted is the equivalent unambiguous signal.  Buyer
+    games never use this marginal.
+    """
+    try:
+        if role != "player_1":
+            return None
+        knows_values = state.get("is_seller_know_cv")
+        values_redacted = _num(state.get("v")) is None and _num(state.get("u")) is None
+        if knows_values is not False and not (knows_values is None and values_redacted):
+            return None
+        price = _num(state.get("product_price"))
+        p = _num(state.get("p"))
+        total_rounds = _int_or_none(state.get("total_rounds"))
+        if price is None or p is None or total_rounds is None:
+            return None
+        return _dumps({
+            "role": role,
+            "product_price": price,
+            "p": p,
+            "total_rounds": total_rounds,
+            "seller_message_type": str(state.get("seller_message_type", "text")),
+            "is_seller_know_cv": False,
         })
     except Exception:  # noqa: BLE001
         return None

@@ -42,10 +42,24 @@ def game_percentile(tg, row) -> float | None:
         config = json.loads(row["config_json"])
         if family == "bargaining":
             key = targets_mod.config_key_bargaining(config)
-            return tg.payoff_percentile(family, key, role, payoff)
+            if key is not None:
+                # A buildable exact key that is absent should remain visible
+                # as target drift; never hide it behind a coarser pool.
+                return tg.payoff_percentile(family, key, role, payoff)
+            key = targets_mod.config_key_bargaining_marginal(config, role)
+            return (
+                tg.payoff_percentile(family, key, role, payoff)
+                if key is not None else None
+            )
         if family == "persuasion":
             key = targets_mod.config_key_persuasion(config)
-            return tg.payoff_percentile(family, key, role, payoff)
+            if key is not None:
+                return tg.payoff_percentile(family, key, role, payoff)
+            key = targets_mod.config_key_persuasion_marginal(config, role)
+            return (
+                tg.payoff_percentile(family, key, role, payoff)
+                if key is not None else None
+            )
         if family == "negotiation":
             my_role = "seller" if role == "player_1" else "buyer"
             my_value = config.get(f"{role}_value")
@@ -121,9 +135,11 @@ def main() -> None:
     total = sum(s["n"] for a in stats.values() for s in a.values())
     scored = sum(s["pct_n"] for a in stats.values() for s in a.values())
     if total:
-        print(f"coverage: {scored}/{total} games matched a dataset config "
-              f"({scored / total * 100:.0f}%) — unmatched games likely have "
-              f"config-key drift; investigate if low.")
+        unscored = total - scored
+        print(f"coverage: {scored}/{total} games matched a payoff target "
+              f"({scored / total * 100:.0f}%); {unscored} unscored "
+              f"(missing payoff/config or no exact/expected-hidden "
+              f"marginal pool).")
 
 
 if __name__ == "__main__":

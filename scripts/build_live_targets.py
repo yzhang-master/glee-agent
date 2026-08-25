@@ -158,6 +158,73 @@ def build_accept_curves(con, neg_state) -> tuple[dict, dict]:
     return barg_out, neg_out
 
 
+def build_payoff_pools(con, neg_state) -> tuple[dict, dict]:
+    """Collect exact and visible-information-marginal live payoff pools.
+
+    Exact keys are shared by both seats, so the opponent payoff remains a
+    useful field sample there.  Marginal keys are role-specific: adding the
+    opponent payoff would assign it to a key built from *our* visible value
+    and contaminate the pool, so those cells receive only ``my_payoff``.
+    """
+    pools: dict[str, dict[str, dict[str, list[float]]]] = {
+        f: defaultdict(lambda: defaultdict(list)) for f in
+        ("bargaining", "negotiation", "persuasion")
+    }
+    n_games = defaultdict(int)
+
+    for r in con.execute(
+        "SELECT game_id, family, your_player, config_json, my_payoff, opp_payoff "
+        "FROM games WHERE config_json IS NOT NULL AND my_payoff IS NOT NULL"
+    ):
+        fam = r["family"]
+        if fam not in pools:
+            continue
+        try:
+            cfg = json.loads(r["config_json"])
+        except Exception:
+            continue
+        role = r["your_player"] or "player_1"
+        entries: list[tuple[str, bool]] = []  # (key, role-specific marginal)
+        if fam == "bargaining":
+            exact = T.config_key_bargaining(cfg)
+            marginal = T.config_key_bargaining_marginal(cfg, role)
+            if exact is not None:
+                entries.append((exact, False))
+            if marginal is not None:
+                entries.append((marginal, True))
+        elif fam == "persuasion":
+            exact = T.config_key_persuasion(cfg)
+            marginal = T.config_key_persuasion_marginal(cfg, role)
+            if exact is not None:
+                entries.append((exact, False))
+            if marginal is not None:
+                entries.append((marginal, True))
+        else:
+            st = neg_state.get(r["game_id"])
+            if st is None:
+                continue
+            my_role = st.get(f"{role}_role") or (
+                "seller" if role == "player_1" else "buyer"
+            )
+            full, rolekey = T.config_key_negotiation(
+                st, my_role, st.get(f"{role}_value")
+            )
+            if full is not None:
+                entries.append((full, False))
+            elif rolekey is not None:
+                entries.append((rolekey, True))
+        if not entries:
+            continue
+
+        n_games[fam] += 1
+        for key, role_specific in entries:
+            pools[fam][key][role].append(float(r["my_payoff"]))
+            if r["opp_payoff"] is not None and not role_specific:
+                pools[fam][key][other(role)].append(float(r["opp_payoff"]))
+
+    return pools, n_games
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--db", default=str(DB))
@@ -180,46 +247,7 @@ def main() -> None:
             continue
     print(f"recovered negotiation state for {len(neg_state)} games", flush=True)
 
-    pools: dict[str, dict[str, dict[str, list[float]]]] = {
-        f: defaultdict(lambda: defaultdict(list)) for f in
-        ("bargaining", "negotiation", "persuasion")
-    }
-    n_games = defaultdict(int)
-
-    for r in con.execute(
-        "SELECT game_id, family, your_player, config_json, my_payoff, opp_payoff "
-        "FROM games WHERE config_json IS NOT NULL AND my_payoff IS NOT NULL"
-    ):
-        fam = r["family"]
-        if fam not in pools:
-            continue
-        try:
-            cfg = json.loads(r["config_json"])
-        except Exception:
-            continue
-        role = r["your_player"] or "player_1"
-        if fam == "bargaining":
-            key = T.config_key_bargaining(cfg)
-        elif fam == "persuasion":
-            key = T.config_key_persuasion(cfg)
-        else:
-            st = neg_state.get(r["game_id"])
-            if st is None:
-                continue
-            my_role = st.get(f"{role}_role") or ("seller" if role == "player_1" else "buyer")
-            full, rolekey = T.config_key_negotiation(st, my_role, st.get(f"{role}_value"))
-            key = full or rolekey
-        if key is None:
-            continue
-        n_games[fam] += 1
-        pools[fam][key][role].append(float(r["my_payoff"]))
-        # The opponent's realized payoff is a FIELD sample for the other seat:
-        # uncontaminated by our own policy, and it doubles the sample size.
-        # (Only valid where both seats share one config key -- for negotiation
-        # the full key already fixes both values, and the role-marginal key
-        # does not, so the opponent sample is skipped there.)
-        if r["opp_payoff"] is not None and not (fam == "negotiation" and key.startswith('{"complete')):
-            pools[fam][key][other(role)].append(float(r["opp_payoff"]))
+    pools, n_games = build_payoff_pools(con, neg_state)
 
     out: dict = {
         "built_from": "live",

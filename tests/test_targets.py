@@ -30,6 +30,11 @@ BARG_KEY = (
     '"horizon_known":true,"max_rounds":10,"messages_allowed":true,'
     '"money_to_divide":1000.0}'
 )
+BARG_MARGINAL_KEY = (
+    '{"complete_information":false,"horizon_known":true,"max_rounds":99,'
+    '"messages_allowed":false,"money_to_divide":1000.0,"my_delta":0.95,'
+    '"role":"player_1"}'
+)
 NEG_ROLE_KEY = (
     '{"complete_information":false,"horizon_known":true,"max_rounds":10,'
     '"messages_allowed":true,"my_value":100.0,"role":"buyer"}'
@@ -41,6 +46,10 @@ NEG_FULL_KEY = (
 PERS_KEY = (
     '{"p":0.5,"product_price":100.0,"seller_message_type":"text",'
     '"total_rounds":20,"u":0.0,"v":120.0}'
+)
+PERS_MARGINAL_KEY = (
+    '{"is_seller_know_cv":false,"p":0.5,"product_price":100.0,'
+    '"role":"player_1","seller_message_type":"text","total_rounds":20}'
 )
 
 
@@ -227,6 +236,30 @@ class TestConfigKeys:
         del state["delta_2"]  # hidden opponent delta -> no key
         assert T.config_key_bargaining(state) is None
 
+    def test_bargaining_marginal_key_is_role_visible_and_canonical(self):
+        dataset_state = {
+            "money_to_divide": "1,000",
+            "delta_1": "0.95",
+            "delta_2": 0.8,
+            "max_rounds": None,
+            "horizon_known": False,
+            "messages_allowed": False,
+            "complete_information": False,
+        }
+        live_state = dict(dataset_state, delta_2=None)
+        assert (
+            T.config_key_bargaining_marginal(dataset_state, "player_1")
+            == BARG_MARGINAL_KEY
+        )
+        assert (
+            T.config_key_bargaining_marginal(live_state, "player_1")
+            == BARG_MARGINAL_KEY
+        )
+        assert T.config_key_bargaining_marginal(live_state, "player_2") is None
+        assert T.config_key_bargaining_marginal(
+            dict(live_state, complete_information=True), "player_1"
+        ) is None
+
     def test_negotiation_keys(self):
         state = parse_game(negotiation_decision(role="buyer")).state
         full, role = T.config_key_negotiation(state, "buyer", 100.0)
@@ -247,6 +280,33 @@ class TestConfigKeys:
         state = parse_game(persuasion_game()).state
         assert T.config_key_persuasion(state) == PERS_KEY
         assert T.config_key_persuasion({}) is None
+
+    def test_persuasion_marginal_key_matches_dataset_and_redacted_live_state(self):
+        common = {
+            "product_price": "$100",
+            "p": "0.5",
+            "total_rounds": 20,
+            "seller_message_type": "text",
+        }
+        dataset_state = dict(
+            common, v=1.2, c=0, is_seller_know_cv=False
+        )
+        live_state = dict(common, v=None, u=None)
+        assert (
+            T.config_key_persuasion_marginal(dataset_state, "player_1")
+            == PERS_MARGINAL_KEY
+        )
+        assert (
+            T.config_key_persuasion_marginal(live_state, "player_1")
+            == PERS_MARGINAL_KEY
+        )
+        assert T.config_key_persuasion_marginal(live_state, "player_2") is None
+        assert T.config_key_persuasion_marginal(
+            dict(common, v=120, u=0), "player_1"
+        ) is None
+        assert T.config_key_persuasion_marginal(
+            dict(live_state, is_seller_know_cv=True), "player_1"
+        ) is None
 
 
 # ------------------------------------------------------------ accept curves

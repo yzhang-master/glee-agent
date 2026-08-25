@@ -25,11 +25,12 @@ def _db() -> sqlite3.Connection:
         """
         CREATE TABLE games (
             game_id TEXT, family TEXT, outcome TEXT, agreed_round INTEGER,
-            config_json TEXT, opp_type TEXT
+            config_json TEXT, opp_type TEXT, your_player TEXT,
+            my_payoff REAL, opp_payoff REAL
         );
         CREATE TABLE turns (
             game_id TEXT, family TEXT, your_player TEXT, round INTEGER,
-            action_json TEXT, action_type TEXT, opp_type TEXT
+            action_json TEXT, action_type TEXT, opp_type TEXT, state_json TEXT
         );
         """
     )
@@ -45,7 +46,9 @@ def _add_game(
     max_rounds: int = 4,
 ) -> None:
     con.execute(
-        "INSERT INTO games VALUES (?, ?, 'agreement', ?, ?, 'agent')",
+        "INSERT INTO games "
+        "(game_id, family, outcome, agreed_round, config_json, opp_type) "
+        "VALUES (?, ?, 'agreement', ?, ?, 'agent')",
         (
             game_id,
             family,
@@ -64,7 +67,9 @@ def _add_turn(
     action: dict,
 ) -> None:
     con.execute(
-        "INSERT INTO turns VALUES (?, ?, 'player_1', ?, ?, ?, 'agent')",
+        "INSERT INTO turns "
+        "(game_id, family, your_player, round, action_json, action_type, opp_type) "
+        "VALUES (?, ?, 'player_1', ?, ?, ?, 'agent')",
         (game_id, family, round_, json.dumps(action), action_type),
     )
 
@@ -165,4 +170,78 @@ def test_negotiation_labels_initial_offer_and_decision_counter(monkeypatch):
     assert neg == {
         _neg_key(0.80, "4+"): [1, 1],
         _neg_key(0.85, "2-3"): [1, 1],
+    }
+
+
+def _add_payoff_game(
+    con: sqlite3.Connection,
+    game_id: str,
+    family: str,
+    role: str,
+    config: dict,
+    my_payoff: float,
+    opp_payoff: float,
+) -> None:
+    con.execute(
+        "INSERT INTO games "
+        "(game_id, family, outcome, config_json, your_player, my_payoff, opp_payoff) "
+        "VALUES (?, ?, 'agreement', ?, ?, ?, ?)",
+        (game_id, family, json.dumps(config), role, my_payoff, opp_payoff),
+    )
+
+
+def test_role_marginal_payoff_pools_never_include_opponent_payoff():
+    con = _db()
+    hidden_barg = {
+        "money_to_divide": 100,
+        "delta_1": 0.9,
+        "delta_2": None,
+        "max_rounds": 12,
+        "horizon_known": True,
+        "messages_allowed": False,
+        "complete_information": False,
+    }
+    blind_seller = {
+        "product_price": 100,
+        "p": 0.5,
+        "v": None,
+        "u": None,
+        "total_rounds": 20,
+        "seller_message_type": "binary",
+    }
+    _add_payoff_game(
+        con, "hidden-barg", "bargaining", "player_1", hidden_barg, 61, 39
+    )
+    _add_payoff_game(
+        con, "blind-seller", "persuasion", "player_1", blind_seller, 700, -200
+    )
+
+    pools, n_games = build_live_targets.build_payoff_pools(con, {})
+
+    barg_key = T.config_key_bargaining_marginal(hidden_barg, "player_1")
+    pers_key = T.config_key_persuasion_marginal(blind_seller, "player_1")
+    assert pools["bargaining"][barg_key] == {"player_1": [61.0]}
+    assert pools["persuasion"][pers_key] == {"player_1": [700.0]}
+    assert n_games == {"bargaining": 1, "persuasion": 1}
+
+
+def test_exact_payoff_pool_keeps_opponent_field_sample():
+    con = _db()
+    config = {
+        "money_to_divide": 100,
+        "delta_1": 0.9,
+        "delta_2": 0.8,
+        "max_rounds": 12,
+        "horizon_known": True,
+        "messages_allowed": True,
+        "complete_information": True,
+    }
+    _add_payoff_game(con, "exact", "bargaining", "player_2", config, 55, 45)
+
+    pools, _ = build_live_targets.build_payoff_pools(con, {})
+
+    exact_key = T.config_key_bargaining(config)
+    assert pools["bargaining"][exact_key] == {
+        "player_2": [55.0],
+        "player_1": [45.0],
     }

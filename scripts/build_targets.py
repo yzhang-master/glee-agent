@@ -14,6 +14,10 @@ import os
 import sys
 from collections import defaultdict
 
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src"))
+
+from glee_agent.theory import targets as T  # noqa: E402
+
 csv.field_size_limit(1 << 30)
 
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "glee_raw", "Data")
@@ -191,6 +195,21 @@ def do_bargaining(cfg_all, ga, rows, agg, human_p1, human_p2, m1, m2):
     rec["deals"] += int(deal)
     rec["p1"].append(p1)
     rec["p2"].append(p2)
+    # In incomplete-information games each seat observes only its own delta.
+    # Emit one role-specific pool per seat, marginalizing the hidden opponent
+    # delta while retaining every other visible config dimension.
+    if not cfg["complete_information"]:
+        for role, payoff, field in (
+            ("player_1", p1, "p1"),
+            ("player_2", p2, "p2"),
+        ):
+            marginal_key = T.config_key_bargaining_marginal(cfg, role)
+            if marginal_key is None:
+                continue
+            marginal = agg.cfg["bargaining"][marginal_key]
+            marginal["n"] += 1
+            marginal["deals"] += int(deal)
+            marginal[field].append(payoff)
     for m in (m1, m2):
         if m is not None:
             agg.models[m]["barg_n"] += 1
@@ -332,6 +351,16 @@ def do_persuasion(cfg_all, ga, rows, agg, human_p1, human_p2, m1, m2):
     rec["p2"].append(round(p2, 6))
     rec["yes"] += yes
     rec["dec"] += dec_n
+    # A blind seller cannot condition on v/u, so its comparison pool must
+    # marginalize those latent values.  Only the seller payoff belongs in the
+    # role-specific pool.
+    marginal_key = T.config_key_persuasion_marginal(ga, "player_1")
+    if marginal_key is not None:
+        marginal = agg.cfg["persuasion"][marginal_key]
+        marginal["n"] += 1
+        marginal["p1"].append(round(p1, 6))
+        marginal["yes"] += yes
+        marginal["dec"] += dec_n
 
 
 HANDLERS = {"bargaining": do_bargaining, "negotiation": do_negotiation,
@@ -402,8 +431,13 @@ def main():
     }
     barg = {}
     for k, r in agg.cfg["bargaining"].items():
+        payoff_q = {}
+        if r["p1"]:
+            payoff_q["player_1"] = quantiles(r["p1"])
+        if r["p2"]:
+            payoff_q["player_2"] = quantiles(r["p2"])
         barg[k] = {"n": r["n"], "deal_rate": round(r["deals"] / r["n"], 4),
-                   "payoff_q": {"player_1": quantiles(r["p1"]), "player_2": quantiles(r["p2"])}}
+                   "payoff_q": payoff_q}
     out["bargaining"] = barg
     neg = {}
     for k, r in agg.cfg["negotiation"].items():
@@ -415,8 +449,13 @@ def main():
                           for k, r in agg.neg_by_role.items()}
     pers = {}
     for k, r in agg.cfg["persuasion"].items():
+        payoff_q = {}
+        if r["p1"]:
+            payoff_q["player_1"] = quantiles(r["p1"])
+        if r["p2"]:
+            payoff_q["player_2"] = quantiles(r["p2"])
         pers[k] = {"n": r["n"],
-                   "payoff_q": {"player_1": quantiles(r["p1"]), "player_2": quantiles(r["p2"])},
+                   "payoff_q": payoff_q,
                    "seller_sell_rate": round(r["yes"] / r["dec"], 4) if r["dec"] else 0.0}
     out["persuasion"] = pers
     out["barg_accept"] = dict(agg.barg_accept)
@@ -448,8 +487,8 @@ def main():
         top = sorted(table.items(), key=lambda kv: -kv[1]["n"])[:3]
         print(f"top {fam} configs:")
         for k, v in top:
-            q = v["payoff_q"]["player_1"]
-            print(f"  n={v['n']} p1_q50={q[9]} p1_q90={q[17]} key={k}")
+            role, q = next(iter(v["payoff_q"].items()))
+            print(f"  n={v['n']} {role}_q50={q[9]} {role}_q90={q[17]} key={k}")
 
 
 if __name__ == "__main__":
