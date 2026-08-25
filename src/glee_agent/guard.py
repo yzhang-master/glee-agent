@@ -83,9 +83,12 @@ def _negotiation_fallback(view: GameView) -> dict:
             if profitable:
                 return {"decision": "AcceptOffer"}
         if n.my_value is not None and not _is_final_round(view):
-            return {"decision": "RejectOffer", "product_price": round(n.my_value, 2)}
+            return {
+                "decision": "RejectOffer",
+                "product_price": round(max(n.my_value, 0.0), 2),
+            }
         return {"decision": "RejectOffer"}
-    value = n.my_value if n.my_value is not None else 100.0
+    value = max(n.my_value, 0.0) if n.my_value is not None else 100.0
     return {"product_price": round(value, 2)}
 
 
@@ -215,13 +218,15 @@ def _guard_negotiation(action: dict, view: GameView, corrections: list[str]) -> 
         out: dict = {"decision": d}
         if d == "RejectOffer":
             counter = _finite(action.get("product_price"))
-            if counter is not None:
-                out["product_price"] = round(max(counter, 0.0), 2)
-            elif not _is_final_round(view):
+            if counter is None and not _is_final_round(view):
                 # Mid-game rejection should carry a counter; use our value.
                 if n.my_value is not None:
-                    out["product_price"] = round(n.my_value, 2)
+                    counter = n.my_value
                     corrections.append("added missing counteroffer at own value")
+            if counter is not None:
+                out["product_price"] = _guard_negotiation_price(
+                    counter, n, corrections, "counteroffer"
+                )
         if "message" in action:
             out["message"] = action["message"]
         return out
@@ -231,11 +236,31 @@ def _guard_negotiation(action: dict, view: GameView, corrections: list[str]) -> 
     if price is None:
         corrections.append("offer price missing/invalid; using own value")
         price = n.my_value if n.my_value is not None else 100.0
-    price = round(max(price, 0.0), 2)
+    price = _guard_negotiation_price(price, n, corrections, "offer")
     out = {"product_price": price}
     if "message" in action:
         out["message"] = action["message"]
     return out
+
+
+def _guard_negotiation_price(
+    price: float, n, corrections: list[str], label: str
+) -> float:
+    """Enforce nonnegative and own-reservation bounds on an emitted price."""
+    cleaned = round(max(price, 0.0), 2)
+    if price < 0:
+        corrections.append(f"clamped negotiation {label} to nonnegative")
+
+    if n.my_value is None:
+        return cleaned
+    reservation = max(n.my_value, 0.0)
+    if n.my_role == "seller" and cleaned < reservation:
+        corrections.append(f"raised seller {label} to own reservation")
+        return reservation
+    if n.my_role == "buyer" and cleaned > reservation:
+        corrections.append(f"lowered buyer {label} to own reservation")
+        return reservation
+    return cleaned
 
 
 def _guard_persuasion(action: dict, view: GameView, corrections: list[str]) -> dict:

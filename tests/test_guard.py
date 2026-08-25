@@ -7,6 +7,8 @@ import math
 import random
 from types import SimpleNamespace
 
+import pytest
+
 from fixtures import (
     bargaining_decision,
     bargaining_game,
@@ -15,10 +17,10 @@ from fixtures import (
     persuasion_game,
 )
 
+import glee_agent.dispatcher as dispatcher
 from glee_agent.config import Knobs
-from glee_agent.dispatcher import build_strategy
 from glee_agent.guard import MAX_MESSAGE, fallback_action, guard
-from glee_agent.schema import parse_game
+from glee_agent.schema import parse_game, parse_negotiation
 
 
 def check_valid(action: dict, game: dict) -> None:
@@ -43,13 +45,30 @@ def check_valid(action: dict, game: dict) -> None:
             assert abs((a + b) - pot) < 1e-6, f"gains {a}+{b} != pot {pot}"
     elif atype == "offer" and family == "negotiation":
         assert isinstance(action.get("product_price"), (int, float))
+        assert math.isfinite(action["product_price"])
         assert action["product_price"] >= 0
+        state = parse_negotiation(parse_game(game))
+        if state.my_value is not None:
+            reservation = max(state.my_value, 0.0)
+            if state.my_role == "seller":
+                assert action["product_price"] >= reservation
+            else:
+                assert action["product_price"] <= reservation
     elif atype == "decision" and family == "bargaining":
         assert action.get("decision") in ("accept", "reject", "walkaway")
     elif atype == "decision" and family == "negotiation":
         assert action.get("decision") in ("AcceptOffer", "RejectOffer", "WalkAway")
         if "product_price" in action:
             assert isinstance(action["product_price"], (int, float))
+            assert math.isfinite(action["product_price"])
+            assert action["product_price"] >= 0
+            state = parse_negotiation(parse_game(game))
+            if state.my_value is not None:
+                reservation = max(state.my_value, 0.0)
+                if state.my_role == "seller":
+                    assert action["product_price"] >= reservation
+                else:
+                    assert action["product_price"] <= reservation
     elif atype == "seller_message":
         assert isinstance(action.get("message"), str) and action["message"]
     elif atype in ("seller_recommendation", "buyer_decision"):
@@ -130,11 +149,79 @@ class TestGuardBasics:
             action, _ = guard(action, parse_game(game))
             check_valid(action, game)
 
+    def test_negative_negotiation_reservation_fallbacks_are_clamped(self):
+        offer = negotiation_game(
+            role="seller", game_state={"player_1_value": -1e308}
+        )
+        decision = negotiation_decision(
+            role="seller",
+            game_state={"player_1_value": -1e308, "last_offer": None},
+        )
+
+        assert fallback_action(parse_game(offer))["product_price"] == 0.0
+        assert fallback_action(parse_game(decision)) == {
+            "decision": "RejectOffer",
+            "product_price": 0.0,
+        }
+
+    def test_negative_negotiation_reservation_guard_counter_is_clamped(self):
+        game = negotiation_decision(
+            role="seller", game_state={"player_1_value": -1e308}
+        )
+
+        action, notes = guard(
+            {"decision": "RejectOffer", "product_price": float("nan")},
+            parse_game(game),
+        )
+
+        check_valid(action, game)
+        assert action["product_price"] == 0.0
+        assert any("added missing counteroffer" in note for note in notes)
+
+    @pytest.mark.parametrize(
+        ("role", "proposed", "expected", "note"),
+        [
+            ("seller", 50.0, 100.0, "raised seller offer"),
+            ("buyer", 150.0, 100.0, "lowered buyer offer"),
+        ],
+    )
+    def test_negotiation_offer_guard_enforces_own_reservation(
+        self, role, proposed, expected, note
+    ):
+        game = negotiation_game(role=role)
+
+        action, notes = guard({"product_price": proposed}, parse_game(game))
+
+        check_valid(action, game)
+        assert action["product_price"] == expected
+        assert any(note in correction for correction in notes)
+
+    @pytest.mark.parametrize(
+        ("role", "proposed", "expected", "note"),
+        [
+            ("seller", 50.0, 100.0, "raised seller counteroffer"),
+            ("buyer", 150.0, 100.0, "lowered buyer counteroffer"),
+        ],
+    )
+    def test_negotiation_counter_guard_enforces_own_reservation(
+        self, role, proposed, expected, note
+    ):
+        game = negotiation_decision(role=role, offer_price=150.0)
+
+        action, notes = guard(
+            {"decision": "RejectOffer", "product_price": proposed},
+            parse_game(game),
+        )
+
+        check_valid(action, game)
+        assert action["product_price"] == expected
+        assert any(note in correction for correction in notes)
+
 
 class TestGuardFuzz:
     def test_dispatcher_handles_nonfinite_game_numbers(self, monkeypatch):
-        monkeypatch.setattr("glee_agent.dispatcher.log_turn", lambda *args, **kwargs: None)
-        strategy = build_strategy(
+        monkeypatch.setattr(dispatcher, "log_turn", lambda *args, **kwargs: None)
+        strategy = dispatcher.build_strategy(
             SimpleNamespace(knobs=Knobs(llm_enabled=False), agent_label="test")
         )
         cases = [
@@ -173,6 +260,25 @@ class TestGuardFuzz:
                 for value in action.values():
                     if isinstance(value, float):
                         assert math.isfinite(value)
+
+    def test_dispatcher_exception_uses_clamped_negotiation_fallback(self, monkeypatch):
+        def fail_strategy(*args, **kwargs):
+            raise OverflowError("synthetic strategy failure")
+
+        monkeypatch.setitem(dispatcher.FAMILIES, "negotiation", fail_strategy)
+        monkeypatch.setattr(dispatcher, "log_turn", lambda *args, **kwargs: None)
+        strategy = dispatcher.build_strategy(
+            SimpleNamespace(knobs=Knobs(llm_enabled=False), agent_label="test")
+        )
+        game = negotiation_decision(
+            role="seller",
+            game_state={"player_1_value": -1e308, "last_offer": None},
+        )
+
+        action = strategy(game)
+
+        check_valid(action, game)
+        assert action == {"decision": "RejectOffer", "product_price": 0.0}
 
     def test_garbage_actions_never_raise(self):
         garbage = [

@@ -11,7 +11,7 @@ from fixtures import (
 
 from glee_agent.config import Knobs
 from glee_agent.families import bargaining, negotiation, persuasion
-from glee_agent.schema import parse_game
+from glee_agent.schema import parse_game, parse_negotiation
 from glee_agent.theory import targets as T
 
 KNOBS = Knobs()
@@ -896,7 +896,15 @@ class TestNegotiationInvariants:
         for role in ("seller", "buyer"):
             for rnd in (1, 2, 5, 9, 10):
                 for frac in (0.0, 0.4, 0.6):
-                    g = self._ci_game(role=role, rnd=rnd)
+                    my_value, opp_value = (
+                        (100.0, 200.0) if role == "seller" else (200.0, 100.0)
+                    )
+                    g = self._ci_game(
+                        role=role,
+                        rnd=rnd,
+                        my_v=my_value,
+                        opp_v=opp_value,
+                    )
                     view = parse_game(g)
                     n = parse_negotiation(view)
                     act = negotiation.decide(view, Knobs(llm_enabled=False,
@@ -907,6 +915,85 @@ class TestNegotiationInvariants:
                     opp_payoff = (n.opp_value - price if n.my_role == "seller"
                                   else price - n.opp_value)
                     assert opp_payoff > 0, (role, rnd, frac, price, n.opp_value)
+
+    @pytest.mark.parametrize(
+        ("role", "my_value", "opp_value"),
+        [("seller", 1000.0, 1005.0), ("buyer", 1005.0, 1000.0)],
+    )
+    def test_thin_surplus_offer_stays_inside_both_reservations(
+        self, role, my_value, opp_value
+    ):
+        game = self._ci_game(
+            role=role, rnd=2, my_v=my_value, opp_v=opp_value
+        )
+        game["game_state"]["max_rounds"] = 2
+
+        action = negotiation.decide(parse_game(game), Knobs(llm_enabled=False))
+
+        price = action["product_price"]
+        seller_value = my_value if role == "seller" else opp_value
+        buyer_value = opp_value if role == "seller" else my_value
+        assert price == pytest.approx(1002.5)
+        assert price == round(price, 2)
+        assert seller_value <= price <= buyer_value
+
+    @pytest.mark.parametrize(
+        ("role", "my_value", "opp_value", "offer"),
+        [
+            ("seller", 1000.0, 1005.0, 999.0),
+            ("buyer", 1005.0, 1000.0, 1006.0),
+        ],
+    )
+    def test_thin_surplus_counter_stays_inside_both_reservations(
+        self, role, my_value, opp_value, offer
+    ):
+        from fixtures import negotiation_decision
+
+        state = {
+            "complete_information": True,
+            "round": 1,
+            "max_rounds": 2,
+            "player_1_value": my_value if role == "seller" else opp_value,
+            "player_2_value": opp_value if role == "seller" else my_value,
+        }
+        game = negotiation_decision(
+            role=role, offer_price=offer, game_state=state
+        )
+
+        action = negotiation.decide(parse_game(game), Knobs(llm_enabled=False))
+
+        assert action["decision"] == "RejectOffer"
+        seller_value = my_value if role == "seller" else opp_value
+        buyer_value = opp_value if role == "seller" else my_value
+        assert action["product_price"] == pytest.approx(1002.5)
+        assert action["product_price"] == round(action["product_price"], 2)
+        assert seller_value <= action["product_price"] <= buyer_value
+
+    @pytest.mark.parametrize(
+        ("role", "my_value", "opp_value"),
+        [("seller", 1005.0, 1000.0), ("buyer", 1000.0, 1005.0)],
+    )
+    def test_incompatible_values_prioritize_own_non_loss(
+        self, role, my_value, opp_value
+    ):
+        game = self._ci_game(
+            role=role, rnd=2, my_v=my_value, opp_v=opp_value
+        )
+
+        action = negotiation.decide(parse_game(game), Knobs(llm_enabled=False))
+
+        if role == "seller":
+            assert action["product_price"] >= my_value
+        else:
+            assert 0.0 <= action["product_price"] <= my_value
+
+    @pytest.mark.parametrize("role", ["seller", "buyer"])
+    def test_hidden_value_feasibility_clamp_preserves_candidate(self, role):
+        game = negotiation_game(role=role)
+        state = parse_negotiation(parse_game(game))
+        candidate = 175.0 if role == "seller" else 25.0
+
+        assert negotiation._feasible_price(candidate, state) == candidate
 
     def test_concession_never_outruns_the_opponent(self):
         """A stonewalling opponent gets at most the drip, not the schedule."""

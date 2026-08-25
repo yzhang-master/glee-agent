@@ -125,13 +125,38 @@ def _feasible_price(price: float, n, eps_frac: float = 0.01) -> float:
     site: the acceptance model has a strict gate at the responder's own
     value, so an infeasible offer has literally zero chance and merely burns
     a round (and, late in a game, invites a walk-away).
+
+    In a thin-surplus game, cap the mandatory opponent-profit epsilon at half
+    the actual surplus.  That keeps the mutually non-losing interval nonempty
+    and prevents the clamp from crossing our own reservation.  If the public
+    values are incompatible, no mutually profitable price exists; preserve
+    our own non-loss boundary instead.
     """
-    if n.opp_value is None or n.opp_value <= 0:
+    if n.opp_value is None:
         return price
-    eps = max(abs(n.opp_value) * eps_frac, 1e-9)
+
+    # A missing own value is malformed (the platform always reveals it), but
+    # retain the old opponent-only clamp for defensive compatibility.
+    if n.my_value is None:
+        if n.opp_value <= 0:
+            return price
+        eps = max(abs(n.opp_value) * eps_frac, 1e-9)
+        if n.my_role == "seller":
+            return min(price, n.opp_value - eps)
+        return max(price, n.opp_value + eps)
+
     if n.my_role == "seller":
-        return min(price, n.opp_value - eps)   # buyer must gain by buying
-    return max(price, n.opp_value + eps)       # seller must gain by selling
+        surplus = n.opp_value - n.my_value
+        if surplus <= 0:
+            return max(price, n.my_value)
+        eps = min(max(abs(n.opp_value) * eps_frac, 1e-9), surplus / 2.0)
+        return min(max(price, n.my_value), n.opp_value - eps)
+
+    surplus = n.my_value - n.opp_value
+    if surplus <= 0:
+        return min(price, n.my_value)
+    eps = min(max(abs(n.opp_value) * eps_frac, 1e-9), surplus / 2.0)
+    return max(min(price, n.my_value), n.opp_value + eps)
 
 
 def _ci_ultimatum_price(n, knobs: Knobs) -> float | None:
