@@ -64,6 +64,15 @@ class Knobs:
                                          # 10.3% of the time and the regime realizes only
                                          # 0.325 of pot. Pricing to close should beat pricing
                                          # to win -- under test on an arm.
+    barg_late_accept_round: int = 0      # accept any offer at/above barg_late_accept_share
+                                         # once the round reaches this depth. 0 = off.
+                                         # Measured at the GAME level (per-rejection means
+                                         # double-count long games and invert the sign):
+                                         # accepting a near-even offer is worth -0.013 pot
+                                         # from round 1, +0.034 from round 5, +0.085 from
+                                         # round 15 and +0.217 from round 30. Rejecting is
+                                         # right early and increasingly wrong late
+    barg_late_accept_share: float = 0.45 # the floor the late rule accepts at
     barg_drip: float = 0.01              # max unreciprocated concession per offer (0 in advantage)
 
     # Negotiation
@@ -98,6 +107,14 @@ class Knobs:
                                             # the directly treated T=1 proposer slice improved by
                                             # 10.0pp and 0.067. Zero rolls back to the generic
                                             # own-value markup.
+    neg_ii_explore_frac: float = 0.0     # incomplete information: share of OPENING offers
+                                         # that take a deterministic jittered markup off a
+                                         # fixed ladder instead of the prior anchor. The
+                                         # policy is otherwise one price per value cell, so
+                                         # the acceptance curve is censored by our own
+                                         # determinism -- every pricing comparison collapses
+                                         # into a cell comparison. Exploration is the only
+                                         # way to measure demand. 0 = off, no behaviour change
     neg_reciprocal: bool = True          # concede at most what the opponent just conceded
                                          # (plus a drip). Their acceptance probability AND
                                          # their own concession both fall in our concession
