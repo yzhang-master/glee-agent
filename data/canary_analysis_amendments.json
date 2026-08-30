@@ -1,0 +1,140 @@
+{
+  "schema_version": 1,
+  "amendments": [
+    {
+      "amendment_id": "neg-terminal-confirm-v2-epoch-unit-r3",
+      "supersedes_nothing_in": "data/canary_analysis_plan.json",
+      "declaration_sha256": "39943a3877adafae71f6bdacfab13a02f0065dc1b955ef6184fbb14dfe20e260",
+      "plan_id": "confirmation-v2-20260825-2100z",
+      "rule_id": "neg-terminal-confirm-v2",
+      "family": "negotiation",
+      "amended_at": 1787708981,
+      "amended_at_utc": "2026-08-26T01:49:41+00:00",
+      "kind": "post_activation_blinded_sample_size_re_estimation",
+      "pre_registered": false,
+      "declared_before_activation": false,
+      "activated_at": 1787691600,
+      "reporter_parent_git_head": "00051a29e9709f94adafa404fe205a9268d57a08",
+      "retired_promotion_check": "two_supported_nonnegative_treatment_epochs",
+      "retired_check_status_after_amendment": "diagnostic_only",
+      "retained_confirmatory_checks": [
+        "balanced_manifest_switchback",
+        "approved_prospective_manifest_assignment"
+      ],
+      "reason": "The retired check requires 60 direct trials, including at least 15 in each of the four own-value grids, inside a single fixed 30-minute agent assignment epoch. Epoch width is fixed wall-clock, so a longer window yields more epochs rather than fuller ones and the per-epoch rate does not accumulate. The check is therefore unreachable by arithmetic at any observed or plausible arrival rate, independent of whether the rule works.",
+      "blinded_evidence_observed": {
+        "observed_as_of": 1787704407,
+        "observed_as_of_utc": "2026-08-26T00:43:27+00:00",
+        "confirmatory_window_elapsed_hours": 3.72,
+        "confirmatory_window_total_hours": 72.0,
+        "treatment_epochs_observed": 30,
+        "treatment_direct_trials_observed": 46,
+        "mean_direct_trials_per_epoch": 1.53,
+        "max_direct_trials_in_any_epoch": 4,
+        "required_direct_trials_per_epoch": 60,
+        "shortfall_multiple_vs_best_epoch": 15.0,
+        "epoch_width_seconds": 1800,
+        "epoch_width_is_fixed_wall_clock": true
+      },
+      "retained_check_projection": {
+        "unit": "per-agent manifest switchback label over the whole confirmatory window",
+        "basis": "linear extrapolation of observed arrival to the 1787950800 enrollment cutoff",
+        "scale_factor": 19.3,
+        "observed_direct_trials_by_agent_arm": {
+          "main": {
+            "control": 11,
+            "treatment": 13
+          },
+          "test_a": {
+            "control": 22,
+            "treatment": 15
+          },
+          "test_b": {
+            "control": 10,
+            "treatment": 11
+          },
+          "test_c": {
+            "control": 5,
+            "treatment": 7
+          }
+        },
+        "projected_direct_trials_by_agent_arm": {
+          "main": {
+            "control": 212,
+            "treatment": 251
+          },
+          "test_a": {
+            "control": 425,
+            "treatment": 290
+          },
+          "test_b": {
+            "control": 193,
+            "treatment": 212
+          },
+          "test_c": {
+            "control": 97,
+            "treatment": 135
+          }
+        },
+        "reachable": true
+      },
+      "unblinding_disclosure": {
+        "frozen_before_any_live_outcomes": false,
+        "live_outcomes_inspected": true,
+        "arm_split_trial_counts_inspected": true,
+        "arm_split_effect_point_estimates_inspected": false,
+        "boolean_promotion_check_results_inspected": true,
+        "note": "The amendment was made after a safety-scope monitoring read that exposed per-arm trial counts and the boolean outcome of the uplift checks at 4.7 percent information, which disclosed that the direct uplift point estimate had not yet reached 0.060. The retired check is a sample-size feasibility check whose value does not depend on the direction or size of the treatment effect, so retiring it cannot select a favourable direction. It is nevertheless a post-activation deviation and is reported as such rather than as pre-registered evidence."
+      },
+      "claim_strength": {
+        "bargaining_and_persuasion_unaffected": true,
+        "negotiation_result_label": "amended_analysis_not_fully_pre_registered",
+        "scope": "negotiation promotion conjunction only; population, outcome, maturity, deadline, censoring, integrity, and safety rules are unchanged"
+      }
+    },
+    {
+      "amendment_id": "neg-terminal-confirm-v2-validity-measurement-r3b",
+      "declaration_sha256": "39943a3877adafae71f6bdacfab13a02f0065dc1b955ef6184fbb14dfe20e260",
+      "plan_id": "confirmation-v2-20260825-2100z",
+      "rule_id": "neg-terminal-confirm-v2",
+      "family": "negotiation",
+      "amended_at": 1787757880,
+      "amended_at_utc": "2026-08-26T15:24:40+00:00",
+      "kind": "post_firing_measurement_correction",
+      "pre_registered": false,
+      "declared_before_activation": false,
+      "made_after_the_trigger_fired": true,
+      "activated_at": 1787691600,
+      "affected_check": "treatment_invalid_and_corrections_clean",
+      "reason": "The check is named and predeclared for treatment-caused invalidity, but its implementation summed three unrelated sources: platform-invalid moves, invalid terminal payloads, and prospective provenance/schema faults. The latter two are reporter-side evidence quality, are already handled conservatively by the deadline-zero outcome policy, and occur in both arms at the platform baseline. Under zero tolerance on the treatment arm alone, the check therefore fired on shared baseline noise rather than on treatment-caused invalidity.",
+      "observed_when_it_fired": {
+        "observed_as_of_utc": "2026-08-26T01:56:00+00:00",
+        "prospective_cohort_treatment_faults": 7,
+        "prospective_cohort_control_faults": 4,
+        "prospective_treatment_result_events": 7611,
+        "prospective_control_result_events": 7496,
+        "exact_two_sided_binomial_p_equal_arms": 0.549,
+        "legacy_cohort_control_faults": 1,
+        "legacy_cohort_control_result_events": 10441,
+        "platform_invalid_moves_fleet_wide_20260825_and_20260826": 0,
+        "treatment_corrections": 0,
+        "treatment_error_rate_excess": 0.0,
+        "routing_and_direction_clean": true
+      },
+      "change": {
+        "hard_fail_scope_before": "invalid_moves + invalid_terminals + provenance_faults + corrections, treatment only, zero tolerance",
+        "hard_fail_scope_after": "invalid_moves + corrections, treatment only, zero tolerance retained",
+        "new_check": "reporter_fault_excess_within_0.01",
+        "new_check_form": "control-relative excess of (invalid_terminals + provenance_faults) per traffic event, same 0.010 margin already predeclared for treatment_error_rate_excess",
+        "retained_total": "invalid_results is still reported unchanged, and the gate contract now requires the three components to reconcile against it"
+      },
+      "why_this_is_not_a_threshold_relaxation": "The stated intent of the check -- zero treatment-caused invalidity -- is preserved exactly, and is currently satisfied with zero invalid moves and zero corrections. A treatment-specific divergence in unusable evidence still hard-fails through the new control-relative check.",
+      "rollback_coupling_note": "A negotiation-only rollback was not achievable: all three rules share one assignment artifact, so disabling the negotiation rule changes artifact_sha256 and ends enrollment for the bargaining and persuasion arms as well.",
+      "claim_strength": {
+        "bargaining_and_persuasion_unaffected": true,
+        "negotiation_result_label": "amended_analysis_not_fully_pre_registered",
+        "scope": "negotiation health hard-fail scope only; population, outcome, maturity, deadline, censoring, and assignment integrity rules are unchanged"
+      }
+    }
+  ]
+}

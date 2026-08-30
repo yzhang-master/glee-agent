@@ -6,8 +6,11 @@ reaper, and avoids making telemetry ingestion part of an experiment readout.
 
 Enrollment is intentionally strict: a game must have no turn before the
 experiment cut, and its first turn at/after the cut must be round 1 with an
-empty embedded history.  Repeated polls are collapsed by
-``(agent, game_id, round, phase)`` and the latest game-over result wins.
+empty embedded history.  The earliest raw sighting fixes enrollment and the
+per-game assignment.  Repeated polls are retained for conflict detection;
+outcomes use the earliest source-valid terminal within the immutable maturity
+deadline, and disagreeing timely terminals fail integrity rather than winning
+by log order.
 
 Usage::
 
@@ -24,6 +27,7 @@ import json
 import math
 import re
 import sys
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -44,12 +48,14 @@ if __package__:
         _newcombe_difference as _gate_newcombe_difference,
         evaluate_report_gates,
     )
+    from scripts.confirmation_plan import load_confirmation_plan
 else:  # direct ``python scripts/canary_report.py`` execution
     from canary_gates import (  # type: ignore[no-redef]
         _binomial_summary as _gate_binomial_summary,
         _newcombe_difference as _gate_newcombe_difference,
         evaluate_report_gates,
     )
+    from confirmation_plan import load_confirmation_plan  # type: ignore[no-redef]
 from glee_agent.theory.targets import (  # noqa: E402
     DEFAULT_PATH as TARGETS_PATH,
     config_key_negotiation,
@@ -101,7 +107,7 @@ EXPERIMENTS = (
         "bargaining",
         1787671708.0,
         ("test_b",),
-        ("main", "test_c"),
+        ("main", "test_a", "test_c"),
         "barg_dis_anchor",
         0.50,
         0.58,
@@ -483,8 +489,23 @@ class Turn:
     round: int
     phase: str
     game: dict
+    history_json: bytes
+    history_empty: bool
     action: dict
-    corrections: list
+    canary_assignment: dict | None
+
+
+@dataclass
+class TurnOccurrence:
+    """Memory-bounded raw-turn fields needed for health and receipt lifecycle."""
+
+    agent: str
+    gid: str
+    family: str
+    ts: float
+    round: int
+    phase: str
+    corrections: int
     error: Any
     canary_assignment: dict | None
 
@@ -520,13 +541,76 @@ class RuntimeEvent:
 @dataclass
 class ParsedRecords:
     turns: dict[tuple[str, str, int, str], Turn]
-    turn_events: list[Turn]
+    turn_events: list[TurnOccurrence]
+    turn_events_by_game: dict[tuple[str, str], list[TurnOccurrence]]
+    duplicate_turn_groups: dict[tuple[str, str, int, str], list[Turn]]
     first_turns: dict[tuple[str, str], Turn]
     results: list[ResultEvent]
+    results_by_game: dict[tuple[str, str], list[ResultEvent]]
     terminals: dict[tuple[str, str], ResultEvent]
     duplicate_events: list[tuple[str, str, float]]
     gid_family: dict[tuple[str, str], str]
     runtimes: list[RuntimeEvent]
+
+
+@dataclass(frozen=True)
+class GameAnalysisAssignment:
+    """One immutable assignment/cohort decision for a parsed game."""
+
+    variant: str
+    epoch_id: str
+    source: str
+    evidence: dict
+    cohort: str
+    included: bool
+
+
+_ANALYSIS_COHORTS = ("legacy", "prospective", "outside_confirmation")
+_MAX_FUTURE_CLOCK_SKEW_S = 300.0
+_MAX_JSONL_LINE_BYTES = 8 * 1024 * 1024
+_MAX_DIAGNOSTIC_TEXT_CHARS = 4096
+_INVALID_CELL_KEY = "<invalid-cell>"
+_CONFIRMATION_DECLARATION_PIN = {
+    "schema_version": 1,
+    "path": "data/canary_analysis_plan.json",
+    "sha256": "39943a3877adafae71f6bdacfab13a02f0065dc1b955ef6184fbb14dfe20e260",
+    "bytes": 5950,
+    "look_id": "final-confirmatory-expiry-plus-persuasion-maturity-v1",
+    "declared_at_ts": 1787689408,
+    "analysis_as_of_ts": 1787952600,
+    "enrollment_cutoff_exclusive": 1787950800,
+    "prefix_procedure_version": "stable-filtered-jsonl-snapshot-v2",
+    "prefix_capture_not_before": 1787952900,
+    "prefix_output_path_template": (
+        "data/canary-confirmation-prefix/{declaration_sha256}.json"
+    ),
+}
+
+# The frozen declaration cannot be re-declared after activation -- the loader
+# rejects ``declared_at >= activated_at`` by design, and its sha256 is pinned
+# for all three families at once.  A negotiation-only deviation therefore lives
+# in its own honestly timestamped artifact, pinned here, and is reported as an
+# amendment rather than as pre-registered evidence.
+_NEG_CONFIRMATION_AMENDMENT = {
+    "schema_version": 1,
+    "path": "data/canary_analysis_amendments.json",
+    "sha256": "35efe9679569b6d73ef88871c36d2097c8eb94e7f8304d51b2e1d756831cc1d9",
+    "bytes": 7843,
+    "amendment_id": "neg-terminal-confirm-v2-epoch-unit-r3",
+    "amended_at_ts": 1787708981,
+    "additional_amendment_ids": (
+        "neg-terminal-confirm-v2-validity-measurement-r3b",
+    ),
+    "pre_registered": False,
+    "declared_before_activation": False,
+    "kind": "post_activation_blinded_sample_size_re_estimation",
+    "retired_promotion_check": "two_supported_nonnegative_treatment_epochs",
+    "retained_confirmatory_checks": (
+        "balanced_manifest_switchback",
+        "approved_prospective_manifest_assignment",
+    ),
+    "analysis_label": "amended_analysis_not_fully_pre_registered",
+}
 
 
 def _as_float(value: Any) -> float | None:
@@ -534,9 +618,67 @@ def _as_float(value: Any) -> float | None:
         return None
     try:
         out = float(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return None
     return out if math.isfinite(out) else None
+
+
+def _finite_json_float(value: str) -> float:
+    """Decode only finite RFC JSON numbers from physical telemetry."""
+
+    out = float(value)
+    if not math.isfinite(out):
+        raise ValueError("non-finite JSON number")
+    return out
+
+
+def _reject_json_constant(value: str) -> None:
+    """Reject Python's non-standard NaN and Infinity JSON extensions."""
+
+    raise ValueError(f"non-standard JSON constant: {value}")
+
+
+def _schema_string(value: Any, default: str = "unknown") -> str:
+    """Return only literal schema strings; never stringify hostile objects."""
+
+    return value if isinstance(value, str) else default
+
+
+def _utf8_bytes(value: Any) -> bytes | None:
+    """Encode only literal schema strings with valid Unicode scalar text."""
+
+    if not isinstance(value, str):
+        return None
+    try:
+        return value.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+
+
+def _safe_text(value: Any, default: str = "") -> str:
+    """Best-effort diagnostic text without Python's huge-int/recursion traps."""
+
+    if isinstance(value, str):
+        text = value
+    else:
+        try:
+            text = str(value)
+        except (TypeError, ValueError, OverflowError, RecursionError):
+            return default
+    if len(text) <= _MAX_DIAGNOSTIC_TEXT_CHARS:
+        return text
+    return text[:_MAX_DIAGNOSTIC_TEXT_CHARS] + "<truncated>"
+
+
+def _player_id(game: dict) -> str:
+    """Normalize the only player identifiers accepted by the game schema."""
+
+    value = game.get("your_player", "player_1")
+    return (
+        value
+        if isinstance(value, str) and value in ("player_1", "player_2")
+        else "player_1"
+    )
 
 
 def _record_agent(record: dict) -> str:
@@ -546,13 +688,42 @@ def _record_agent(record: dict) -> str:
 
 def parse_records(records: Iterable[dict]) -> ParsedRecords:
     turns: dict[tuple[str, str, int, str], Turn] = {}
-    turn_events: list[Turn] = []
+    turn_events: list[TurnOccurrence] = []
+    turn_events_by_game: dict[
+        tuple[str, str], list[TurnOccurrence]
+    ] = defaultdict(list)
+    duplicate_turn_groups: dict[
+        tuple[str, str, int, str], list[Turn]
+    ] = {}
     first_turns: dict[tuple[str, str], Turn] = {}
     results: list[ResultEvent] = []
+    results_by_game: dict[tuple[str, str], list[ResultEvent]] = defaultdict(list)
     terminals: dict[tuple[str, str], ResultEvent] = {}
     runtimes: list[RuntimeEvent] = []
     turn_occurrences: dict[tuple[str, str, int, str], list[float]] = defaultdict(list)
     gid_family: dict[tuple[str, str], str] = {}
+    assignment_pool: dict[bytes, dict] = {}
+
+    def intern_assignment(value: Any) -> dict | None:
+        if not isinstance(value, dict):
+            return None
+        try:
+            identity = json.dumps(
+                value,
+                ensure_ascii=False,
+                allow_nan=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        except (
+            TypeError,
+            ValueError,
+            OverflowError,
+            UnicodeError,
+            RecursionError,
+        ):
+            return value
+        return assignment_pool.setdefault(identity, value)
 
     for record in records:
         if not isinstance(record, dict):
@@ -560,7 +731,7 @@ def parse_records(records: Iterable[dict]) -> ParsedRecords:
         kind = record.get("type")
         agent = _record_agent(record)
         ts = _as_float(record.get("ts"))
-        if not agent or ts is None:
+        if not agent or _utf8_bytes(agent) is None or ts is None:
             continue
         if kind == "runtime":
             hashes = record.get("content_hashes")
@@ -591,7 +762,7 @@ def parse_records(records: Iterable[dict]) -> ParsedRecords:
                         else None
                     ),
                     target_sha256={
-                        str(path): (
+                        _schema_string(path, "<invalid-path>"): (
                             identity.get("sha256")
                             if isinstance(identity, dict)
                             and isinstance(identity.get("sha256"), str)
@@ -600,9 +771,7 @@ def parse_records(records: Iterable[dict]) -> ParsedRecords:
                         for path, identity in targets.items()
                     },
                     canary_assignment=(
-                        record.get("canary_assignment")
-                        if isinstance(record.get("canary_assignment"), dict)
-                        else None
+                        intern_assignment(record.get("canary_assignment"))
                     ),
                 )
             )
@@ -613,13 +782,40 @@ def parse_records(records: Iterable[dict]) -> ParsedRecords:
             gid = game.get("game_id")
             family = game.get("game_family")
             state = game.get("game_state")
-            if not isinstance(gid, str) or not isinstance(family, str):
+            if (
+                not isinstance(gid, str)
+                or not isinstance(family, str)
+                or _utf8_bytes(gid) is None
+                or _utf8_bytes(family) is None
+            ):
                 continue
             state = state if isinstance(state, dict) else {}
+            history = state.get("history")
+            try:
+                history_json = json.dumps(
+                    history,
+                    ensure_ascii=False,
+                    allow_nan=False,
+                    separators=(",", ":"),
+                ).encode("utf-8")
+            except (
+                TypeError,
+                ValueError,
+                OverflowError,
+                UnicodeError,
+                RecursionError,
+            ):
+                history_json = b"null"
+            compact_state = dict(state)
+            compact_state.pop("history", None)
+            compact_game = dict(game)
+            compact_game["game_state"] = compact_state
             rnd_value = _as_float(state.get("round"))
             rnd = int(rnd_value) if rnd_value is not None else 1
             phase = game.get("phase", state.get("phase", ""))
             phase = phase if isinstance(phase, str) else ""
+            if _utf8_bytes(phase) is None:
+                continue
             turn = Turn(
                 agent=agent,
                 gid=gid,
@@ -627,22 +823,30 @@ def parse_records(records: Iterable[dict]) -> ParsedRecords:
                 ts=ts,
                 round=rnd,
                 phase=phase,
-                game=game,
+                game=compact_game,
+                history_json=history_json,
+                history_empty=history == [],
                 action=record.get("action") if isinstance(record.get("action"), dict) else {},
+                canary_assignment=intern_assignment(record.get("canary_assignment")),
+            )
+            game_key = (agent, gid)
+            occurrence = TurnOccurrence(
+                agent=agent,
+                gid=gid,
+                family=family,
+                ts=ts,
+                round=rnd,
+                phase=phase,
                 corrections=(
-                    record.get("corrections")
+                    len(record["corrections"])
                     if isinstance(record.get("corrections"), list)
-                    else []
+                    else 0
                 ),
                 error=record.get("error"),
-                canary_assignment=(
-                    record.get("canary_assignment")
-                    if isinstance(record.get("canary_assignment"), dict)
-                    else None
-                ),
+                canary_assignment=turn.canary_assignment,
             )
-            turn_events.append(turn)
-            game_key = (agent, gid)
+            turn_events.append(occurrence)
+            turn_events_by_game[game_key].append(occurrence)
             old_first = first_turns.get(game_key)
             if old_first is None or turn.ts < old_first.ts:
                 first_turns[game_key] = turn
@@ -650,11 +854,14 @@ def parse_records(records: Iterable[dict]) -> ParsedRecords:
             key = (agent, gid, rnd, phase)
             turn_occurrences[key].append(ts)
             old = turns.get(key)
+            if old is not None:
+                group = duplicate_turn_groups.setdefault(key, [old])
+                group.append(turn)
             if old is None or turn.ts >= old.ts:
                 turns[key] = turn
         elif kind == "result":
             gid = record.get("game_id")
-            if not isinstance(gid, str):
+            if not isinstance(gid, str) or _utf8_bytes(gid) is None:
                 continue
             raw_source = record.get("result_source")
             raw_reaped = record.get("reaped")
@@ -662,8 +869,6 @@ def parse_records(records: Iterable[dict]) -> ParsedRecords:
             raw_valid = record.get("valid")
             raw_result = record.get("result")
             schema_failures: list[str] = []
-            if type(raw_game_over) is not bool:
-                schema_failures.append("game_over_not_literal_bool")
             if raw_source not in ("move", "move_transport_error", "reaper"):
                 schema_failures.append("result_source_missing_or_invalid")
             if type(raw_reaped) is not bool:
@@ -672,10 +877,21 @@ def parse_records(records: Iterable[dict]) -> ParsedRecords:
                 schema_failures.append("valid_not_bool_or_null")
             if raw_result is not None and not isinstance(raw_result, dict):
                 schema_failures.append("result_not_object_or_null")
-            if raw_source in ("move", "move_transport_error") and raw_reaped is not False:
+            if raw_source in ("move", "reaper") and type(raw_game_over) is not bool:
+                schema_failures.append("game_over_not_literal_bool")
+            if raw_source == "move" and raw_reaped is not False:
                 schema_failures.append("move_source_reaped_mismatch")
             if raw_source == "reaper" and raw_reaped is not True:
                 schema_failures.append("reaper_source_reaped_mismatch")
+            if raw_source == "move_transport_error" and not (
+                raw_reaped is False
+                and raw_valid is None
+                and raw_game_over is None
+                and raw_result is None
+                and isinstance(record.get("error"), str)
+                and bool(record.get("error"))
+            ):
+                schema_failures.append("transport_error_envelope_mismatch")
             event = ResultEvent(
                 agent=agent,
                 gid=gid,
@@ -703,6 +919,7 @@ def parse_records(records: Iterable[dict]) -> ParsedRecords:
                 prospective_schema_failures=tuple(schema_failures),
             )
             results.append(event)
+            results_by_game[(agent, gid)].append(event)
             if event.game_over:
                 key = (agent, gid)
                 old = terminals.get(key)
@@ -720,8 +937,11 @@ def parse_records(records: Iterable[dict]) -> ParsedRecords:
     return ParsedRecords(
         turns=turns,
         turn_events=turn_events,
+        turn_events_by_game=dict(turn_events_by_game),
+        duplicate_turn_groups=duplicate_turn_groups,
         first_turns=first_turns,
         results=results,
+        results_by_game=dict(results_by_game),
         terminals=terminals,
         duplicate_events=duplicate_events,
         gid_family=gid_family,
@@ -730,8 +950,18 @@ def parse_records(records: Iterable[dict]) -> ParsedRecords:
 
 
 def _history_empty(turn: Turn) -> bool:
-    state = turn.game.get("game_state")
-    return isinstance(state, dict) and state.get("history") == []
+    return turn.history_empty
+
+
+def _materialize_game(turn: Turn) -> dict:
+    """Restore the packed history for one temporary strategy replay."""
+
+    game = dict(turn.game)
+    state = game.get("game_state")
+    state = dict(state) if isinstance(state, dict) else {}
+    state["history"] = json.loads(turn.history_json)
+    game["game_state"] = state
+    return game
 
 
 def _arm_empty() -> dict:
@@ -786,7 +1016,7 @@ def _action_equal(left: dict, right: dict) -> bool:
 
 
 def _my_gain(action: dict, game: dict) -> float | None:
-    player = game.get("your_player", "player_1")
+    player = _player_id(game)
     key = "alice_gain" if player == "player_1" else "bob_gain"
     value = _as_float(action.get(key))
     if value is not None:
@@ -817,11 +1047,19 @@ def _direction_violation(
         t = _as_float(treatment.get("product_price"))
         if c is None or t is None:
             return True
-        player = turn.game.get("your_player", "player_1")
-        role = state.get(f"{player}_role", "seller" if player == "player_1" else "buyer")
+        player = _player_id(turn.game)
+        role = _schema_string(
+            state.get(
+                f"{player}_role",
+                "seller" if player == "player_1" else "buyer",
+            )
+        )
         return not (t < c if role == "seller" else t > c)
     if experiment.name == "pers_blind_lie":
-        return not (_recommendation(control) is True and _recommendation(treatment) is False)
+        return not (
+            _recommendation(control) is True
+            and _recommendation(treatment) is False
+        )
     return False
 
 
@@ -868,11 +1106,14 @@ def _max_rounds(turn: Turn) -> str:
     state = turn.game.get("game_state")
     state = state if isinstance(state, dict) else {}
     maximum = state.get("max_rounds")
-    return str(maximum) if maximum is not None else "unlimited"
+    if maximum is None:
+        return "unlimited"
+    number = _as_float(maximum)
+    return f"{number:g}" if number is not None else "unknown"
 
 
 def _terminal_payoff(turn: Turn, terminal: ResultEvent) -> float | None:
-    player = turn.game.get("your_player", "player_1")
+    player = _player_id(turn.game)
     return _as_float(terminal.result.get(f"{player}_payoff"))
 
 
@@ -882,33 +1123,120 @@ def _terminal_agreement(terminal: ResultEvent) -> bool:
 
 def _round_number(value: Any) -> int | None:
     number = _as_float(value)
-    if number is None or number < 0 or not number.is_integer():
+    if number is None or number < 0 or number > 1_000_000 or not number.is_integer():
         return None
-    return int(number)
+    try:
+        return int(number)
+    except (OverflowError, ValueError):
+        return None
+
+
+def _terminal_payload_failures(
+    turn: Turn,
+    terminal: ResultEvent,
+    *,
+    prospective_schema: bool,
+) -> tuple[str, ...]:
+    """Validate outcome fields that feed binding payoff/conversion metrics."""
+
+    failures: list[str] = []
+    result = terminal.result
+    raw_player = turn.game.get("your_player", "player_1")
+    player = _player_id(turn.game)
+    if not (
+        isinstance(raw_player, str)
+        and raw_player in ("player_1", "player_2")
+    ):
+        failures.append("your_player_missing_or_invalid")
+    payoff = result.get(f"{player}_payoff")
+    payoff_number = (
+        _as_float(payoff)
+        if not isinstance(payoff, bool) and isinstance(payoff, (int, float))
+        else None
+    )
+    if (
+        payoff_number is None
+    ):
+        failures.append("own_payoff_not_finite_number")
+    outcome = result.get("outcome")
+    allowed = (
+        {"completed", "timeout"}
+        if turn.family == "persuasion"
+        else {"agreement", "no_deal", "walked_away", "timeout"}
+    )
+    if not isinstance(outcome, str) or outcome not in allowed:
+        failures.append("outcome_missing_or_invalid")
+    if (
+        turn.family in ("bargaining", "negotiation")
+        and isinstance(outcome, str)
+        and outcome == "agreement"
+    ):
+        agreed_round = result.get("agreed_round")
+        if prospective_schema:
+            valid_round = type(agreed_round) is int and 1 <= agreed_round <= 1_000_000
+            round_number = agreed_round if valid_round else None
+        else:
+            round_number = _round_number(agreed_round)
+            valid_round = round_number is not None and round_number >= 1
+        state = turn.game.get("game_state")
+        state = state if isinstance(state, dict) else {}
+        maximum = _round_number(state.get("max_rounds"))
+        if not valid_round:
+            failures.append("agreement_round_missing_or_invalid")
+        elif maximum is not None and round_number is not None and round_number > maximum:
+            failures.append("agreement_round_out_of_bounds")
+    return tuple(failures)
+
+
+def _terminal_signature(turn: Turn, terminal: ResultEvent) -> str | None:
+    """Canonical full payload signature; hostile values become invalid evidence."""
+
+    try:
+        return json.dumps(
+            terminal.result,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        return None
 
 
 def _cell_key(cell: dict) -> str:
-    return json.dumps(cell, sort_keys=True, separators=(",", ":"))
+    try:
+        return json.dumps(
+            cell,
+            sort_keys=True,
+            separators=(",", ":"),
+            ensure_ascii=True,
+            allow_nan=False,
+        )
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        return _INVALID_CELL_KEY
 
 
 def _offer_cell(experiment: Experiment, turn: Turn, affected: dict) -> dict:
     state = turn.game.get("game_state")
     state = state if isinstance(state, dict) else {}
-    player = turn.game.get("your_player", "player_1")
+    player = _player_id(turn.game)
     opponent = turn.game.get("opponent")
     opponent = opponent if isinstance(opponent, dict) else {}
     common = {
         "horizon": _horizon(turn),
         "max_rounds": _max_rounds(turn),
         "phase": affected.get("phase", "unknown"),
-        "opponent_type": opponent.get("type", "unknown"),
+        "opponent_type": _schema_string(opponent.get("type")),
     }
     if experiment.family == "negotiation":
         return {
             **common,
             "complete_information": bool(state.get("complete_information", False)),
-            "role": state.get(
-                f"{player}_role", "seller" if player == "player_1" else "buyer"
+            "role": _schema_string(
+                state.get(
+                    f"{player}_role",
+                    "seller" if player == "player_1" else "buyer",
+                )
             ),
         }
     my_index = 2 if player == "player_2" else 1
@@ -941,6 +1269,8 @@ def _outcome_metric_empty() -> dict:
         "direct_resolved": 0,
         "direct_converted": 0,
         "direct_conversion_rate": None,
+        "invalid_terminals": 0,
+        "terminal_conflicts": 0,
     }
 
 
@@ -974,6 +1304,9 @@ def _offer_outcomes(
     enrolled: set[tuple[str, str]],
     parsed: ParsedRecords,
     experiment: Experiment,
+    assignments: dict[tuple[str, str], GameAnalysisAssignment],
+    *,
+    cohort: str | None = None,
 ) -> dict:
     by_variant = {
         "treatment": {
@@ -999,15 +1332,30 @@ def _offer_outcomes(
     }
     affected_by_game: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for item in affected:
-        affected_by_game[(item["agent"], item["game_id"])].append(item)
+        key = (item["agent"], item["game_id"])
+        assignment = assignments.get(key)
+        if (
+            assignment is not None
+            and assignment.included
+            and (cohort is None or assignment.cohort == cohort)
+        ):
+            affected_by_game[key].append(item)
+
+    if not affected_by_game:
+        for metric in by_variant.values():
+            _finish_outcome_metrics(metric)
+        return by_variant
 
     first_by_game: dict[tuple[str, str], Turn] = {}
-    for turn in parsed.turn_events:
-        key = (turn.agent, turn.gid)
-        if key not in enrolled or turn.family != experiment.family:
-            continue
-        old = first_by_game.get(key)
-        if old is None or turn.ts < old.ts:
+    for key, turn in parsed.first_turns.items():
+        assignment = assignments.get(key)
+        if (
+            key in enrolled
+            and turn.family == experiment.family
+            and assignment is not None
+            and assignment.included
+            and (cohort is None or assignment.cohort == cohort)
+        ):
             first_by_game[key] = turn
 
     for key, items in affected_by_game.items():
@@ -1019,14 +1367,26 @@ def _offer_outcomes(
         # ``affected_turns`` for routing diagnostics but cannot create extra
         # conversion trials or reweight the terminal payoff.
         first_affected = min(items, key=lambda item: (item["ts"], item["round"]))
-        variant = first_affected["variant"]
+        assignment = assignments[key]
+        variant = assignment.variant
         metric = by_variant[variant]
         metric["affected_games"] += 1
         metric["affected_turns"] += 1
         metric["direction_violations"] += int(
             bool(first_affected["direction_violation"])
         )
-        terminal = parsed.terminals.get(key)
+        terminal_result = _itt_deadline_terminal(
+            parsed,
+            key,
+            turn,
+            1200 if experiment.family == "bargaining" else _NEG_MATURITY_LAG_S,
+            experiment,
+        )
+        terminal = (
+            terminal_result[0]
+            if not terminal_result[1] and not terminal_result[2]
+            else None
+        )
         horizon = _horizon(turn)
         maximum = _max_rounds(turn)
         hmetric = metric["horizon_strata"].setdefault(horizon, _outcome_metric_empty())
@@ -1039,6 +1399,8 @@ def _offer_outcomes(
         targets = (metric, hmetric, mmetric, cmetric)
         for target in targets:
             target["games"] += 1
+            target["terminal_conflicts"] += int(terminal_result[1])
+            target["invalid_terminals"] += int(terminal_result[2])
         if terminal is None:
             for target in targets:
                 target["censored"] += 1
@@ -1049,7 +1411,7 @@ def _offer_outcomes(
             if experiment.family == "bargaining":
                 denominator = _as_float(state.get("money_to_divide"))
             else:
-                player = turn.game.get("your_player", "player_1")
+                player = _player_id(turn.game)
                 denominator = _as_float(state.get(f"{player}_value"))
             normalized_valid = (
                 payoff is not None and denominator is not None and denominator > 0
@@ -1108,6 +1470,56 @@ def _analysis_timestamp(parsed: ParsedRecords) -> float:
     return max(timestamps, default=0.0)
 
 
+def _utc_iso(timestamp: float) -> str | None:
+    """Render a timestamp without allowing platform range errors to escape."""
+
+    try:
+        return datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _analysis_clock(
+    parsed: ParsedRecords, *, wall_clock_ts: float | None = None
+) -> dict:
+    """Build one bounded censoring clock shared by every experiment.
+
+    Persisted timestamps beyond the platform datetime range are always rejected.
+    CLI reports additionally reject records more than five minutes ahead of the
+    observed wall clock.  Rejected records never advance maturation, while the
+    integrity bit makes every prospective binding view fail closed.
+    """
+
+    timestamps = [turn.ts for turn in parsed.turn_events]
+    timestamps.extend(event.ts for event in parsed.results)
+    timestamps.extend(event.ts for event in parsed.runtimes)
+    wall = _as_float(wall_clock_ts) if wall_clock_ts is not None else None
+    maximum_allowed = wall + _MAX_FUTURE_CLOCK_SKEW_S if wall is not None else None
+    invalid_range = [timestamp for timestamp in timestamps if _utc_iso(timestamp) is None]
+    future = [
+        timestamp
+        for timestamp in timestamps
+        if maximum_allowed is not None and timestamp > maximum_allowed
+    ]
+    accepted = [
+        timestamp
+        for timestamp in timestamps
+        if _utc_iso(timestamp) is not None
+        and (maximum_allowed is None or timestamp <= maximum_allowed)
+    ]
+    analysis_ts = max(accepted, default=0.0)
+    return {
+        "analysis_as_of_ts": analysis_ts,
+        "analysis_as_of_utc": _utc_iso(analysis_ts),
+        "max_observed_ts": max(timestamps, default=0.0),
+        "wall_clock_ts": wall,
+        "maximum_allowed_ts": maximum_allowed,
+        "future_skew_events": len(future),
+        "out_of_range_timestamp_events": len(invalid_range),
+        "valid": not future and not invalid_range,
+    }
+
+
 def _itt_leaf_empty() -> dict:
     return {
         "games": 0,
@@ -1140,6 +1552,7 @@ def _itt_metric_empty(*, population: str, maturity_lag_s: int) -> dict:
         ),
         "cells": {},
         "p_strata": {},
+        "by_agent": {},
     }
 
 
@@ -1161,6 +1574,8 @@ def _finish_itt_metric(metric: dict) -> None:
         _finish_itt_leaf(entry)
     for entry in metric["p_strata"].values():
         _finish_itt_leaf(entry)
+    for entry in metric["by_agent"].values():
+        _finish_itt_leaf(entry)
     _finish_itt_leaf(metric)
 
 
@@ -1172,8 +1587,9 @@ def _first_enrolled_turns(
     # sighting, otherwise a duplicate round-1 poll can move the deadline.
     return {
         key: turn
-        for key, turn in parsed.first_turns.items()
-        if key in enrolled and turn.family == family
+        for key in enrolled
+        if (turn := parsed.first_turns.get(key)) is not None
+        and turn.family == family
     }
 
 
@@ -1219,7 +1635,7 @@ def _runtime_variant(
 
 
 def _itt_cell_bargaining(turn: Turn) -> dict:
-    player = turn.game.get("your_player", "player_1")
+    player = _player_id(turn.game)
     return {"role": player, "horizon": _horizon(turn)}
 
 
@@ -1228,7 +1644,7 @@ def _itt_cell_persuasion(turn: Turn) -> dict:
     state = state if isinstance(state, dict) else {}
     return {
         "p": _as_float(state.get("p")),
-        "message_type": state.get("seller_message_type", "unknown"),
+        "message_type": _schema_string(state.get("seller_message_type")),
         "price": _as_float(state.get("product_price")),
         "total_rounds": _round_number(state.get("total_rounds")),
     }
@@ -1251,27 +1667,29 @@ def _itt_terminal_valid(turn: Turn, terminal: ResultEvent) -> bool:
     )
     legacy_direct = bool(
         not prospective
+        and terminal.ts < _NEG_PROSPECTIVE_ASSIGNMENT["activated_at"]
         and terminal.result_source is None
         and terminal.reaped is None
         and terminal.valid is True
     )
-    outcomes = (
-        {"completed", "timeout"}
-        if turn.family == "persuasion"
-        else {"agreement", "no_deal", "walked_away", "timeout"}
+    legacy_reaper = bool(
+        not prospective
+        and terminal.ts < _NEG_PROSPECTIVE_ASSIGNMENT["activated_at"]
+        and terminal.result_source is None
+        and terminal.reaped is None
+        and terminal.valid is None
     )
-    player = turn.game.get("your_player", "player_1")
-    payoff = terminal.result.get(f"{player}_payoff")
+    payload_failures = _terminal_payload_failures(
+        turn, terminal, prospective_schema=prospective
+    )
     return bool(
         terminal.game_over is True
         and terminal.error is None
         and terminal.result_is_dict
         and (not prospective or terminal.prospective_schema_valid)
-        and terminal.result.get("outcome") in outcomes
-        and not isinstance(payoff, bool)
-        and isinstance(payoff, (int, float))
-        and math.isfinite(float(payoff))
-        and (explicit_move or explicit_reaper or legacy_direct)
+        and not payload_failures
+        and _terminal_signature(turn, terminal) is not None
+        and (explicit_move or explicit_reaper or legacy_direct or legacy_reaper)
     )
 
 
@@ -1280,6 +1698,7 @@ def _itt_deadline_terminal(
     key: tuple[str, str],
     turn: Turn,
     maturity_lag_s: int,
+    experiment: Experiment,
 ) -> tuple[ResultEvent | None, bool, bool]:
     deadline = turn.ts + maturity_lag_s
     prospective = bool(
@@ -1288,42 +1707,56 @@ def _itt_deadline_terminal(
     )
     game_events = [
         event
-        for event in parsed.results
-        if (event.agent, event.gid) == key and turn.ts <= event.ts <= deadline
+        for event in parsed.results_by_game.get(key, ())
+        if turn.ts <= event.ts <= deadline
     ]
-    malformed_prospective = bool(
-        prospective
-        and any(not event.prospective_schema_valid for event in game_events)
-    )
     candidates = sorted(
         (
             event
             for event in game_events
             if event.game_over is True
+            or (
+                prospective
+                and not event.prospective_schema_valid
+                and event.result_is_dict
+                and bool(event.result)
+            )
         ),
         key=lambda event: event.ts,
     )
-    valid = [event for event in candidates if _itt_terminal_valid(turn, event)]
-    signatures = {
-        (
-            event.result.get("outcome"),
-            tuple(
-                sorted(
-                    (key, value)
-                    for key, value in event.result.items()
-                    if key.endswith("_payoff")
-                )
-            ),
+    runtime_checks = {
+        id(event): _strict_runtime_provenance(
+            parsed, experiment, turn.agent, event.ts
         )
+        for event in candidates
+        if prospective
+    }
+    valid = [
+        event
+        for event in candidates
+        if _itt_terminal_valid(turn, event)
+        and (
+            not prospective
+            or runtime_checks.get(id(event), {}).get("valid") is True
+        )
+    ]
+    valid_ids = {id(event) for event in valid}
+    malformed_terminal = bool(
+        any(id(event) not in valid_ids for event in candidates)
+        or any(_terminal_signature(turn, event) is None for event in valid)
+    )
+    signatures = {
+        signature
         for event in valid
+        if (signature := _terminal_signature(turn, event)) is not None
     }
     conflict = len(signatures) > 1
     if conflict:
-        return None, True, malformed_prospective
+        return None, True, malformed_terminal
     return (
         valid[0] if valid else candidates[0] if candidates else None,
         False,
-        malformed_prospective,
+        malformed_terminal,
     )
 
 
@@ -1345,6 +1778,9 @@ def _add_itt_observation(
     targets = [metric, cell_metric]
     if p_key is not None:
         targets.append(metric["p_strata"].setdefault(p_key, _itt_leaf_empty()))
+    targets.append(
+        metric["by_agent"].setdefault(turn.agent, _itt_leaf_empty())
+    )
     for target in targets:
         target["games"] += 1
         target["terminal_conflicts"] += int(terminal_conflict)
@@ -1353,6 +1789,9 @@ def _add_itt_observation(
     if analysis_ts < deadline:
         for target in targets:
             target["pending_maturation"] += 1
+            target["invalid_terminals"] += int(
+                terminal_conflict or terminal_schema_failure
+            )
         return
 
     payoff = _terminal_payoff(turn, terminal) if terminal is not None else None
@@ -1366,7 +1805,9 @@ def _add_itt_observation(
         terminal_timely and terminal is not None and _itt_terminal_valid(turn, terminal)
     )
     normalized_valid = (
-        terminal_structured
+        not terminal_conflict
+        and not terminal_schema_failure
+        and terminal_structured
         and payoff is not None
         and denominator is not None
         and denominator > 0
@@ -1399,8 +1840,10 @@ def _bargaining_itt(
     enrolled: set[tuple[str, str]],
     parsed: ParsedRecords,
     experiment: Experiment,
+    assignments: dict[tuple[str, str], GameAnalysisAssignment],
     *,
     analysis_ts: float,
+    cohort: str | None = None,
 ) -> dict:
     by_variant = {
         arm: _itt_metric_empty(
@@ -1409,15 +1852,35 @@ def _bargaining_itt(
         )
         for arm in ("treatment", "control")
     }
-    by_variant["integrity"] = {"unknown_assignment_games": 0}
+    by_variant["integrity"] = {
+        "unknown_assignment_games": 0,
+        "excluded_outside_confirmation_games": 0,
+        "excluded_unapproved_prospective_games": 0,
+    }
     for key, turn in _first_enrolled_turns(enrolled, parsed, "bargaining").items():
-        variant = _validated_game_assignment(parsed, experiment, key)[0]
+        assignment = assignments.get(key)
+        if assignment is None:
+            by_variant["integrity"]["unknown_assignment_games"] += 1
+            continue
+        if assignment.cohort == "outside_confirmation":
+            by_variant["integrity"]["excluded_outside_confirmation_games"] += 1
+            continue
+        if cohort is not None and assignment.cohort != cohort:
+            continue
+        if not assignment.included:
+            if assignment.cohort == "prospective":
+                by_variant["integrity"]["excluded_unapproved_prospective_games"] += 1
+            by_variant["integrity"]["unknown_assignment_games"] += 1
+            continue
+        variant = assignment.variant
         if variant not in by_variant:
             by_variant["integrity"]["unknown_assignment_games"] += 1
             continue
         state = turn.game.get("game_state")
         state = state if isinstance(state, dict) else {}
-        terminal_result = _itt_deadline_terminal(parsed, key, turn, 1200)
+        terminal_result = _itt_deadline_terminal(
+            parsed, key, turn, 1200, experiment
+        )
         _add_itt_observation(
             by_variant[variant],
             turn,
@@ -1438,8 +1901,10 @@ def _persuasion_itt(
     enrolled: set[tuple[str, str]],
     parsed: ParsedRecords,
     experiment: Experiment,
+    assignments: dict[tuple[str, str], GameAnalysisAssignment],
     *,
     analysis_ts: float,
+    cohort: str | None = None,
 ) -> dict:
     by_variant = {
         arm: _itt_metric_empty(
@@ -1448,17 +1913,35 @@ def _persuasion_itt(
         )
         for arm in ("treatment", "control")
     }
-    by_variant["integrity"] = {"unknown_assignment_games": 0}
+    by_variant["integrity"] = {
+        "unknown_assignment_games": 0,
+        "excluded_outside_confirmation_games": 0,
+        "excluded_unapproved_prospective_games": 0,
+    }
     for key, turn in _first_enrolled_turns(enrolled, parsed, "persuasion").items():
         state = turn.game.get("game_state")
         state = state if isinstance(state, dict) else {}
-        player = turn.game.get("your_player", "player_1")
+        player = _player_id(turn.game)
         seller = player == "player_1" or state.get(f"{player}_role") == "seller"
         # V2 deliberately excludes ambiguous legacy payloads: the estimand is
         # the explicit blind-seller contract, not a post-hoc missing-v proxy.
         if not seller or state.get("is_seller_know_cv") is not False:
             continue
-        variant = _validated_game_assignment(parsed, experiment, key)[0]
+        assignment = assignments.get(key)
+        if assignment is None:
+            by_variant["integrity"]["unknown_assignment_games"] += 1
+            continue
+        if assignment.cohort == "outside_confirmation":
+            by_variant["integrity"]["excluded_outside_confirmation_games"] += 1
+            continue
+        if cohort is not None and assignment.cohort != cohort:
+            continue
+        if not assignment.included:
+            if assignment.cohort == "prospective":
+                by_variant["integrity"]["excluded_unapproved_prospective_games"] += 1
+            by_variant["integrity"]["unknown_assignment_games"] += 1
+            continue
+        variant = assignment.variant
         if variant not in by_variant:
             by_variant["integrity"]["unknown_assignment_games"] += 1
             continue
@@ -1469,7 +1952,9 @@ def _persuasion_itt(
             if price is not None and price > 0 and rounds_value is not None and rounds_value > 0
             else None
         )
-        terminal_result = _itt_deadline_terminal(parsed, key, turn, 1800)
+        terminal_result = _itt_deadline_terminal(
+            parsed, key, turn, 1800, experiment
+        )
         _add_itt_observation(
             by_variant[variant],
             turn,
@@ -1560,8 +2045,7 @@ def _neg_target_integrity(actual: dict | None = None) -> dict:
 def _literal_finite_number(value: Any) -> float | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    result = float(value)
-    return result if math.isfinite(result) else None
+    return _as_float(value)
 
 
 def _literal_nonnegative_int(value: Any) -> int | None:
@@ -1574,6 +2058,108 @@ def _sha256_text(value: Any) -> str | None:
     if not isinstance(value, str) or not re.fullmatch(r"[0-9a-f]{64}", value):
         return None
     return value
+
+
+def _strict_runtime_provenance(
+    parsed: ParsedRecords,
+    experiment: Experiment,
+    agent: str,
+    event_ts: float,
+) -> dict:
+    """Fail-closed runtime identity for a prospective terminal event.
+
+    The live runner holds a single-instance lock, so the unique latest startup
+    manifest at or before a result is the strongest provenance available in
+    the current result schema.  Ambiguous duplicate manifests are rejected.
+    """
+
+    candidates = [
+        event
+        for event in parsed.runtimes
+        if event.agent == agent
+        and experiment.cutoff <= event.ts <= event_ts
+    ]
+    if not candidates:
+        return {"valid": False, "failures": ["missing_terminal_runtime"]}
+    latest_ts = max(event.ts for event in candidates)
+    latest = [event for event in candidates if event.ts == latest_ts]
+    if len(latest) != 1:
+        return {
+            "valid": False,
+            "failures": ["ambiguous_terminal_runtime"],
+            "runtime_ts": latest_ts,
+        }
+    runtime = latest[0]
+    expected = _prospective_assignment_expected(experiment)
+    manifest = (
+        runtime.canary_assignment
+        if isinstance(runtime.canary_assignment, dict)
+        else {}
+    )
+    artifact = manifest.get("artifact")
+    artifact = artifact if isinstance(artifact, dict) else {}
+    contract = manifest.get("contract")
+    contract = contract if isinstance(contract, dict) else {}
+    receipt_store = manifest.get("receipt_store")
+    receipt_store = receipt_store if isinstance(receipt_store, dict) else {}
+    failures: list[str] = []
+    if set(manifest) != {
+        "loader_status",
+        "error_code",
+        "artifact",
+        "contract",
+        "receipt_store",
+    }:
+        failures.append("terminal_runtime_manifest_fields")
+    if manifest.get("loader_status") != "valid" or manifest.get("error_code") is not None:
+        failures.append("terminal_runtime_loader")
+    if artifact != {
+        "path": expected["artifact_path"],
+        "available": True,
+        "sha256": expected["artifact_sha256"],
+        "bytes": expected["artifact_bytes"],
+    }:
+        failures.append("terminal_runtime_artifact")
+    expected_contract = {
+        "schema_version": 1,
+        "plan_id": expected["plan_id"],
+        "assignment_salt": expected["assignment_salt"],
+        "assignment_salt_visibility": "public_replay_seed",
+        "activated_at": expected["activated_at"],
+        "expires_at": expected["expires_at"],
+        "agents": expected["agents"],
+        "assignment_algorithm": expected["assignment_algorithm"],
+        "enrollment": {
+            "first_seen_round": 1,
+            "requires_empty_history": True,
+            "assigned_games_remain_stable_after_expiry": True,
+        },
+        "rules": expected["rules"],
+    }
+    if contract != expected_contract:
+        failures.append("terminal_runtime_contract")
+    if receipt_store != {
+        "format": "append-only-jsonl-v1",
+        "path": (
+            f"logs/canary-assignments/{agent}/"
+            f"{expected['artifact_sha256']}.jsonl"
+        ),
+        "write_ahead_fsync": True,
+        "max_bytes": 64 * 1024 * 1024,
+    }:
+        failures.append("terminal_runtime_receipt_store")
+    if runtime.strategy_sha256 != expected["strategy_aggregate_sha256"]:
+        failures.append("terminal_runtime_strategy")
+    if runtime.target_sha256 != expected["target_sha256"]:
+        failures.append("terminal_runtime_targets")
+    return {
+        "valid": not failures,
+        "failures": failures,
+        "runtime_ts": runtime.ts,
+        "runtime_pid": runtime.pid,
+        "strategy_aggregate_sha256": runtime.strategy_sha256,
+        "target_sha256": dict(runtime.target_sha256),
+    }
 
 
 def _neg_receipt_assignment(
@@ -1686,7 +2272,8 @@ def _neg_receipt_assignment(
         and metadata.get("value") == expected_value
     ):
         failures.append("value")
-    if probability is None or not 0 <= probability <= 1:
+    probability_valid = probability is not None and 0 <= probability <= 1
+    if not probability_valid:
         failures.append("treatment_probability")
     if metadata.get("assignment_algorithm") != "sha256-u64-v1":
         failures.append("algorithm")
@@ -1694,7 +2281,10 @@ def _neg_receipt_assignment(
         failures.append("assignment_u64")
     if threshold is None or threshold > 1 << 64:
         failures.append("threshold")
-    if probability is not None and threshold != int(probability * (1 << 64)):
+    if (
+        probability_valid
+        and threshold != int(probability * (1 << 64))
+    ):
         failures.append("threshold_probability")
     if assignment_u64 is not None and threshold is not None:
         derived_arm = "treatment" if assignment_u64 < threshold else "control"
@@ -1713,7 +2303,15 @@ def _neg_receipt_assignment(
         if event.agent == turn.agent
         and experiment.cutoff <= event.ts <= turn.ts
     ]
-    runtime = max(runtime_candidates, key=lambda item: item.ts) if runtime_candidates else None
+    latest_runtime_ts = max(
+        (event.ts for event in runtime_candidates), default=None
+    )
+    latest_runtimes = [
+        event for event in runtime_candidates if event.ts == latest_runtime_ts
+    ]
+    runtime = latest_runtimes[0] if len(latest_runtimes) == 1 else None
+    if len(latest_runtimes) > 1:
+        failures.append("ambiguous_runtime_epoch")
     manifest = runtime.canary_assignment if runtime is not None else None
     manifest = manifest if isinstance(manifest, dict) else {}
     manifest_artifact = manifest.get("artifact")
@@ -1824,11 +2422,18 @@ def _neg_receipt_assignment(
             experiment.family,
             turn.gid,
         )
-        digest = hashlib.sha256(
-            b"\0".join(component.encode("utf-8") for component in components)
-        ).digest()
-        if digest.hex() != assignment_sha or int.from_bytes(digest[:8], "big") != assignment_u64:
-            failures.append("assignment_digest")
+        encoded_components = [_utf8_bytes(component) for component in components]
+        if any(component is None for component in encoded_components):
+            failures.append("assignment_digest_text")
+        else:
+            digest = hashlib.sha256(
+                b"\0".join(encoded_components)  # type: ignore[arg-type]
+            ).digest()
+            if (
+                digest.hex() != assignment_sha
+                or int.from_bytes(digest[:8], "big") != assignment_u64
+            ):
+                failures.append("assignment_digest")
     else:
         failures.append("assignment_salt")
 
@@ -1879,7 +2484,11 @@ def _neg_receipt_assignment(
     )
     return (
         str(arm),
-        f"receipt:{artifact[:12]}:{plan_id}:{rule_id}",
+        (
+            f"receipt:{turn.agent}:runtime:{runtime.ts:.6f}:"
+            f"pid:{runtime.pid}:block:{int(enrolled_at // 1800)}:"
+            f"arm:{arm}:{artifact[:12]}"
+        ),
         "manifest_assignment_receipt",
         {
             "prospective": True,
@@ -1889,6 +2498,7 @@ def _neg_receipt_assignment(
             "plan_id": plan_id,
             "rule_id": rule_id,
             "activated_at": activated_at,
+            "expires_at": expires_at,
             "enrolled_at": enrolled_at,
             "enrollment": metadata.get("enrollment"),
             "runtime_ts": runtime.ts,
@@ -1976,11 +2586,11 @@ def _neg_gate_payoff_percentile(
         percentile = None
         if full_key is not None:
             percentile = targets.payoff_percentile(
-                "negotiation", full_key, turn.game.get("your_player", "player_1"), payoff
+                "negotiation", full_key, _player_id(turn.game), payoff
             )
         if percentile is None and role_key is not None:
             percentile = targets.payoff_percentile(
-                "negotiation", role_key, turn.game.get("your_player", "player_1"), payoff
+                "negotiation", role_key, _player_id(turn.game), payoff
             )
         return _as_float(percentile)
     except Exception:  # noqa: BLE001 - target drift must not kill a health report
@@ -1990,33 +2600,31 @@ def _neg_gate_payoff_percentile(
 def _neg_gate_unsupported_reason(cell: dict) -> str:
     if cell.get("complete_information") is not False:
         return "complete_information"
-    if cell.get("role") != "buyer":
-        return f"role={cell.get('role', 'unknown')}"
-    if cell.get("own_value_grid") not in {"80", "100", "120", "150"}:
-        return f"own_value_grid={cell.get('own_value_grid', 'unknown')}"
-    if cell.get("phase") != "decision":
-        return f"phase={cell.get('phase', 'unknown')}"
-    if cell.get("horizon") != "finite" or cell.get("max_rounds") != "10":
+    role = _schema_string(cell.get("role"))
+    if role != "buyer":
+        return f"role={role}"
+    own_value_grid = _schema_string(cell.get("own_value_grid"))
+    if own_value_grid not in ("80", "100", "120", "150"):
+        return f"own_value_grid={own_value_grid}"
+    phase = _schema_string(cell.get("phase"))
+    if phase != "decision":
+        return f"phase={phase}"
+    horizon = _schema_string(cell.get("horizon"))
+    max_rounds = _schema_string(cell.get("max_rounds"))
+    if horizon != "finite" or max_rounds != "10":
         return (
-            f"horizon={cell.get('horizon', 'unknown')},"
-            f"max_rounds={cell.get('max_rounds', 'unknown')}"
+            f"horizon={horizon},"
+            f"max_rounds={max_rounds}"
         )
-    if cell.get("opponent_type") not in ("agent", "hidden"):
-        return f"opponent_type={cell.get('opponent_type', 'unknown')}"
+    opponent_type = _schema_string(cell.get("opponent_type"))
+    if opponent_type not in ("agent", "hidden"):
+        return f"opponent_type={opponent_type}"
     return "not_in_frozen_reference"
 
 
 def _neg_valid_terminal(
     event: ResultEvent, turn: Turn, *, prospective_schema: bool
 ) -> bool:
-    outcome = event.result.get("outcome")
-    player = turn.game.get("your_player", "player_1")
-    payoff = event.result.get(f"{player}_payoff")
-    payoff_valid = (
-        not isinstance(payoff, bool)
-        and isinstance(payoff, (int, float))
-        and math.isfinite(float(payoff))
-    )
     explicit_move = bool(
         event.result_source == "move"
         and event.reaped is False
@@ -2029,18 +2637,29 @@ def _neg_valid_terminal(
     )
     legacy_direct = bool(
         not prospective_schema
+        and event.ts < _NEG_PROSPECTIVE_ASSIGNMENT["activated_at"]
         and event.result_source is None
         and event.reaped is None
         and event.valid is True
+    )
+    legacy_reaper = bool(
+        not prospective_schema
+        and event.ts < _NEG_PROSPECTIVE_ASSIGNMENT["activated_at"]
+        and event.result_source is None
+        and event.reaped is None
+        and event.valid is None
+    )
+    payload_failures = _terminal_payload_failures(
+        turn, event, prospective_schema=prospective_schema
     )
     return bool(
         event.game_over is True
         and event.error is None
         and event.result_is_dict
         and (not prospective_schema or event.prospective_schema_valid)
-        and outcome in ("agreement", "no_deal", "walked_away", "timeout")
-        and payoff_valid
-        and (explicit_move or explicit_reaper or legacy_direct)
+        and not payload_failures
+        and _terminal_signature(turn, event) is not None
+        and (explicit_move or explicit_reaper or legacy_direct or legacy_reaper)
     )
 
 
@@ -2050,35 +2669,48 @@ def _neg_deadline_outcome(
     first_observed_ts: float,
     analysis_ts: float,
     turn: Turn,
+    experiment: Experiment,
     *,
     prospective_schema: bool,
 ) -> dict:
     """Classify a game once by its fixed first-turn + 600 second deadline."""
     deadline_ts = first_observed_ts + _NEG_MATURITY_LAG_S
     game_events = sorted(
-        (
-            event
-            for event in parsed.results
-            if (event.agent, event.gid) == key
-        ),
-        key=lambda event: event.ts,
+        parsed.results_by_game.get(key, ()), key=lambda event: event.ts
     )
-    candidates = [event for event in game_events if event.game_over is True]
-    malformed_terminal_events = sum(
-        prospective_schema
-        and first_observed_ts <= event.ts <= deadline_ts
-        and not event.prospective_schema_valid
+    candidates = [
+        event
         for event in game_events
-    )
+        if event.game_over is True
+        or (
+            prospective_schema
+            and not event.prospective_schema_valid
+            and event.result_is_dict
+            and bool(event.result)
+        )
+    ]
+    runtime_checks = {
+        id(event): _strict_runtime_provenance(
+            parsed, experiment, turn.agent, event.ts
+        )
+        for event in candidates
+        if prospective_schema and first_observed_ts <= event.ts <= deadline_ts
+    }
     timely_valid = [
         event
         for event in candidates
         if first_observed_ts <= event.ts <= deadline_ts
         and _neg_valid_terminal(event, turn, prospective_schema=prospective_schema)
+        and (
+            not prospective_schema
+            or runtime_checks.get(id(event), {}).get("valid") is True
+        )
     ]
+    timely_valid_ids = {id(event) for event in timely_valid}
     terminal_signatures = {
-        json.dumps(event.result, sort_keys=True, separators=(",", ":"))
+        signature
         for event in timely_valid
+        if (signature := _terminal_signature(turn, event)) is not None
     }
     conflicting_timely = len(terminal_signatures) > 1
     terminal = timely_valid[0] if timely_valid and not conflicting_timely else None
@@ -2100,14 +2732,16 @@ def _neg_deadline_outcome(
         "matured": status != "pending",
         "invalid_timely_terminals": sum(
             first_observed_ts <= event.ts <= deadline_ts
-            and not _neg_valid_terminal(
-                event, turn, prospective_schema=prospective_schema
-            )
+            and id(event) not in timely_valid_ids
             for event in candidates
         ),
         "late_terminals": sum(event.ts > deadline_ts for event in candidates),
         "conflicting_timely_terminals": conflicting_timely,
-        "malformed_terminal_events": malformed_terminal_events,
+        "malformed_terminal_events": sum(
+            first_observed_ts <= event.ts <= deadline_ts
+            and id(event) not in timely_valid_ids
+            for event in candidates
+        ),
     }
 
 
@@ -2124,8 +2758,8 @@ def _neg_game_assignment_evidence(
     game_turns = sorted(
         (
             turn
-            for turn in parsed.turn_events
-            if (turn.agent, turn.gid) == key and turn.family == experiment.family
+            for turn in parsed.turn_events_by_game.get(key, ())
+            if turn.family == experiment.family
         ),
         key=lambda turn: (turn.ts, turn.round, turn.phase),
     )
@@ -2147,44 +2781,36 @@ def _neg_game_assignment_evidence(
         for item in validated
         if item is not None and isinstance(item[3], dict)
     ]
-    recovered_index = next(
-        (
-            index
-            for index, enrollment in enumerate(enrollment_sequence)
-            if enrollment == "recovered"
-        ),
-        None,
-    )
-    enrollment_monotone = bool(
-        enrollment_sequence
-        and enrollment_sequence[0] == "new"
-        and len(enrolled_times) == 1
-        and (
-            recovered_index is None
-            or (
-                all(value == "new" for value in enrollment_sequence[:recovered_index])
-                and all(
-                    value == "recovered"
-                    for value in enrollment_sequence[recovered_index:]
-                )
-                and recovered_index > 0
-                and runtime_ids[recovered_index] != runtime_ids[recovered_index - 1]
-            )
-        )
-    )
+    enrollment_monotone = bool(enrollment_sequence and len(enrolled_times) == 1)
+    if enrollment_monotone:
+        first_runtime_id = runtime_ids[0]
+        crossed_runtime_boundary = False
+        previous_runtime_id = first_runtime_id
+        for index, (enrollment, runtime_id) in enumerate(
+            zip(enrollment_sequence, runtime_ids, strict=True)
+        ):
+            if index and runtime_id != previous_runtime_id:
+                crossed_runtime_boundary = True
+            expected_enrollment = "recovered" if crossed_runtime_boundary else "new"
+            if enrollment != expected_enrollment:
+                enrollment_monotone = False
+                break
+            previous_runtime_id = runtime_id
     consistent = bool(
         game_turns
-        and game_turns[0] is first_observed
+        and game_turns[0].ts == first_observed.ts
+        and game_turns[0].round == first_observed.round
+        and game_turns[0].phase == first_observed.phase
         and all(item is not None for item in validated)
         and enrollment_monotone
         and all(
             item is not None
             and item[0] == variant
-            and item[1] == epoch_id
             and item[2] == source
             and item[3].get("assignment_sha256")
             == evidence.get("assignment_sha256")
             and item[3].get("valid") is True
+            and item[3].get("approved") is True
             for item in validated
         )
     )
@@ -2299,11 +2925,58 @@ def _validated_game_assignment(
     )
 
 
+def _game_analysis_assignment(
+    parsed: ParsedRecords,
+    experiment: Experiment,
+    key: tuple[str, str],
+) -> GameAnalysisAssignment:
+    variant, epoch_id, source, evidence = _validated_game_assignment(
+        parsed, experiment, key
+    )
+    if evidence.get("outside_confirmation") is True:
+        cohort = "outside_confirmation"
+    elif evidence.get("prospective") is True:
+        cohort = "prospective"
+    else:
+        cohort = "legacy"
+    included = bool(
+        variant in ("treatment", "control")
+        and evidence.get("valid") is True
+        and (
+            cohort == "legacy"
+            or (cohort == "prospective" and evidence.get("approved") is True)
+        )
+    )
+    return GameAnalysisAssignment(
+        variant=variant,
+        epoch_id=epoch_id,
+        source=source,
+        evidence=dict(evidence),
+        cohort=cohort,
+        included=included,
+    )
+
+
+def _game_analysis_assignments(
+    parsed: ParsedRecords, experiment: Experiment
+) -> dict[tuple[str, str], GameAnalysisAssignment]:
+    return {
+        key: _game_analysis_assignment(parsed, experiment, key)
+        for key, turn in parsed.first_turns.items()
+        if turn.agent in experiment.agents
+        and turn.family == experiment.family
+        and turn.ts >= experiment.cutoff
+    }
+
+
 def _neg_terminal_gate_rows(
     affected: list[dict],
     enrolled: set[tuple[str, str]],
     parsed: ParsedRecords,
     experiment: Experiment,
+    assignments: dict[tuple[str, str], GameAnalysisAssignment],
+    *,
+    analysis_ts: float,
 ) -> list[dict]:
     """Extract exactly one immutable gate observation per affected game."""
     affected_by_game: dict[tuple[str, str], list[dict]] = defaultdict(list)
@@ -2322,7 +2995,6 @@ def _neg_terminal_gate_rows(
         load_targets(TARGETS_PATH, live=False) if target_integrity["pass"] else None
     )
     rows: list[dict] = []
-    analysis_ts = _analysis_timestamp(parsed)
     for key, items in sorted(affected_by_game.items()):
         first = min(items, key=lambda item: (item["ts"], item["round"], item["phase"]))
         turn = turn_index.get((key[0], key[1], first["round"], first["phase"]))
@@ -2330,9 +3002,12 @@ def _neg_terminal_gate_rows(
             continue
         state = turn.game.get("game_state")
         state = state if isinstance(state, dict) else {}
-        player = turn.game.get("your_player", "player_1")
-        role = state.get(
-            f"{player}_role", "seller" if player == "player_1" else "buyer"
+        player = _player_id(turn.game)
+        role = _schema_string(
+            state.get(
+                f"{player}_role",
+                "seller" if player == "player_1" else "buyer",
+            )
         )
         own_value = _as_float(state.get(f"{player}_value"))
         opponent = turn.game.get("opponent")
@@ -2343,7 +3018,7 @@ def _neg_terminal_gate_rows(
             "phase": first.get("phase", "unknown"),
             "horizon": _horizon(turn),
             "max_rounds": _max_rounds(turn),
-            "opponent_type": opponent.get("type", "unknown"),
+            "opponent_type": _schema_string(opponent.get("type")),
             "complete_information": bool(state.get("complete_information", False)),
         }
         cell_id = _neg_gate_cell_id(cell)
@@ -2356,6 +3031,7 @@ def _neg_terminal_gate_rows(
             first_observed.ts,
             analysis_ts,
             first_observed,
+            experiment,
             prospective_schema=bool(
                 isinstance(first_observed.canary_assignment, dict)
                 and first_observed.canary_assignment.get("status") == "assigned"
@@ -2383,8 +3059,13 @@ def _neg_terminal_gate_rows(
             ),
             None,
         )
-        assignment = _validated_game_assignment(parsed, experiment, key)
-        variant, epoch_id, assignment_source, assignment_evidence = assignment
+        assignment = assignments.get(key)
+        if assignment is None or not assignment.included:
+            continue
+        variant = assignment.variant
+        epoch_id = assignment.epoch_id
+        assignment_source = assignment.source
+        assignment_evidence = assignment.evidence
         rows.append(
             {
                 "agent": key[0],
@@ -2421,7 +3102,7 @@ def _neg_terminal_gate_rows(
                 "effective_offer_round": offer_round,
                 "normalized_payoff": normalized,
                 "payoff_percentile": _neg_gate_payoff_percentile(
-                    turn, str(role), own_value, payoff, targets
+                    turn, role, own_value, payoff, targets
                 ),
                 "compatibility_rate": compatibility,
                 "direction_violation": bool(first.get("direction_violation")),
@@ -2506,7 +3187,7 @@ def _neg_gate_counts(rows: list[dict]) -> dict:
             _neg_gate_add_sample(agent["primary"], row)
             _neg_gate_add_sample(cells[row["cell_id"]][variant], row)
             continue
-        reason = str(row.get("unsupported_reason") or "unknown")
+        reason = _schema_string(row.get("unsupported_reason"))
         unsupported_reasons[reason] += 1
         entry = unsupported_cells.setdefault(
             row["cell_id"],
@@ -2534,6 +3215,10 @@ def _neg_gate_row_failures(row: Any) -> list[str]:
     if not isinstance(row, dict):
         return ["row is not an object"]
     failures: list[str] = []
+    if not isinstance(row.get("agent"), str) or not row.get("agent"):
+        failures.append("agent missing or invalid")
+    if not isinstance(row.get("game_id"), str) or not row.get("game_id"):
+        failures.append("game_id missing or invalid")
     if row.get("variant") not in ("treatment", "control"):
         failures.append("variant missing or invalid")
     cell = row.get("cell")
@@ -2541,8 +3226,32 @@ def _neg_gate_row_failures(row: Any) -> list[str]:
         failures.append("cell missing or malformed")
     else:
         cell_id = row.get("cell_id")
-        if not isinstance(cell_id, str) or cell_id != _neg_gate_cell_id(cell):
+        expected_cell_id = _neg_gate_cell_id(cell)
+        if (
+            expected_cell_id == _INVALID_CELL_KEY
+            or not isinstance(cell_id, str)
+            or cell_id != expected_cell_id
+        ):
             failures.append("cell_id mismatch")
+        reference_ids = {
+            _neg_gate_cell_id(spec) for spec in _NEG_TERMINAL_REFERENCE_CELLS
+        }
+        expected_supported = (
+            expected_cell_id != _INVALID_CELL_KEY
+            and expected_cell_id in reference_ids
+        )
+        if row.get("supported") is not expected_supported:
+            failures.append("supported flag does not match frozen cell membership")
+        expected_reason = (
+            None if expected_supported else _neg_gate_unsupported_reason(cell)
+        )
+        if row.get("unsupported_reason") != expected_reason:
+            failures.append("unsupported_reason does not match frozen semantics")
+        for field in _NEG_GATE_CELL_FIELDS[:-1]:
+            if not isinstance(cell.get(field), str):
+                failures.append(f"cell.{field} must be a literal string")
+        if type(cell.get("complete_information")) is not bool:
+            failures.append("cell.complete_information must be a literal boolean")
     for key in (
         "supported",
         "matured",
@@ -2557,11 +3266,14 @@ def _neg_gate_row_failures(row: Any) -> list[str]:
         if type(row.get(key)) is not bool:
             failures.append(f"{key} must be a literal boolean")
     status = row.get("maturity_status")
-    expected = {
+    expected_by_status = {
         "resolved": (True, True, False, False),
         "pending": (False, False, True, False),
         "deadline_censored": (True, False, False, True),
-    }.get(status)
+    }
+    expected = (
+        expected_by_status.get(status) if isinstance(status, str) else None
+    )
     observed = (
         row.get("matured"),
         row.get("resolved"),
@@ -2601,6 +3313,8 @@ def _neg_gate_row_failures(row: Any) -> list[str]:
     ):
         if _literal_nonnegative_int(row.get(key)) is None:
             failures.append(f"{key} must be a literal nonnegative integer")
+    if _literal_nonnegative_int(row.get("invalid_timely_terminals")) not in (0,):
+        failures.append("invalid timely terminal evidence")
     if row.get("conflicting_timely_terminals") is True:
         failures.append("conflicting timely valid terminals")
     if _literal_nonnegative_int(row.get("malformed_terminal_events")) not in (0,):
@@ -2615,13 +3329,63 @@ def _neg_gate_row_failures(row: Any) -> list[str]:
         failures.append("pending/censored row contains post-deadline outcome")
     for key in ("normalized_payoff", "payoff_percentile"):
         value = row.get(key)
-        if value is not None and _literal_finite_number(value) is None:
+        number = _literal_finite_number(value) if value is not None else None
+        if value is not None and number is None:
             failures.append(f"{key} is malformed")
+        elif number is not None and not 0 <= number <= 1:
+            failures.append(f"{key} must be within [0,1]")
     evidence = row.get("assignment_evidence")
     if not isinstance(evidence, dict) or type(evidence.get("prospective")) is not bool:
         failures.append("assignment evidence missing or malformed")
     elif evidence.get("valid") is not True:
         failures.append("assignment evidence invalid")
+    return failures
+
+
+def _neg_gate_cross_row_failures(rows: list[Any]) -> dict[int, list[str]]:
+    """Reject duplicate observations and mutable/common-look identities."""
+
+    failures: dict[int, list[str]] = defaultdict(list)
+    keys: dict[tuple[str, str], list[int]] = defaultdict(list)
+    analysis_timestamps: dict[float, list[int]] = defaultdict(list)
+    for index, row in enumerate(rows):
+        if not isinstance(row, dict):
+            continue
+        agent = row.get("agent")
+        game_id = row.get("game_id")
+        if isinstance(agent, str) and isinstance(game_id, str):
+            keys[(agent, game_id)].append(index)
+        analysis_ts = _literal_finite_number(row.get("analysis_ts"))
+        if analysis_ts is not None:
+            analysis_timestamps[analysis_ts].append(index)
+        evidence = row.get("assignment_evidence")
+        if isinstance(evidence, dict) and evidence.get("prospective") is True:
+            expected = _prospective_assignment_expected(
+                next(
+                    experiment
+                    for experiment in EXPERIMENTS
+                    if experiment.name == "neg_terminal_close"
+                )
+            )
+            identity = {
+                "artifact_sha256": expected["artifact_sha256"],
+                "plan_id": expected["plan_id"],
+                "rule_id": expected["rule_id"],
+                "activated_at": float(expected["activated_at"]),
+                "expires_at": float(expected["expires_at"]),
+            }
+            if any(evidence.get(key) != value for key, value in identity.items()):
+                failures[index].append(
+                    "prospective row does not share the frozen prefix cutoff identity"
+                )
+    for indices in keys.values():
+        if len(indices) > 1:
+            for index in indices:
+                failures[index].append("duplicate (agent,game_id) observation")
+    if len(analysis_timestamps) > 1:
+        for indices in analysis_timestamps.values():
+            for index in indices:
+                failures[index].append("analysis_ts differs from common report prefix")
     return failures
 
 
@@ -3009,6 +3773,8 @@ def _neg_gate_epoch_health(
     experiment: Experiment,
     affected: list[dict],
     agent_data: dict[str, dict],
+    assignments: dict[tuple[str, str], GameAnalysisAssignment],
+    cohort_routing: dict[str, dict],
 ) -> dict[str, dict]:
     by_cohort = {
         cohort: {
@@ -3016,6 +3782,9 @@ def _neg_gate_epoch_health(
                 "traffic_events": 0,
                 "errors": 0,
                 "invalid_results": 0,
+                "invalid_moves": 0,
+                "invalid_terminals": 0,
+                "provenance_faults": 0,
                 "corrections": 0,
                 "replay_errors": 0,
                 "affected_wrong_variant": 0,
@@ -3028,14 +3797,20 @@ def _neg_gate_epoch_health(
         }
         for cohort in ("legacy", "prospective")
     }
-    arm_health = _experiment_arm_health(parsed, experiment)
+    arm_health = _experiment_arm_health(parsed, experiment, assignments)
     for cohort in ("legacy", "prospective"):
         for variant in ("treatment", "control"):
             source = arm_health["cohorts"][cohort][variant]
             target = by_cohort[cohort][variant]
             target["traffic_events"] = source["turn_events"] + source["result_events"]
             target["errors"] = source["turn_errors"] + source["result_errors"]
-            target["invalid_results"] = source["invalid_results"]
+            for key in (
+                "invalid_results",
+                "invalid_moves",
+                "invalid_terminals",
+                "provenance_faults",
+            ):
+                target[key] = source.get(key, 0)
             target["corrections"] = source["corrections"]
     for item in affected:
         variant = item.get("variant")
@@ -3055,16 +3830,17 @@ def _neg_gate_epoch_health(
             not item.get("assigned_match") and not item.get("other_variant_match")
         )
         target["direction_violations"] += int(bool(item.get("direction_violation")))
-    replay_errors = sum(
-        data.get("routing", {}).get("replay_errors", 0)
-        for data in agent_data.values()
-    )
-    selected_cohort = "prospective" if any(
-        isinstance(item.get("assignment_evidence"), dict)
-        and item["assignment_evidence"].get("prospective") is True
-        for item in affected
-    ) else "legacy"
-    by_cohort[selected_cohort]["treatment"]["replay_errors"] = replay_errors
+    for cohort in ("legacy", "prospective"):
+        for variant in ("treatment", "control"):
+            routing = cohort_routing.get(cohort, {}).get(variant, {})
+            target = by_cohort[cohort][variant]
+            for key in (
+                "replay_errors",
+                "affected_wrong_variant",
+                "affected_unknown",
+                "direction_violations",
+            ):
+                target[key] = int(routing.get(key, 0))
     duplicate_causal_conflicts = sum(
         data.get("routing", {}).get("duplicate_causal_turn_conflicts", 0)
         for data in agent_data.values()
@@ -3091,6 +3867,9 @@ def _neg_gate_health(
             "traffic_events": 0,
             "errors": 0,
             "invalid_results": 0,
+            "invalid_moves": 0,
+            "invalid_terminals": 0,
+            "provenance_faults": 0,
             "corrections": 0,
             "replay_errors": 0,
             "affected_wrong_variant": 0,
@@ -3121,7 +3900,13 @@ def _neg_gate_health(
             target["errors"] += health.get("turn_errors", 0) + health.get(
                 "result_errors", 0
             )
-            target["invalid_results"] += health.get("invalid_results", 0)
+            for key in (
+                "invalid_results",
+                "invalid_moves",
+                "invalid_terminals",
+                "provenance_faults",
+            ):
+                target[key] += health.get(key, 0)
             target["corrections"] += health.get("corrections", 0)
             for key in (
                 "replay_errors",
@@ -3173,12 +3958,43 @@ def _neg_gate_health(
             "direction_violations",
         )
     )
-    treatment_validity_faults = treatment["invalid_results"] + treatment["corrections"]
+    # Only invalid moves and corrections are things a strategy arm can cause.
+    # Invalid terminals and prospective provenance faults are reporter-side
+    # evidence quality: they occur in both arms at the platform's baseline
+    # rate, are already handled conservatively by the deadline-zero outcome
+    # policy, and folding them into a zero-tolerance treatment check made the
+    # check fire on noise rather than on treatment-caused invalidity.
+    treatment_validity_faults = treatment["invalid_moves"] + treatment["corrections"]
+    reporter_faults = {
+        variant: target["invalid_terminals"] + target["provenance_faults"]
+        for variant, target in by_variant.items()
+    }
+    reporter_fault_rates = {
+        variant: (
+            reporter_faults[variant] / target["traffic_events"]
+            if target["traffic_events"]
+            else None
+        )
+        for variant, target in by_variant.items()
+    }
+    reporter_fault_excess = (
+        reporter_fault_rates["treatment"] - reporter_fault_rates["control"]
+        if reporter_fault_rates["treatment"] is not None
+        and reporter_fault_rates["control"] is not None
+        else None
+    )
     checks = {
         "routing_and_direction_clean": structural_faults == 0,
         "treatment_invalid_and_corrections_clean": treatment_validity_faults == 0,
         "treatment_error_rate_excess_within_0.01": (
             error_excess <= 0.010 if error_excess is not None else None
+        ),
+        # Control-relative, so a treatment-specific explosion in unusable
+        # evidence still hard-fails while a shared baseline does not.
+        "reporter_fault_excess_within_0.01": (
+            reporter_fault_excess <= 0.010
+            if reporter_fault_excess is not None
+            else None
         ),
     }
     return {
@@ -3187,6 +4003,12 @@ def _neg_gate_health(
         "affected_censor_rate_excess": censor_excess,
         "structural_faults": structural_faults,
         "treatment_validity_faults": treatment_validity_faults,
+        "treatment_reported_validity_faults": (
+            treatment["invalid_results"] + treatment["corrections"]
+        ),
+        "reporter_faults": reporter_faults,
+        "reporter_fault_rates": reporter_fault_rates,
+        "reporter_fault_excess": reporter_fault_excess,
         "checks": checks,
         "pass": all(value is True for value in checks.values()),
         "hard_fail": any(value is False for value in checks.values()),
@@ -3196,7 +4018,9 @@ def _neg_gate_health(
 def _neg_gate_agent_confirmation(rows: list[dict]) -> dict:
     treatment_epochs = sorted(
         {
-            row.get("assignment_epoch_id", f"legacy:{row['agent']}")
+            _schema_string(
+                row.get("assignment_epoch_id"), f"legacy:{row['agent']}"
+            )
             for row in rows
             if row["variant"] == "treatment"
         }
@@ -3237,7 +4061,9 @@ def _neg_gate_agent_confirmation(rows: list[dict]) -> dict:
                 "agents": agents,
                 "assignment_sources": sorted(
                     {
-                        str(row.get("assignment_source", "legacy"))
+                        _schema_string(
+                            row.get("assignment_source"), "legacy"
+                        )
                         for row in treatment_rows
                     }
                 ),
@@ -3262,6 +4088,12 @@ def _neg_gate_agent_confirmation(rows: list[dict]) -> dict:
         "confirmed": confirmed,
         "pass": confirmed >= 2,
         "blocks": blocks,
+        # Epoch width is fixed wall-clock, so a longer window yields more
+        # epochs rather than fuller ones and the per-epoch rate never
+        # accumulates towards the 60-trial minimum.  Retired to diagnostic by
+        # the pinned amendment; it no longer gates promotion.
+        "formal_promotion_gate": False,
+        "retired_by_amendment": _NEG_CONFIRMATION_AMENDMENT["amendment_id"],
     }
 
 
@@ -3304,7 +4136,16 @@ def _neg_gate_switchback_confirmation(rows: list[dict]) -> dict:
             {
                 row["variant"]
                 for row in agent_rows
-                if str(row.get("assignment_epoch_id", "")).startswith("runtime:")
+                if _schema_string(
+                    row.get("assignment_epoch_id"), ""
+                ).startswith("runtime:")
+                or (
+                    isinstance(row.get("assignment_evidence"), dict)
+                    and row["assignment_evidence"].get("prospective") is True
+                    and _schema_string(
+                        row.get("assignment_epoch_id"), ""
+                    ).startswith("receipt:")
+                )
             }
         )
         metric = _neg_gate_standardized(agent_rows, "direct", binary=True)
@@ -3362,9 +4203,14 @@ def _neg_gate_prospective_confirmation(rows: list[dict]) -> dict:
         }
         arm_blocks = {
             arm: {
-                int(float(row["first_observed_ts"]) // 1800)
+                int(timestamp // 1800)
                 for row in arm_rows
-                if _literal_finite_number(row.get("first_observed_ts")) is not None
+                if (
+                    timestamp := _literal_finite_number(
+                        row.get("first_observed_ts")
+                    )
+                )
+                is not None
             }
             for arm, arm_rows in arms.items()
         }
@@ -3446,10 +4292,16 @@ def _neg_terminal_gate_from_rows(
 ) -> dict:
     """Pure deterministic evaluator for the frozen hidden terminal-close gate."""
     original_rows = list(rows)
+    indexed_failures: dict[int, list[str]] = {
+        index: _neg_gate_row_failures(row)
+        for index, row in enumerate(original_rows)
+    }
+    for index, failures in _neg_gate_cross_row_failures(original_rows).items():
+        indexed_failures[index].extend(failures)
     row_failures = {
         str(index): failures
-        for index, row in enumerate(original_rows)
-        if (failures := _neg_gate_row_failures(row))
+        for index, failures in indexed_failures.items()
+        if failures
     }
     unknown_assignment_rows = sum(
         isinstance(row, dict)
@@ -3620,7 +4472,6 @@ def _neg_terminal_gate_from_rows(
             percentile["one_sided_95_lower"] is not None
             and percentile["one_sided_95_lower"] > -0.050
         ),
-        "two_supported_nonnegative_treatment_epochs": agent_confirmation["pass"],
         "balanced_manifest_switchback": switchback_confirmation["pass"],
         "approved_prospective_manifest_assignment": prospective_confirmation["pass"],
         "deadline_censor_safety": censor_safety["promotion_pass"],
@@ -3632,7 +4483,6 @@ def _neg_terminal_gate_from_rows(
     }
     failed = [name for name, passed in passes.items() if not passed]
     causal_checks = {
-        "two_supported_nonnegative_treatment_epochs",
         "balanced_manifest_switchback",
         "approved_prospective_manifest_assignment",
     }
@@ -3696,10 +4546,16 @@ def _neg_terminal_gate_from_rows(
         "censor_safety": censor_safety,
         "interim": interim,
         "agent_confirmation": agent_confirmation,
+        "amendment": _NEG_CONFIRMATION_AMENDMENT,
         "switchback_confirmation": switchback_confirmation,
         "prospective_confirmation": prospective_confirmation,
         "promotion": {
             "status": status,
+            # A negotiation promotion rests on an amended conjunction, so the
+            # label travels with the verdict and is never dropped downstream.
+            "analysis_label": _NEG_CONFIRMATION_AMENDMENT["analysis_label"],
+            "pre_registered": _NEG_CONFIRMATION_AMENDMENT["pre_registered"],
+            "amendment_id": _NEG_CONFIRMATION_AMENDMENT["amendment_id"],
             "passes": passes,
             "failed_checks": failed,
             "empirical_rollback_signal": interim["rollback"],
@@ -3747,6 +4603,8 @@ def _pers_leaf_empty() -> dict:
         "direction_violations": 0,
         "deterministic_route_checked": 0,
         "deterministic_route_matches": 0,
+        "invalid_terminals": 0,
+        "terminal_conflicts": 0,
     }
 
 
@@ -3779,10 +4637,10 @@ def _pers_cell(turn: Turn, experiment: Experiment) -> dict:
     total_rounds = _round_number(state.get("total_rounds"))
     return {
         "p": _as_float(state.get("p")),
-        "message_type": state.get("seller_message_type", "unknown"),
+        "message_type": _schema_string(state.get("seller_message_type")),
         "price": _as_float(state.get("product_price")),
         "total_rounds": total_rounds if total_rounds is not None else "unknown",
-        "opponent_type": opponent.get("type", "unknown"),
+        "opponent_type": _schema_string(opponent.get("type")),
         "start_block_15m": int(max(turn.ts - experiment.cutoff, 0) // 900),
     }
 
@@ -3792,25 +4650,43 @@ def _persuasion_outcomes(
     enrolled: set[tuple[str, str]],
     parsed: ParsedRecords,
     experiment: Experiment,
+    assignments: dict[tuple[str, str], GameAnalysisAssignment],
+    *,
+    cohort: str | None = None,
 ) -> dict:
     metrics = {"treatment": _pers_metric_empty(), "control": _pers_metric_empty()}
+    if not enrolled:
+        for metric in metrics.values():
+            _finish_pers_metric(metric)
+        return metrics
     affected_by_game: dict[tuple[str, str], list[dict]] = defaultdict(list)
     for item in affected:
-        affected_by_game[(item["agent"], item["game_id"])].append(item)
+        key = (item["agent"], item["game_id"])
+        assignment = assignments.get(key)
+        if (
+            assignment is not None
+            and assignment.included
+            and (cohort is None or assignment.cohort == cohort)
+        ):
+            affected_by_game[key].append(item)
 
     first_by_game: dict[tuple[str, str], Turn] = {}
-    for turn in parsed.turns.values():
-        key = (turn.agent, turn.gid)
-        if key not in enrolled or turn.family != "persuasion":
-            continue
-        old = first_by_game.get(key)
-        if old is None or turn.ts < old.ts:
+    for key, turn in parsed.first_turns.items():
+        assignment = assignments.get(key)
+        if (
+            key in enrolled
+            and turn.family == "persuasion"
+            and assignment is not None
+            and assignment.included
+            and (cohort is None or assignment.cohort == cohort)
+        ):
             first_by_game[key] = turn
 
     for key, turn in first_by_game.items():
         state = turn.game.get("game_state")
         state = state if isinstance(state, dict) else {}
-        player = turn.game.get("your_player", "player_1")
+        assignment = assignments[key]
+        player = _player_id(turn.game)
         seller = player == "player_1" or state.get(f"{player}_role") == "seller"
         if "is_seller_know_cv" in state:
             # Current payloads carry the authoritative visibility contract.
@@ -3819,10 +4695,12 @@ def _persuasion_outcomes(
         else:
             # Old archived payloads predate that flag; absent v is the only
             # available backward-compatible indication of seller blindness.
-            blind = state.get("v") is None
+            # It is diagnostic-only and must never enter the prospective
+            # confirmation population.
+            blind = assignment.cohort == "legacy" and state.get("v") is None
         if not seller or not blind:
             continue
-        variant = experiment.variant_for(turn.agent)
+        variant = assignment.variant
         metric = metrics[variant]
         pmetric = metric["p_strata"].setdefault(
             _p_key(state.get("p")), _pers_leaf_empty()
@@ -3846,7 +4724,17 @@ def _persuasion_outcomes(
                 target["deterministic_route_matches"] += sum(
                     bool(item["assigned_match"]) for item in items
                 )
-        terminal = parsed.terminals.get(key)
+        terminal_result = _itt_deadline_terminal(
+            parsed, key, turn, 1800, experiment
+        )
+        terminal = (
+            terminal_result[0]
+            if not terminal_result[1] and not terminal_result[2]
+            else None
+        )
+        for target in targets:
+            target["terminal_conflicts"] += int(terminal_result[1])
+            target["invalid_terminals"] += int(terminal_result[2])
         if terminal is None:
             for target in targets:
                 target["censored"] += 1
@@ -3889,13 +4777,22 @@ def _empty_arm_health_counts() -> dict:
         "corrections": 0,
         "result_events": 0,
         "result_errors": 0,
+        # ``invalid_results`` is the historical total and is kept so downstream
+        # consumers stay compatible.  The three components below separate what
+        # the agent actually emitted from what the reporter could not vouch
+        # for; only the former can be caused by a strategy arm.
         "invalid_results": 0,
+        "invalid_moves": 0,
+        "invalid_terminals": 0,
+        "provenance_faults": 0,
         "http_503": 0,
     }
 
 
 def _experiment_arm_health(
-    parsed: ParsedRecords, experiment: Experiment
+    parsed: ParsedRecords,
+    experiment: Experiment,
+    assignments: dict[tuple[str, str], GameAnalysisAssignment],
 ) -> dict:
     cohorts = {
         cohort: {
@@ -3910,30 +4807,30 @@ def _experiment_arm_health(
         "unassigned_or_missing_after_activation": 0,
         "outside_confirmation_turn_events": 0,
         "outside_confirmation_result_events": 0,
+        "unapproved_prospective_games": 0,
+        "unapproved_prospective_turn_events": 0,
+        "unapproved_prospective_result_events": 0,
     }
     activation = float(_NEG_PROSPECTIVE_ASSIGNMENT["activated_at"])
 
-    game_assignments: dict[tuple[str, str], tuple[str, str]] = {}
+    game_assignments: dict[tuple[str, str], GameAnalysisAssignment] = {}
     for key, turn in parsed.first_turns.items():
         if (
             turn.agent in experiment.agents
             and turn.family == experiment.family
             and turn.ts >= experiment.cutoff
         ):
-            assignment = _validated_game_assignment(parsed, experiment, key)
-            evidence = assignment[3]
-            cohort = (
-                "outside_confirmation"
-                if evidence.get("outside_confirmation") is True
-                else
-                "prospective"
-                if evidence.get("prospective") is True
-                else "legacy"
-            )
-            variant = assignment[0]
-            game_assignments[key] = variant, cohort
+            assignment = assignments.get(key)
+            if assignment is None:
+                continue
+            evidence = assignment.evidence
+            cohort = assignment.cohort
+            variant = assignment.variant
+            game_assignments[key] = assignment
+            if cohort == "prospective" and not assignment.included:
+                integrity["unapproved_prospective_games"] += 1
             if (
-                variant not in ("treatment", "control")
+                not assignment.included
                 and turn.ts >= activation
                 and evidence.get("reason")
                 in {
@@ -3950,20 +4847,24 @@ def _experiment_arm_health(
             or turn.ts < experiment.cutoff
         ):
             continue
-        variant, cohort = game_assignments.get(
-            (turn.agent, turn.gid), ("unknown", "legacy")
-        )
+        assignment = game_assignments.get((turn.agent, turn.gid))
+        if assignment is None:
+            integrity["unknown_turn_events"] += 1
+            continue
+        variant, cohort = assignment.variant, assignment.cohort
         if cohort == "outside_confirmation":
             integrity["outside_confirmation_turn_events"] += 1
             continue
-        if variant not in ("treatment", "control"):
+        if not assignment.included:
             integrity["unknown_turn_events"] += 1
+            if cohort == "prospective":
+                integrity["unapproved_prospective_turn_events"] += 1
             continue
         target = cohorts[cohort][variant]
         target["turn_events"] += 1
         target["turn_errors"] += int(bool(turn.error))
-        target["corrections"] += len(turn.corrections)
-        target["http_503"] += int("503" in str(turn.error or ""))
+        target["corrections"] += turn.corrections
+        target["http_503"] += int("503" in _safe_text(turn.error))
 
     for event in parsed.results:
         key = (event.agent, event.gid)
@@ -3974,21 +4875,46 @@ def _experiment_arm_health(
         ):
             continue
         assignment = game_assignments.get(key)
-        if assignment is None or assignment[0] not in ("treatment", "control"):
-            integrity["unknown_result_events"] += 1
-            continue
-        variant, cohort = assignment
-        if cohort == "outside_confirmation":
+        if assignment is not None and assignment.cohort == "outside_confirmation":
             integrity["outside_confirmation_result_events"] += 1
             continue
+        if assignment is None or not assignment.included:
+            integrity["unknown_result_events"] += 1
+            if assignment is not None and assignment.cohort == "prospective":
+                integrity["unapproved_prospective_result_events"] += 1
+            continue
+        variant, cohort = assignment.variant, assignment.cohort
         target = cohorts[cohort][variant]
         target["result_events"] += 1
-        target["result_errors"] += int(bool(event.error))
-        target["invalid_results"] += int(
-            event.valid is False
-            or (cohort == "prospective" and not event.prospective_schema_valid)
+        target["result_errors"] += int(
+            event.result_source == "move_transport_error" or bool(event.error)
         )
-        target["http_503"] += int("503" in str(event.error or ""))
+        first_turn = parsed.first_turns.get(key)
+        terminal_invalid = bool(
+            event.game_over is True
+            and first_turn is not None
+            and (
+                not _itt_terminal_valid(first_turn, event)
+                or (
+                    cohort == "prospective"
+                    and _strict_runtime_provenance(
+                        parsed, experiment, event.agent, event.ts
+                    ).get("valid")
+                    is not True
+                )
+            )
+        )
+        invalid_move = event.valid is False
+        provenance_fault = bool(
+            cohort == "prospective" and not event.prospective_schema_valid
+        )
+        target["invalid_moves"] += int(invalid_move)
+        target["invalid_terminals"] += int(terminal_invalid)
+        target["provenance_faults"] += int(provenance_fault)
+        target["invalid_results"] += int(
+            invalid_move or provenance_fault or terminal_invalid
+        )
+        target["http_503"] += int("503" in _safe_text(event.error))
 
     prospective_events = sum(
         value
@@ -4009,8 +4935,388 @@ def _experiment_arm_health(
                 "unknown_turn_events",
                 "unknown_result_events",
                 "unassigned_or_missing_after_activation",
+                "unapproved_prospective_games",
+                "unapproved_prospective_turn_events",
+                "unapproved_prospective_result_events",
             )
         ),
+    }
+
+
+def _empty_cohort_routing_arm() -> dict:
+    return {
+        "checked": 0,
+        "assigned_matches": 0,
+        "replay_errors": 0,
+        "assignment_integrity_errors": 0,
+        "duplicate_causal_turn_conflicts": 0,
+        "affected": 0,
+        "affected_assigned_matches": 0,
+        "affected_wrong_variant": 0,
+        "affected_unknown": 0,
+        "direction_violations": 0,
+    }
+
+
+def _empty_cohort_routing() -> dict:
+    return {
+        cohort: {
+            "treatment": _empty_cohort_routing_arm(),
+            "control": _empty_cohort_routing_arm(),
+            "integrity": {
+                "unknown_assignment_turns": 0,
+                "unknown_assignment_games": 0,
+                "unapproved_prospective_games": 0,
+                "duplicate_causal_turn_conflicts": 0,
+            },
+        }
+        for cohort in _ANALYSIS_COHORTS
+    }
+
+
+def _variant_summaries(
+    enrolled: set[tuple[str, str]],
+    parsed: ParsedRecords,
+    assignments: dict[tuple[str, str], GameAnalysisAssignment],
+    affected: list[dict],
+    *,
+    cohort: str | None = None,
+) -> dict:
+    variants = {"treatment": _variant_summary(), "control": _variant_summary()}
+    for key in enrolled:
+        assignment = assignments.get(key)
+        if (
+            assignment is None
+            or not assignment.included
+            or (cohort is not None and assignment.cohort != cohort)
+        ):
+            continue
+        target = variants[assignment.variant]
+        target["games"] += 1
+        if key in parsed.terminals:
+            target["resolved"] += 1
+        else:
+            target["censored"] += 1
+    for item in affected:
+        if cohort is not None and item.get("assignment_cohort") != cohort:
+            continue
+        variant = item.get("variant")
+        if variant not in variants:
+            continue
+        variants[variant]["affected_turns"] += 1
+        variants[variant]["direction_violations"] += int(
+            bool(item.get("direction_violation"))
+        )
+    for variant in variants:
+        variants[variant]["affected_games"] = len(
+            {
+                (item["agent"], item["game_id"])
+                for item in affected
+                if item.get("variant") == variant
+                and (cohort is None or item.get("assignment_cohort") == cohort)
+            }
+        )
+    return variants
+
+
+def _empty_negotiation_itt() -> dict:
+    output = {
+        arm: _itt_metric_empty(
+            population="affected negotiation games use experiment.gate",
+            maturity_lag_s=_NEG_MATURITY_LAG_S,
+        )
+        for arm in ("treatment", "control")
+    }
+    for arm in ("treatment", "control"):
+        _finish_itt_metric(output[arm])
+    output["integrity"] = {
+        "unknown_assignment_games": 0,
+        "excluded_outside_confirmation_games": 0,
+        "excluded_unapproved_prospective_games": 0,
+    }
+    return output
+
+
+def _itt_integrity_for_scope(
+    scope: set[tuple[str, str]],
+    parsed: ParsedRecords,
+    experiment: Experiment,
+    assignments: dict[tuple[str, str], GameAnalysisAssignment],
+) -> dict:
+    integrity = {
+        "unknown_assignment_games": 0,
+        "excluded_outside_confirmation_games": 0,
+        "excluded_unapproved_prospective_games": 0,
+    }
+    if experiment.family == "negotiation":
+        return integrity
+    for key, turn in _first_enrolled_turns(
+        scope, parsed, experiment.family
+    ).items():
+        if experiment.family == "persuasion" and not _in_itt_population(
+            turn, experiment.family
+        ):
+            continue
+        assignment = assignments.get(key)
+        if assignment is None:
+            integrity["unknown_assignment_games"] += 1
+        elif assignment.cohort == "outside_confirmation":
+            integrity["excluded_outside_confirmation_games"] += 1
+        elif not assignment.included:
+            integrity["unknown_assignment_games"] += 1
+            if assignment.cohort == "prospective":
+                integrity["excluded_unapproved_prospective_games"] += 1
+    return integrity
+
+
+def _cohort_metrics_and_itt(
+    cohort: str | None,
+    affected: list[dict],
+    enrolled: set[tuple[str, str]],
+    parsed: ParsedRecords,
+    experiment: Experiment,
+    assignments: dict[tuple[str, str], GameAnalysisAssignment],
+    *,
+    analysis_ts: float,
+) -> tuple[dict, dict | None]:
+    if experiment.family == "persuasion":
+        return (
+            _persuasion_outcomes(
+                affected,
+                enrolled,
+                parsed,
+                experiment,
+                assignments,
+                cohort=cohort,
+            ),
+            _persuasion_itt(
+                enrolled,
+                parsed,
+                experiment,
+                assignments,
+                analysis_ts=analysis_ts,
+                cohort=cohort,
+            ),
+        )
+    metrics = _offer_outcomes(
+        affected,
+        enrolled,
+        parsed,
+        experiment,
+        assignments,
+        cohort=cohort,
+    )
+    if experiment.family == "bargaining":
+        itt = _bargaining_itt(
+            enrolled,
+            parsed,
+            experiment,
+            assignments,
+            analysis_ts=analysis_ts,
+            cohort=cohort,
+        )
+    else:
+        itt = _empty_negotiation_itt()
+    return metrics, itt
+
+
+def _confirmation_declaration_valid() -> bool:
+    try:
+        loaded = load_confirmation_plan(project_root=ROOT)
+    except (OSError, ValueError, RuntimeError):
+        return False
+    if not loaded.valid or not loaded.linked_assignment_verified:
+        return False
+    plan = loaded.plan
+    return bool(
+        loaded.artifact_path == _CONFIRMATION_DECLARATION_PIN["path"]
+        and loaded.artifact_sha256 == _CONFIRMATION_DECLARATION_PIN["sha256"]
+        and loaded.artifact_bytes == _CONFIRMATION_DECLARATION_PIN["bytes"]
+        and plan is not None
+        and plan.scheduled_look_id
+        == _CONFIRMATION_DECLARATION_PIN["look_id"]
+        and plan.declared_at == _CONFIRMATION_DECLARATION_PIN["declared_at_ts"]
+        and plan.analysis_as_of
+        == _CONFIRMATION_DECLARATION_PIN["analysis_as_of_ts"]
+        and plan.assignment_enrollment_cutoff_exclusive
+        == _CONFIRMATION_DECLARATION_PIN["enrollment_cutoff_exclusive"]
+        and plan.prefix_procedure_version
+        == _CONFIRMATION_DECLARATION_PIN["prefix_procedure_version"]
+        and plan.prefix_capture_not_before
+        == _CONFIRMATION_DECLARATION_PIN["prefix_capture_not_before"]
+        and plan.prefix_output_path_template
+        == _CONFIRMATION_DECLARATION_PIN["prefix_output_path_template"]
+    )
+
+
+def _in_itt_population(turn: Turn, family: str) -> bool:
+    if family == "bargaining":
+        return True
+    if family != "persuasion":
+        return False
+    state = turn.game.get("game_state")
+    state = state if isinstance(state, dict) else {}
+    player = _player_id(turn.game)
+    seller = player == "player_1" or state.get(f"{player}_role") == "seller"
+    return bool(seller and state.get("is_seller_know_cv") is False)
+
+
+def _prospective_turn_schema_failures(turn: Turn) -> tuple[str, ...]:
+    """Validate raw string fields used to form prospective metric identities."""
+
+    failures: list[str] = []
+    raw_player = turn.game.get("your_player", "player_1")
+    if not (
+        isinstance(raw_player, str)
+        and raw_player in ("player_1", "player_2")
+    ):
+        failures.append("your_player")
+    player = _player_id(turn.game)
+    state = turn.game.get("game_state")
+    state = state if isinstance(state, dict) else {}
+    role_key = f"{player}_role"
+    if role_key in state and not isinstance(state.get(role_key), str):
+        failures.append("player_role")
+    opponent = turn.game.get("opponent")
+    if (
+        isinstance(opponent, dict)
+        and "type" in opponent
+        and not isinstance(opponent.get("type"), str)
+    ):
+        failures.append("opponent_type")
+    if (
+        turn.family == "persuasion"
+        and "seller_message_type" in state
+        and not isinstance(state.get("seller_message_type"), str)
+    ):
+        failures.append("seller_message_type")
+    return tuple(failures)
+
+
+def _prospective_confirmation_evidence(
+    experiment: Experiment,
+    enrolled: set[tuple[str, str]],
+    parsed: ParsedRecords,
+    assignments: dict[tuple[str, str], GameAnalysisAssignment],
+    prospective: dict,
+    *,
+    declaration_valid: bool,
+) -> dict:
+    expected = _prospective_assignment_expected(experiment)
+    rule = next(
+        item for item in expected["rules"] if item["family"] == experiment.family
+    )
+    itt = prospective["itt"]
+    metrics = prospective["metrics"]
+    eligible_keys = {
+        key
+        for key in enrolled
+        if (assignment := assignments.get(key)) is not None
+        and assignment.included
+        and assignment.cohort == "prospective"
+        and (turn := parsed.first_turns.get(key)) is not None
+        and _in_itt_population(turn, experiment.family)
+    }
+    labels: dict[str, dict] = {}
+    common_blocks = 0
+    population_fields = (
+        ("treatment_affected_rows", "control_affected_rows")
+        if experiment.family == "bargaining"
+        else ("treatment_matured_rows", "control_matured_rows")
+    )
+    for agent in expected["agents"]:
+        arm_blocks: dict[str, set[int]] = {}
+        row_counts: dict[str, int] = {}
+        population_counts: dict[str, int] = {}
+        for arm in ("treatment", "control"):
+            by_agent = itt[arm].get("by_agent", {}).get(agent, {})
+            row_counts[arm] = int(by_agent.get("games", 0))
+            if experiment.family == "bargaining":
+                population_counts[arm] = len(
+                    {
+                        (item["agent"], item["game_id"])
+                        for item in prospective["affected_turns"]
+                        if item.get("agent") == agent
+                        and item.get("variant") == arm
+                    }
+                )
+            else:
+                population_counts[arm] = int(by_agent.get("matured", 0))
+            arm_blocks[arm] = {
+                int(parsed.first_turns[key].ts // 1800)
+                for key in eligible_keys
+                if key[0] == agent and assignments[key].variant == arm
+            }
+        same_blocks = arm_blocks["treatment"] & arm_blocks["control"]
+        common_blocks += len(same_blocks)
+        labels[agent] = {
+            "treatment_rows": row_counts["treatment"],
+            "control_rows": row_counts["control"],
+            population_fields[0]: population_counts["treatment"],
+            population_fields[1]: population_counts["control"],
+            "treatment_blocks": len(arm_blocks["treatment"]),
+            "control_blocks": len(arm_blocks["control"]),
+            "same_30m_blocks": len(same_blocks),
+        }
+    enrollment_times = [
+        _literal_finite_number(assignments[key].evidence.get("enrolled_at"))
+        for key in eligible_keys
+    ]
+    enrollment_times = [value for value in enrollment_times if value is not None]
+    linked = {
+        arm: int(itt[arm].get("games", 0))
+        for arm in ("treatment", "control")
+    }
+    declaration_sha = (
+        _CONFIRMATION_DECLARATION_PIN["sha256"] if declaration_valid else None
+    )
+    return {
+        "schema_version": 2,
+        "producer": "scripts.canary_report:prospective-confirmation-v2",
+        "contract": {
+            "artifact_sha256": expected["artifact_sha256"],
+            "plan_id": expected["plan_id"],
+            "strategy_aggregate_sha256": expected["strategy_aggregate_sha256"],
+            "activated_at": expected["activated_at"],
+            "expires_at": expected["expires_at"],
+            "target_sha256": dict(expected["target_sha256"]),
+            "rule": dict(rule),
+        },
+        "linked_itt_rows": linked,
+        "labels": labels,
+        "prospective_rows": linked["treatment"] + linked["control"],
+        "approved_rows": linked["treatment"] + linked["control"],
+        "common_agent_30m_blocks": common_blocks,
+        "first_enrollment_ts": min(enrollment_times) if enrollment_times else None,
+        "last_enrollment_ts": max(enrollment_times) if enrollment_times else None,
+        "immutable_prefix": {
+            "status": "pending",
+            "producer": "scripts.canary_report:immutable-prefix-v1",
+            "algorithm": "sha256",
+            "bytes": 0,
+            "records": 0,
+            "last_event_ts": None,
+            "sha256": None,
+        },
+        "scheduled_look": {
+            "status": "pending",
+            "plan_id": expected["plan_id"],
+            "look_id": _CONFIRMATION_DECLARATION_PIN["look_id"],
+            "declaration_sha256": declaration_sha,
+            "declaration_artifact": dict(_CONFIRMATION_DECLARATION_PIN),
+            "declared_at_ts": _CONFIRMATION_DECLARATION_PIN["declared_at_ts"],
+            "scheduled_at_ts": _CONFIRMATION_DECLARATION_PIN["analysis_as_of_ts"],
+            "analysis_as_of_ts": _CONFIRMATION_DECLARATION_PIN["analysis_as_of_ts"],
+            "prefix_sha256": None,
+        },
+        "reporter_verification": {
+            "schema_version": 1,
+            "producer": "scripts.canary_report:confirmation-verifier-v1",
+            "prefix_recomputed_from_sources": False,
+            "declaration_recomputed_from_artifact": False,
+            "prefix_sha256": None,
+            "declaration_sha256": declaration_sha,
+        },
     }
 
 
@@ -4019,8 +5325,14 @@ def analyze_experiment(
     preexisting: set[tuple[str, str]],
     experiment: Experiment,
     replay: ReplayFn = replay_action,
+    *,
+    analysis_clock: dict | None = None,
+    declaration_valid: bool = False,
 ) -> dict:
+    clock = analysis_clock or _analysis_clock(parsed)
+    analysis_ts = float(clock["analysis_as_of_ts"])
     agent_data = {agent: _arm_empty() for agent in experiment.agents}
+    assignments = _game_analysis_assignments(parsed, experiment)
     candidates: dict[tuple[str, str], Turn] = {}
     for turn in parsed.turns.values():
         if (
@@ -4068,9 +5380,9 @@ def analyze_experiment(
         health = agent_data[turn.agent]["health"]
         health["turns"] += 1
         health["turn_errors"] += int(bool(turn.error))
-        health["corrections"] += len(turn.corrections)
-        health["turns_with_corrections"] += int(bool(turn.corrections))
-        if "503" in str(turn.error or ""):
+        health["corrections"] += turn.corrections
+        health["turns_with_corrections"] += int(turn.corrections > 0)
+        if "503" in _safe_text(turn.error):
             health["http_503"] += 1
     for agent, family, ts in parsed.duplicate_events:
         if (
@@ -4090,16 +5402,25 @@ def analyze_experiment(
         health = agent_data[event.agent]["health"]
         health["result_events"] += 1
         health["invalid_results"] += int(event.valid is False)
-        health["result_errors"] += int(bool(event.error))
-        if "503" in str(event.error or ""):
+        health["result_errors"] += int(
+            event.result_source == "move_transport_error" or bool(event.error)
+        )
+        if "503" in _safe_text(event.error):
             health["http_503"] += 1
 
     control_knobs = _knobs(experiment, "control")
     treatment_knobs = _knobs(experiment, "treatment")
-    game_assignments = {
-        key: _validated_game_assignment(parsed, experiment, key)
-        for key in enrolled
-    }
+    cohort_routing = _empty_cohort_routing()
+    for key in enrolled:
+        assignment = assignments.get(key)
+        if assignment is None or assignment.cohort == "outside_confirmation":
+            continue
+        if not assignment.included:
+            integrity = cohort_routing[assignment.cohort]["integrity"]
+            integrity["unknown_assignment_games"] += 1
+            if assignment.cohort == "prospective":
+                integrity["unapproved_prospective_games"] += 1
+
     replay_cache: dict[int, tuple[dict, dict]] = {}
 
     def replay_pair(turn: Turn) -> tuple[dict, dict]:
@@ -4107,46 +5428,69 @@ def analyze_experiment(
         if cached is not None:
             return cached
         routing = agent_data[turn.agent]["routing"]
+        assignment = assignments.get((turn.agent, turn.gid))
         try:
+            replay_game = _materialize_game(turn)
             pair = (
-                replay(turn.game, control_knobs),
-                replay(turn.game, treatment_knobs),
+                replay(replay_game, control_knobs),
+                replay(replay_game, treatment_knobs),
             )
         except Exception as exc:  # report a replay bug as a routing miss
-            error_action = {"_replay_error": f"{type(exc).__name__}: {exc}"}
+            error_action = {
+                "_replay_error": (
+                    f"{type(exc).__name__}: "
+                    f"{_safe_text(exc, '<unprintable>')}"
+                )
+            }
             pair = error_action, error_action
             routing["replay_errors"] += 1
+            if assignment is not None and assignment.included:
+                cohort_routing[assignment.cohort][assignment.variant][
+                    "replay_errors"
+                ] += 1
         replay_cache[id(turn)] = pair
         return pair
 
-    raw_turn_groups: dict[tuple[str, str, int, str], list[Turn]] = defaultdict(list)
-    for raw_turn in parsed.turn_events:
-        raw_key = (raw_turn.agent, raw_turn.gid)
-        if raw_key in enrolled and raw_turn.ts >= experiment.cutoff:
-            raw_turn_groups[
-                (raw_turn.agent, raw_turn.gid, raw_turn.round, raw_turn.phase)
-            ].append(raw_turn)
-    for group in raw_turn_groups.values():
+    for raw_group in parsed.duplicate_turn_groups.values():
+        group = [
+            turn
+            for turn in raw_group
+            if (turn.agent, turn.gid) in enrolled
+            and turn.ts >= experiment.cutoff
+        ]
         if len(group) < 2:
             continue
-        signatures = {
-            json.dumps(
-                {
-                    "game": turn.game,
-                    "logged": turn.action,
-                    "control": replay_pair(turn)[0],
-                    "treatment": replay_pair(turn)[1],
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-                default=repr,
-            )
-            for turn in group
-        }
-        if len(signatures) > 1:
+        assignment = assignments.get((group[0].agent, group[0].gid))
+        if assignment is None or not assignment.included:
+            continue
+        signatures: list[str | None] = []
+        for turn in group:
+            try:
+                signature = json.dumps(
+                    {
+                        "game": turn.game,
+                        "history_sha256": hashlib.sha256(
+                            turn.history_json
+                        ).hexdigest(),
+                        "logged": turn.action,
+                        "control": replay_pair(turn)[0],
+                        "treatment": replay_pair(turn)[1],
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                    ensure_ascii=True,
+                    allow_nan=False,
+                )
+            except (TypeError, ValueError, OverflowError, RecursionError):
+                signature = None
+            signatures.append(signature)
+        if None in signatures or len(set(signatures)) > 1:
             agent_data[group[0].agent]["routing"][
                 "duplicate_causal_turn_conflicts"
             ] += 1
+            cohort = cohort_routing[assignment.cohort]
+            cohort[assignment.variant]["duplicate_causal_turn_conflicts"] += 1
+            cohort["integrity"]["duplicate_causal_turn_conflicts"] += 1
     affected: list[dict] = []
     games_with_divergence: set[tuple[str, str]] = set()
     for turn in sorted(parsed.turns.values(), key=lambda item: item.ts):
@@ -4154,26 +5498,19 @@ def analyze_experiment(
         if key not in enrolled or turn.ts < experiment.cutoff:
             continue
         routing = agent_data[turn.agent]["routing"]
-        control_action, treatment_action = replay_pair(turn)
-        assignment_result = game_assignments.get(
-            key,
-            (
-                "unknown",
-                f"missing-game-assignment:{turn.agent}:{turn.gid}",
-                "missing_game_assignment",
-                {
-                    "prospective": False,
-                    "valid": False,
-                    "approved": False,
-                },
-            ),
-        )
-        assigned_variant, assignment_epoch_id, assignment_source, assignment_evidence = (
-            assignment_result
-        )
-        if assigned_variant not in ("treatment", "control"):
-            routing["assignment_integrity_errors"] += 1
+        assignment = assignments.get(key)
+        if assignment is not None and assignment.cohort == "outside_confirmation":
             continue
+        if assignment is None or not assignment.included:
+            routing["assignment_integrity_errors"] += 1
+            if assignment is not None:
+                cohort_routing[assignment.cohort]["integrity"][
+                    "unknown_assignment_turns"
+                ] += 1
+            continue
+        assigned_variant = assignment.variant
+        cohort_route = cohort_routing[assignment.cohort][assigned_variant]
+        control_action, treatment_action = replay_pair(turn)
         assigned_action = (
             treatment_action if assigned_variant == "treatment" else control_action
         )
@@ -4183,6 +5520,8 @@ def analyze_experiment(
         assigned_match = _action_equal(turn.action, assigned_action)
         routing["checked"] += 1
         routing["assigned_matches"] += int(assigned_match)
+        cohort_route["checked"] += 1
+        cohort_route["assigned_matches"] += int(assigned_match)
         if _action_equal(control_action, treatment_action):
             continue
         violation = _direction_violation(
@@ -4194,15 +5533,25 @@ def analyze_experiment(
         routing["affected_wrong_variant"] += int(not assigned_match and other_match)
         routing["affected_unknown"] += int(not assigned_match and not other_match)
         routing["direction_violations"] += int(violation)
+        cohort_route["affected"] += 1
+        cohort_route["affected_assigned_matches"] += int(assigned_match)
+        cohort_route["affected_wrong_variant"] += int(
+            not assigned_match and other_match
+        )
+        cohort_route["affected_unknown"] += int(
+            not assigned_match and not other_match
+        )
+        cohort_route["direction_violations"] += int(violation)
         first_for_game = key not in games_with_divergence
         games_with_divergence.add(key)
         affected.append(
             {
                 "agent": turn.agent,
                 "variant": assigned_variant,
-                "assignment_epoch_id": assignment_epoch_id,
-                "assignment_source": assignment_source,
-                "assignment_evidence": assignment_evidence,
+                "assignment_epoch_id": assignment.epoch_id,
+                "assignment_source": assignment.source,
+                "assignment_evidence": dict(assignment.evidence),
+                "assignment_cohort": assignment.cohort,
                 "game_id": turn.gid,
                 "ts": turn.ts,
                 "round": turn.round,
@@ -4220,56 +5569,162 @@ def analyze_experiment(
             }
         )
 
-    variants = {"treatment": _variant_summary(), "control": _variant_summary()}
-    for agent, data in agent_data.items():
-        variant = experiment.variant_for(agent)
-        enrollment = data["enrollment"]
-        routing = data["routing"]
-        variants[variant]["games"] += enrollment["enrolled"]
-        variants[variant]["resolved"] += enrollment["resolved"]
-        variants[variant]["censored"] += enrollment["censored"]
-        variants[variant]["affected_turns"] += routing["affected"]
-        variants[variant]["direction_violations"] += routing["direction_violations"]
-    for variant in variants:
-        variants[variant]["affected_games"] = len(
-            {
-                (item["agent"], item["game_id"])
-                for item in affected
-                if item["variant"] == variant
-            }
-        )
+    variants = _variant_summaries(enrolled, parsed, assignments, affected)
+    cohort_scopes = {
+        cohort: {
+            key
+            for key in enrolled
+            if (assignment := assignments.get(key)) is not None
+            and assignment.cohort == cohort
+        }
+        for cohort in _ANALYSIS_COHORTS
+    }
+    included_cohorts = {
+        assignment.cohort
+        for key, assignment in assignments.items()
+        if key in enrolled and assignment.included
+    }
+    metrics, combined_itt = _cohort_metrics_and_itt(
+        None,
+        affected,
+        enrolled,
+        parsed,
+        experiment,
+        assignments,
+        analysis_ts=analysis_ts,
+    )
+    itt = combined_itt if experiment.family != "negotiation" else None
+    arm_health = _experiment_arm_health(parsed, experiment, assignments)
+    arm_health["integrity"]["analysis_clock_invalid"] = int(
+        clock.get("valid") is not True
+    )
+    arm_health["integrity_pass"] = bool(
+        arm_health["integrity_pass"] and clock.get("valid") is True
+    )
 
-    analysis_ts = _analysis_timestamp(parsed)
-    if experiment.family == "persuasion":
-        metrics = _persuasion_outcomes(affected, enrolled, parsed, experiment)
-        itt = _persuasion_itt(
-            enrolled,
-            parsed,
-            experiment,
-            analysis_ts=analysis_ts,
-        )
-    else:
-        metrics = _offer_outcomes(affected, enrolled, parsed, experiment)
-        itt = (
-            _bargaining_itt(
-                enrolled,
+    analysis_cohorts: dict[str, dict] = {}
+    for cohort in _ANALYSIS_COHORTS:
+        cohort_scope = cohort_scopes[cohort]
+        cohort_affected = [
+            item for item in affected if item.get("assignment_cohort") == cohort
+        ]
+        if included_cohorts == {cohort} or not included_cohorts:
+            cohort_metrics = metrics
+            if isinstance(combined_itt, dict):
+                cohort_itt = {
+                    "treatment": combined_itt["treatment"],
+                    "control": combined_itt["control"],
+                    "integrity": _itt_integrity_for_scope(
+                        cohort_scope, parsed, experiment, assignments
+                    ),
+                }
+            else:
+                cohort_itt = combined_itt
+        else:
+            cohort_metrics, cohort_itt = _cohort_metrics_and_itt(
+                cohort,
+                affected,
+                cohort_scope,
                 parsed,
                 experiment,
+                assignments,
                 analysis_ts=analysis_ts,
             )
-            if experiment.family == "bargaining"
-            else None
+        cohort_variants = _variant_summaries(
+            cohort_scope, parsed, assignments, affected, cohort=cohort
         )
+        included_games = sum(
+            assignment.included and assignment.cohort == cohort
+            for key, assignment in assignments.items()
+            if key in enrolled
+        )
+        excluded_games = sum(
+            assignment.cohort == cohort and not assignment.included
+            for key, assignment in assignments.items()
+            if key in enrolled
+        )
+        if cohort == "outside_confirmation":
+            excluded_games = sum(
+                assignment.cohort == cohort
+                for key, assignment in assignments.items()
+                if key in enrolled
+            )
+            included_games = 0
+        cohort_health = {
+            arm: dict(arm_health["cohorts"][cohort][arm])
+            for arm in ("treatment", "control")
+        }
+        routing_integrity = cohort_routing[cohort]["integrity"]
+        assignment_failures = sum(routing_integrity.values())
+        if isinstance(cohort_itt, dict):
+            for arm in ("treatment", "control"):
+                assignment_failures += int(
+                    cohort_itt[arm].get("invalid_terminals", 0)
+                )
+                assignment_failures += int(
+                    cohort_itt[arm].get("terminal_conflicts", 0)
+                )
+        binding_population_games = included_games
+        if cohort == "prospective":
+            assignment_failures += sum(
+                int(bool(_prospective_turn_schema_failures(turn)))
+                for key in cohort_scope
+                if (assignment := assignments.get(key)) is not None
+                and assignment.included
+                and (turn := parsed.first_turns.get(key)) is not None
+            )
+            assignment_failures += sum(
+                int(cohort_health[arm].get("invalid_results", 0))
+                for arm in ("treatment", "control")
+            )
+            if experiment.family == "persuasion":
+                population_consistent = all(
+                    cohort_metrics[arm].get("blind_seller_games")
+                    == cohort_itt[arm].get("games")
+                    for arm in ("treatment", "control")
+                )
+                assignment_failures += int(not population_consistent)
+                binding_population_games = sum(
+                    int(cohort_itt[arm].get("games", 0))
+                    for arm in ("treatment", "control")
+                )
+        integrity_pass = bool(
+            assignment_failures == 0 and clock.get("valid") is True
+        )
+        analysis_cohorts[cohort] = {
+            "selection": {
+                "legacy": "legacy_pre_activation_diagnostic",
+                "prospective": "approved_manifest_confirmation_only",
+                "outside_confirmation": "excluded_after_enrollment_cutoff",
+            }[cohort],
+            "binding_eligible": bool(
+                cohort == "prospective"
+                and binding_population_games > 0
+                and integrity_pass
+            ),
+            "enrolled_games": int(included_games),
+            "excluded_games": int(excluded_games),
+            "variants": cohort_variants,
+            "metrics": cohort_metrics,
+            "itt": cohort_itt,
+            "affected_turns": cohort_affected,
+            "health": cohort_health,
+            "routing": cohort_routing[cohort],
+            "integrity": {
+                "pass": integrity_pass,
+                "assignment_failures": int(assignment_failures),
+                "clock_valid": clock.get("valid") is True,
+            },
+        }
 
     report = {
         "name": experiment.name,
         "family": experiment.family,
         "cutoff": experiment.cutoff,
-        "cutoff_utc": datetime.fromtimestamp(experiment.cutoff, timezone.utc).isoformat(),
+        "cutoff_utc": _utc_iso(experiment.cutoff),
         "analysis_as_of_ts": analysis_ts,
-        "analysis_as_of_utc": datetime.fromtimestamp(
-            analysis_ts, timezone.utc
-        ).isoformat(),
+        "analysis_as_of_utc": _utc_iso(analysis_ts),
+        "analysis_clock": dict(clock),
         "assignment": {
             "knob": experiment.knob,
             "treatment_value": experiment.treatment_value,
@@ -4279,24 +5734,42 @@ def analyze_experiment(
         },
         "agents": agent_data,
         "variants": variants,
-        "variants_assignment_basis": (
-            "static_agent_legacy; use experiment.gate epoch-aware counts"
-            if experiment.name == "neg_terminal_close"
-            else "runtime_manifest_then_static_assignment"
-        ),
+        "variants_assignment_basis": "immutable first-game validated assignment",
         "metrics": metrics,
         "itt": itt,
-        "arm_health": _experiment_arm_health(parsed, experiment),
+        "arm_health": arm_health,
+        "analysis_cohorts": analysis_cohorts,
         "affected_turns": affected,
     }
+    if experiment.family in ("bargaining", "persuasion"):
+        report["prospective_confirmation"] = _prospective_confirmation_evidence(
+            experiment,
+            enrolled,
+            parsed,
+            assignments,
+            analysis_cohorts["prospective"],
+            declaration_valid=declaration_valid,
+        )
     if experiment.name == "neg_terminal_close":
-        gate_rows = _neg_terminal_gate_rows(affected, enrolled, parsed, experiment)
+        gate_rows = _neg_terminal_gate_rows(
+            affected,
+            enrolled,
+            parsed,
+            experiment,
+            assignments,
+            analysis_ts=analysis_ts,
+        )
         report["gate"] = _neg_terminal_gate_from_rows(
             gate_rows,
             agent_data,
             {agent: experiment.variant_for(agent) for agent in experiment.agents},
             epoch_health=_neg_gate_epoch_health(
-                parsed, experiment, affected, agent_data
+                parsed,
+                experiment,
+                affected,
+                agent_data,
+                assignments,
+                cohort_routing,
             ),
         )
     return report
@@ -4307,13 +5780,25 @@ def build_report(
     preexisting: set[tuple[str, str]] | None = None,
     experiments: Iterable[Experiment] = EXPERIMENTS,
     replay: ReplayFn = replay_action,
+    *,
+    wall_clock_ts: float | None = None,
 ) -> dict:
     parsed = parse_records(records)
     prior = preexisting or set()
+    clock = _analysis_clock(parsed, wall_clock_ts=wall_clock_ts)
+    declaration_valid = _confirmation_declaration_valid()
     report = {
         "generated_at": datetime.now(timezone.utc).isoformat(),
+        "analysis_clock": dict(clock),
         "experiments": [
-            analyze_experiment(parsed, prior, experiment, replay)
+            analyze_experiment(
+                parsed,
+                prior,
+                experiment,
+                replay,
+                analysis_clock=clock,
+                declaration_valid=declaration_valid,
+            )
             for experiment in experiments
         ],
     }
@@ -4331,10 +5816,20 @@ def _line_ts(line: bytes) -> float | None:
     match = _TS_RE.search(line[:512])
     if match is None:
         return None
-    try:
-        return float(match.group(1))
-    except ValueError:
-        return None
+    return _as_float(match.group(1))
+
+
+def _read_bounded_line(handle: Any) -> bytes | None:
+    """Read one physical JSONL line, draining and rejecting oversized input."""
+
+    raw = handle.readline(_MAX_JSONL_LINE_BYTES + 1)
+    if not raw:
+        return b""
+    if len(raw) <= _MAX_JSONL_LINE_BYTES:
+        return raw
+    while raw and not raw.endswith(b"\n"):
+        raw = handle.readline(_MAX_JSONL_LINE_BYTES + 1)
+    return None
 
 
 def seek_timestamp(path: Path, cutoff: float) -> int:
@@ -4349,12 +5844,15 @@ def seek_timestamp(path: Path, cutoff: float) -> int:
             mid = (low + high) // 2
             handle.seek(mid)
             if mid:
-                handle.readline()  # discard the partial line
+                _read_bounded_line(handle)  # discard the partial line
             pos = handle.tell()
             if pos >= high:
                 high = mid
                 continue
-            line = handle.readline()
+            line = _read_bounded_line(handle)
+            if line is None:
+                low = handle.tell()
+                continue
             ts = _line_ts(line)
             if ts is None:
                 low = handle.tell()
@@ -4365,8 +5863,10 @@ def seek_timestamp(path: Path, cutoff: float) -> int:
         handle.seek(low)
         while True:
             pos = handle.tell()
-            line = handle.readline()
-            if not line:
+            line = _read_bounded_line(handle)
+            if line is None:
+                continue
+            if line == b"":
                 return handle.tell()
             ts = _line_ts(line)
             if ts is not None and ts >= cutoff:
@@ -4403,8 +5903,10 @@ def discover_log_slices(
             # large embedded histories before the cut would dominate runtime.
             with path.open("rb") as handle:
                 while handle.tell() < offset:
-                    line = handle.readline()
-                    if not line or handle.tell() > offset:
+                    line = _read_bounded_line(handle)
+                    if line is None:
+                        continue
+                    if line == b"" or handle.tell() > offset:
                         break
                     if b'"type": "turn"' not in line:
                         continue
@@ -4418,10 +5920,19 @@ def iter_log_records(slices: Iterable[LogSlice]) -> Iterator[dict]:
     for item in slices:
         with item.path.open("rb") as handle:
             handle.seek(item.offset)
-            for raw in handle:
+            while True:
+                raw = _read_bounded_line(handle)
+                if raw == b"":
+                    break
+                if raw is None:
+                    continue
                 try:
-                    record = json.loads(raw)
-                except (json.JSONDecodeError, UnicodeDecodeError):
+                    record = json.loads(
+                        raw,
+                        parse_float=_finite_json_float,
+                        parse_constant=_reject_json_constant,
+                    )
+                except (ValueError, UnicodeDecodeError, RecursionError):
                     continue
                 if isinstance(record, dict):
                     record["_agent"] = item.agent
@@ -4549,7 +6060,12 @@ def main() -> None:
         if not args.experiment or experiment.name in args.experiment
     )
     slices, preexisting = discover_log_slices(args.logs, selected)
-    report = build_report(iter_log_records(slices), preexisting, selected)
+    report = build_report(
+        iter_log_records(slices),
+        preexisting,
+        selected,
+        wall_clock_ts=time.time(),
+    )
     if args.json:
         print(json.dumps(report, indent=2, sort_keys=True, default=str))
     else:
