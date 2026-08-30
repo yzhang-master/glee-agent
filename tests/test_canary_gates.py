@@ -602,9 +602,15 @@ def test_persuasion_zero_sale_upper_bound_can_block_promotion():
     [
         ("games", 1),
         ("matured", 1),
+        ("pending_maturation", 1),
         ("resolved", 1),
         ("censored", 1),
+        ("deadline_censored", 1),
+        ("timely_valid_terminals", 1),
+        ("deadline_zeroes", 1),
+        ("late_terminals", 1),
         ("invalid_terminals", 1),
+        ("terminal_conflicts", 1),
         ("zero_sales", 1),
         ("normalized_outcome_sum", 0.1),
         ("normalized_outcome_sum_squares", 0.1),
@@ -632,6 +638,51 @@ def test_persuasion_zero_sales_must_add_from_cells_to_top():
     failures = gate["data_integrity"]["failures"]["treatment_itt"]
     assert "ITT cell zero_sales statistics are not additive" in failures
     assert gate["decision"] != "screen_pass"
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "pending_maturation",
+        "deadline_censored",
+        "timely_valid_terminals",
+        "deadline_zeroes",
+        "late_terminals",
+        "invalid_terminals",
+        "terminal_conflicts",
+    ],
+)
+def test_persuasion_deadline_statistics_must_add_from_cells_to_top(field):
+    experiment = _pers_experiment()
+    experiment["itt"]["treatment"]["cells"]["0"][field] += 1
+
+    gate = evaluate_gate(experiment)
+
+    assert gate is not None
+    failures = gate["data_integrity"]["failures"]["treatment_itt"]
+    assert f"ITT cell {field} statistics are not additive" in failures
+    assert gate["decision"] != "screen_pass"
+
+
+def test_coherent_nonzero_invalid_terminal_is_never_treated_as_censoring():
+    experiment = _pers_experiment()
+    treatment = experiment["itt"]["treatment"]
+    entry = treatment["cells"]["0"]
+    entry["resolved"] -= 1
+    entry["timely_valid_terminals"] -= 1
+    entry["invalid_terminals"] += 1
+    entry["deadline_zeroes"] += 1
+    entry["zero_sales"] += 1
+    entry["zero_sales_rate"] = entry["zero_sales"] / entry["matured"]
+    _rebuild_pers_itt_from_cells(treatment)
+
+    gate = evaluate_gate(experiment)
+
+    assert gate is not None
+    failures = gate["data_integrity"]["failures"]["treatment_itt"]
+    assert "ITT contains invalid timely terminals" in failures
+    assert not any("statistics are not additive" in failure for failure in failures)
+    assert gate["decision"] == "continue"
 
 
 def test_fixed_weight_zero_sale_guard_blocks_pooled_dilution_counterexample():
@@ -891,6 +942,773 @@ def test_expected_p_set_is_fixed_even_if_stratum_disappears_in_both_arms():
     assert gate is not None
     assert set(gate["p_strata_checks"]) == {"0.333333", "0.5", "0.8"}
     assert not gate["p_strata_checks"]["0.8"]["treatment_matured"]["passed"]
+    assert gate["decision"] == "continue"
+
+
+@pytest.mark.parametrize(
+    ("factory", "valid_key", "invalid_key"),
+    [
+        (
+            _barg_experiment,
+            "normalized_payoff_valid",
+            "normalized_payoff_invalid",
+        ),
+        (_pers_experiment, "revenue_share_valid", "revenue_share_invalid"),
+    ],
+)
+def test_invalid_affected_outcomes_are_never_efficacy_evidence(
+    factory, valid_key, invalid_key
+):
+    experiment = factory()
+    treatment = experiment["metrics"]["treatment"]
+    first_cell = next(iter(treatment["cells"].values()))
+    treatment[valid_key] -= 1
+    treatment[invalid_key] += 1
+    first_cell[valid_key] -= 1
+    first_cell[invalid_key] += 1
+
+    gate = evaluate_gate(experiment)
+
+    assert gate is not None
+    assert not gate["data_integrity"]["passed"]
+    assert any(
+        "invalid normalized values" in failure
+        for failure in gate["data_integrity"]["failures"]["treatment_affected"]
+    )
+    assert gate["decision"] == "continue"
+
+
+@pytest.mark.parametrize(
+    ("factory", "valid_key", "invalid_key"),
+    [
+        (
+            _barg_experiment,
+            "normalized_payoff_valid",
+            "normalized_payoff_invalid",
+        ),
+        (_pers_experiment, "revenue_share_valid", "revenue_share_invalid"),
+    ],
+)
+def test_affected_validity_counts_must_add_from_cells(
+    factory, valid_key, invalid_key
+):
+    experiment = factory()
+    treatment = experiment["metrics"]["treatment"]
+    first_cell = next(iter(treatment["cells"].values()))
+    first_cell[valid_key] -= 1
+    first_cell[invalid_key] += 1
+
+    gate = evaluate_gate(experiment)
+
+    assert gate is not None
+    failures = gate["data_integrity"]["failures"]["treatment_affected"]
+    assert "affected cell valid counts are not additive" in failures
+    assert "affected cell invalid counts are not additive" in failures
+    assert gate["decision"] == "continue"
+
+
+def test_persuasion_deadline_zeroes_are_a_lower_bound_on_zero_sales():
+    experiment = _pers_experiment()
+    experiment["itt"]["treatment"] = _pers_itt(
+        0.70, 0, censor_fraction=0.012
+    )
+    experiment["itt"]["control"] = _pers_itt(0.50, 0)
+    treatment = experiment["itt"]["treatment"]
+    assert treatment["deadline_zeroes"] == 21
+    for entry in treatment["cells"].values():
+        entry["zero_sales"] = 0
+        entry["zero_sales_rate"] = 0.0
+    _rebuild_pers_itt_from_cells(treatment)
+    assert treatment["zero_sales"] == 0
+
+    gate = evaluate_gate(experiment)
+
+    assert gate is not None
+    assert not gate["data_integrity"]["passed"]
+    failures = gate["data_integrity"]["failures"]["treatment_itt"]
+    assert "ITT zero sales are fewer than forced deadline zeroes" in failures
+    assert any("zero_sales fewer than deadline zeroes" in item for item in failures)
+    assert gate["decision"] == "continue"
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [("p", "0.5"), ("price", "100"), ("total_rounds", 20.0)],
+)
+def test_fixed_persuasion_cells_require_literal_configuration_types(
+    field, replacement
+):
+    experiment = _pers_experiment()
+    treatment = experiment["itt"]["treatment"]
+    entry = next(
+        cell
+        for cell in treatment["cells"].values()
+        if cell["cell"]["p"] == 0.5 and cell["cell"]["price"] == 100.0
+    )
+    entry["cell"][field] = replacement
+
+    gate = evaluate_gate(experiment)
+
+    assert gate is not None
+    assert not gate["data_integrity"]["passed"]
+    assert not gate["statistics"]["itt_standardized_revenue"]["available"]
+    assert gate["decision"] == "continue"
+
+
+@pytest.mark.parametrize(
+    ("factory", "path"),
+    [
+        (
+            _barg_experiment,
+            ("metrics", "treatment", "normalized_payoff_sum"),
+        ),
+        (_barg_experiment, ("metrics", "treatment", "resolved")),
+        (
+            _pers_experiment,
+            (
+                "metrics",
+                "treatment",
+                "cells",
+                "0",
+                "cell",
+                "total_rounds",
+            ),
+        ),
+    ],
+)
+def test_gigantic_valid_json_integer_fails_closed_without_crashing(
+    factory, path
+):
+    experiment = factory()
+    target = experiment
+    for key in path[:-1]:
+        target = target[key]
+    target[path[-1]] = 10**10000
+
+    gate = evaluate_gate(experiment)
+    report_gates = evaluate_report_gates({"experiments": [experiment]})
+
+    assert gate is not None
+    assert gate["decision"] == "continue"
+    assert not gate["screen_ready"]
+    assert not gate["promotion_ready"]
+    assert report_gates[experiment["name"]]["decision"] == "continue"
+
+
+@pytest.mark.parametrize("malformed_message_type", [[], {}])
+def test_unhashable_prospective_message_type_fails_closed_end_to_end(
+    malformed_message_type
+):
+    from scripts.canary_report import Experiment, build_report
+    from tests.test_canary_report import _prospective_nonneg_records
+
+    records, _arm = _prospective_nonneg_records(
+        "persuasion", gid=f"unhashable-message-{type(malformed_message_type).__name__}"
+    )
+    records[1]["game"]["game_state"]["seller_message_type"] = (
+        malformed_message_type
+    )
+    experiment = Experiment(
+        "pers_blind_lie",
+        "persuasion",
+        100,
+        ("main",),
+        (),
+        "pers_blind_lie",
+        0.40,
+        1.0,
+    )
+
+    def replay(_game, knobs):
+        return {"decision": "no" if knobs.pers_blind_lie == 0.40 else "yes"}
+
+    report = build_report(records, experiments=(experiment,), replay=replay)
+    gate = evaluate_report_gates(report)["pers_blind_lie"]
+
+    assert gate["binding_analysis_cohort"]["contract_valid"]
+    assert gate["decision"] == "continue"
+    assert not gate["screen_ready"]
+    assert not gate["promotion_ready"]
+    assert not gate["statistics"]["standardized_revenue"]["available"]
+
+
+def test_bargaining_fixed_weight_roundoff_preserves_inclusive_equality():
+    experiment = _barg_experiment()
+    experiment["metrics"]["treatment"] = _barg_arm(300, 0.42)
+    experiment["metrics"]["control"] = _barg_arm(900, 0.40)
+    experiment["itt"]["treatment"] = _barg_itt(2521, 0.40)
+    experiment["itt"]["control"] = _barg_itt(7563, 0.40)
+
+    gate = evaluate_gate(experiment)
+
+    assert gate is not None
+    affected = gate["statistics"]["standardized_payoff"]
+    itt = gate["statistics"]["itt_payoff"]
+    checks = gate["statistics"]["payoff_checks"]
+    assert affected["support"]["missing_mass"] == pytest.approx(0.0)
+    assert checks["affected_lift"]["passed"]
+    assert itt["support"]["missing_mass"] == pytest.approx(0.0)
+    assert checks["itt_fixed_point_nonnegative"]["passed"]
+
+
+def _allocate_labels(total):
+    counts = [total // 4] * 4
+    for index in range(total % 4):
+        counts[index] += 1
+    return counts
+
+
+def _structured_confirmation_evidence(experiment, family):
+    initial = evaluate_gate(experiment)
+    assert initial is not None
+    causal = initial["causal_confirmation"]
+    treatment_games = experiment["itt"]["treatment"]["games"]
+    control_games = experiment["itt"]["control"]["games"]
+    treatment_rows = _allocate_labels(treatment_games)
+    control_rows = _allocate_labels(control_games)
+    if family == "bargaining":
+        population_fields = (
+            "treatment_affected_rows",
+            "control_affected_rows",
+        )
+        treatment_population = _allocate_labels(
+            experiment["metrics"]["treatment"]["affected_games"]
+        )
+        control_population = _allocate_labels(
+            experiment["metrics"]["control"]["affected_games"]
+        )
+    else:
+        population_fields = (
+            "treatment_matured_rows",
+            "control_matured_rows",
+        )
+        treatment_population = _allocate_labels(
+            experiment["itt"]["treatment"]["matured"]
+        )
+        control_population = _allocate_labels(
+            experiment["itt"]["control"]["matured"]
+        )
+    labels = {}
+    for index, label in enumerate(("main", "test_a", "test_b", "test_c")):
+        labels[label] = {
+            "treatment_rows": treatment_rows[index],
+            "control_rows": control_rows[index],
+            population_fields[0]: treatment_population[index],
+            population_fields[1]: control_population[index],
+            "treatment_blocks": 8,
+            "control_blocks": 8,
+            "same_30m_blocks": 8,
+        }
+    activation = causal["expected_contract"]["activated_at"]
+    declaration = causal["expected_declaration_artifact"]
+    analysis_ts = declaration["analysis_as_of_ts"]
+    experiment["analysis_as_of_ts"] = analysis_ts
+    return {
+        "schema_version": 2,
+        "producer": "scripts.canary_report:prospective-confirmation-v2",
+        "contract": causal["expected_contract"],
+        "linked_itt_rows": {
+            "treatment": treatment_games,
+            "control": control_games,
+        },
+        "labels": labels,
+        "prospective_rows": treatment_games + control_games,
+        "approved_rows": treatment_games + control_games,
+        "common_agent_30m_blocks": 32,
+        "first_enrollment_ts": activation,
+        "last_enrollment_ts": activation + 500,
+        "immutable_prefix": {
+            "status": "verified",
+            "producer": "scripts.canary_report:immutable-prefix-v1",
+            "algorithm": "sha256",
+            "bytes": 1,
+            "records": treatment_games + control_games,
+            "last_event_ts": analysis_ts,
+            "sha256": "0" * 64,
+        },
+        "scheduled_look": {
+            "status": "verified",
+            "plan_id": causal["expected_contract"]["plan_id"],
+            "look_id": declaration["look_id"],
+            "declaration_sha256": declaration["sha256"],
+            "declaration_artifact": declaration,
+            "declared_at_ts": declaration["declared_at_ts"],
+            "scheduled_at_ts": analysis_ts,
+            "analysis_as_of_ts": analysis_ts,
+            "prefix_sha256": "0" * 64,
+        },
+        "reporter_verification": {
+            "schema_version": 1,
+            "producer": "scripts.canary_report:confirmation-verifier-v1",
+            "prefix_recomputed_from_sources": True,
+            "declaration_recomputed_from_artifact": True,
+            "prefix_sha256": "0" * 64,
+            "declaration_sha256": declaration["sha256"],
+        },
+    }
+
+
+@pytest.mark.parametrize(
+    ("factory", "family"),
+    [(_barg_experiment, "bargaining"), (_pers_experiment, "persuasion")],
+)
+def test_mismatched_structured_confirmation_assertions_cannot_promote(
+    factory, family
+):
+    experiment = factory()
+    evidence = _structured_confirmation_evidence(experiment, family)
+    experiment["analysis_cohorts"] = {
+        "legacy": {},
+        "prospective": _prospective_cohort(experiment),
+        "outside_confirmation": {},
+    }
+    evidence["scheduled_look"]["declaration_sha256"] = "f" * 64
+    experiment["prospective_confirmation"] = evidence
+
+    gate = evaluate_gate(experiment)
+
+    assert gate is not None
+    causal = gate["causal_confirmation"]
+    assert causal["design_checks"]["exact_itt_row_linkage"]
+    assert causal["design_checks"]["exact_population_row_linkage"]
+    assert not causal["design_checks"]["pinned_scheduled_look_declaration"]
+    assert not causal["pass"]
+    assert gate["decision"] == "screen_pass"
+
+
+@pytest.mark.parametrize(
+    ("factory", "family", "population_field"),
+    [
+        (_barg_experiment, "bargaining", "treatment_affected_rows"),
+        (_pers_experiment, "persuasion", "treatment_matured_rows"),
+    ],
+)
+def test_causal_representation_links_to_affected_or_matured_population(
+    factory, family, population_field
+):
+    experiment = factory()
+    evidence = _structured_confirmation_evidence(experiment, family)
+    experiment["analysis_cohorts"] = {
+        "legacy": {},
+        "prospective": _prospective_cohort(experiment),
+        "outside_confirmation": {},
+    }
+    evidence["labels"]["main"][population_field] += 1
+    experiment["prospective_confirmation"] = evidence
+
+    gate = evaluate_gate(experiment)
+
+    assert gate is not None
+    causal = gate["causal_confirmation"]
+    assert causal["design_checks"]["exact_itt_row_linkage"]
+    assert not causal["design_checks"]["exact_population_row_linkage"]
+    assert not causal["pass"]
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement"),
+    [
+        ("prefix_recomputed_from_sources", False),
+        ("declaration_recomputed_from_artifact", False),
+        ("prefix_sha256", "f" * 64),
+        ("producer", "unverified-caller"),
+        ("schema_version", True),
+    ],
+)
+def test_structured_confirmation_requires_reporter_recomputation(
+    field, replacement
+):
+    experiment = _barg_experiment()
+    evidence = _structured_confirmation_evidence(experiment, "bargaining")
+    experiment["analysis_cohorts"] = {
+        "legacy": {},
+        "prospective": _prospective_cohort(experiment),
+        "outside_confirmation": {},
+    }
+    evidence["reporter_verification"][field] = replacement
+    experiment["prospective_confirmation"] = evidence
+
+    gate = evaluate_gate(experiment)
+
+    assert gate is not None
+    causal = gate["causal_confirmation"]
+    assert causal["design_checks"]["immutable_prefix_identity"]
+    assert causal["design_checks"]["pinned_scheduled_look_declaration"]
+    assert not causal["design_checks"][
+        "reporter_recomputed_prefix_and_declaration"
+    ]
+    assert not causal["pass"]
+    assert gate["decision"] == "screen_pass"
+
+
+def test_structured_confirmation_prefix_may_end_before_scheduled_boundary():
+    experiment = _barg_experiment()
+    evidence = _structured_confirmation_evidence(experiment, "bargaining")
+    experiment["analysis_cohorts"] = {
+        "legacy": {},
+        "prospective": _prospective_cohort(experiment),
+        "outside_confirmation": {},
+    }
+    evidence["immutable_prefix"]["last_event_ts"] = (
+        evidence["last_enrollment_ts"] + 1
+    )
+    experiment["prospective_confirmation"] = evidence
+
+    gate = evaluate_gate(experiment)
+
+    assert gate is not None
+    assert gate["causal_confirmation"]["design_checks"][
+        "immutable_prefix_identity"
+    ]
+
+
+@pytest.mark.parametrize("relative_ts", (-1, 1))
+def test_structured_confirmation_prefix_must_cover_enrollment_and_respect_boundary(
+    relative_ts,
+):
+    experiment = _barg_experiment()
+    evidence = _structured_confirmation_evidence(experiment, "bargaining")
+    experiment["analysis_cohorts"] = {
+        "legacy": {},
+        "prospective": _prospective_cohort(experiment),
+        "outside_confirmation": {},
+    }
+    if relative_ts < 0:
+        evidence["immutable_prefix"]["last_event_ts"] = (
+            evidence["last_enrollment_ts"] - 1
+        )
+    else:
+        evidence["immutable_prefix"]["last_event_ts"] = (
+            experiment["analysis_as_of_ts"] + 1
+        )
+    experiment["prospective_confirmation"] = evidence
+
+    gate = evaluate_gate(experiment)
+
+    assert gate is not None
+    assert not gate["causal_confirmation"]["design_checks"][
+        "immutable_prefix_identity"
+    ]
+
+
+def _prospective_cohort(experiment, *, binding_eligible=True):
+    variants = {}
+    health = {}
+    routing_arms = {}
+    for arm in ("treatment", "control"):
+        games = experiment["itt"][arm]["games"]
+        metric = experiment["metrics"][arm]
+        affected_games = (
+            metric.get("affected_games", 0)
+            if experiment["family"] == "bargaining"
+            else metric.get("blind_seller_games", 0)
+        )
+        variants[arm] = {
+            "games": games,
+            "resolved": games,
+            "censored": 0,
+            "affected_games": affected_games,
+            "affected_turns": affected_games,
+            "direction_violations": 0,
+        }
+        health[arm] = {
+            "turn_events": games,
+            "turn_errors": 0,
+            "corrections": 0,
+            "result_events": games,
+            "result_errors": 0,
+            "invalid_results": 0,
+            "invalid_moves": 0,
+            "invalid_terminals": 0,
+            "provenance_faults": 0,
+            "http_503": 0,
+        }
+        routing_arms[arm] = {
+            "checked": games,
+            "assigned_matches": games,
+            "replay_errors": 0,
+            "assignment_integrity_errors": 0,
+            "duplicate_causal_turn_conflicts": 0,
+            "affected": affected_games,
+            "affected_assigned_matches": affected_games,
+            "affected_wrong_variant": 0,
+            "affected_unknown": 0,
+            "direction_violations": 0,
+        }
+    return {
+        "selection": "approved_manifest_confirmation_only",
+        "binding_eligible": binding_eligible,
+        "enrolled_games": sum(
+            experiment["itt"][arm]["games"]
+            for arm in ("treatment", "control")
+        ),
+        "excluded_games": 0,
+        "variants": variants,
+        "metrics": copy.deepcopy(experiment["metrics"]),
+        "itt": copy.deepcopy(experiment["itt"]),
+        "affected_turns": [],
+        "health": health,
+        "routing": {
+            **routing_arms,
+            "integrity": {
+                "unknown_assignment_turns": 0,
+                "unknown_assignment_games": 0,
+                "unapproved_prospective_games": 0,
+                "duplicate_causal_turn_conflicts": 0,
+            },
+        },
+        "integrity": {
+            "pass": True,
+            "assignment_failures": 0,
+            "clock_valid": True,
+        },
+    }
+
+
+def test_binding_gate_uses_prospective_cohort_not_mixed_top_level():
+    experiment = _barg_experiment()
+    prospective = _prospective_cohort(experiment)
+    experiment["analysis_cohorts"] = {
+        "legacy": {},
+        "prospective": prospective,
+        "outside_confirmation": {},
+    }
+    # The backward-compatible root is explicitly nonbinding once cohort data
+    # exists.  Destroy it to prove the gate consumes the prospective copy.
+    experiment["metrics"] = {}
+    experiment["itt"] = {}
+
+    gate = evaluate_gate(experiment)
+
+    assert gate is not None
+    assert gate["binding_analysis_cohort"]["passed"]
+    assert gate["binding_analysis_cohort"]["source"] == (
+        "analysis_cohorts.prospective"
+    )
+    assert gate["screen_ready"]
+    assert gate["decision"] == "screen_pass"
+    assert gate["arm_rate_guardrails"]["errors"]["attribution"] == (
+        "analysis_cohorts.prospective"
+    )
+
+
+def test_present_but_ineligible_prospective_cohort_never_falls_back():
+    experiment = _pers_experiment()
+    experiment["analysis_cohorts"] = {
+        "legacy": {},
+        "prospective": _prospective_cohort(
+            experiment, binding_eligible=False
+        ),
+        "outside_confirmation": {},
+    }
+
+    gate = evaluate_gate(experiment)
+
+    assert gate is not None
+    assert not gate["binding_analysis_cohort"]["passed"]
+    assert (
+        "prospective binding_eligible is inconsistent with valid nonempty data"
+        in gate["binding_analysis_cohort"]["failures"]
+    )
+    assert not gate["data_integrity"]["passed"]
+    assert "analysis_cohort" in gate["data_integrity"]["failures"]
+    assert gate["decision"] == "continue"
+
+
+def test_prospective_binding_requires_nonempty_itt_population():
+    experiment = _pers_experiment()
+    prospective = _prospective_cohort(experiment)
+    for arm in ("treatment", "control"):
+        prospective["itt"][arm]["games"] = 0
+        prospective["metrics"][arm]["blind_seller_games"] = 0
+    experiment["analysis_cohorts"] = {
+        "legacy": {},
+        "prospective": prospective,
+        "outside_confirmation": {},
+    }
+
+    gate = evaluate_gate(experiment)
+
+    assert gate is not None
+    binding = gate["binding_analysis_cohort"]
+    assert "prospective ITT population must be nonempty" in binding["failures"]
+    assert not binding["contract_valid"]
+    assert not binding["passed"]
+    assert gate["decision"] == "continue"
+
+
+@pytest.mark.parametrize(
+    ("field", "replacement", "expected_failure"),
+    [
+        (
+            "enrolled_games",
+            0,
+            "prospective variant games do not add to enrolled_games",
+        ),
+        (
+            "enrolled_games",
+            [],
+            "prospective enrolled_games must be a literal nonnegative integer",
+        ),
+        (
+            "enrolled_games",
+            True,
+            "prospective enrolled_games must be a literal nonnegative integer",
+        ),
+        (
+            "excluded_games",
+            {},
+            "prospective excluded_games must be a literal nonnegative integer",
+        ),
+        (
+            "variants",
+            [],
+            "prospective variants arms missing or malformed",
+        ),
+    ],
+)
+def test_prospective_population_contract_rejects_malformed_counts(
+    field, replacement, expected_failure
+):
+    experiment = _barg_experiment()
+    prospective = _prospective_cohort(experiment)
+    prospective[field] = replacement
+    experiment["analysis_cohorts"] = {
+        "legacy": {},
+        "prospective": prospective,
+        "outside_confirmation": {},
+    }
+
+    gate = evaluate_gate(experiment)
+
+    assert gate is not None
+    binding = gate["binding_analysis_cohort"]
+    assert not binding["contract_valid"]
+    assert expected_failure in binding["failures"]
+    assert not binding["passed"]
+    assert gate["decision"] == "continue"
+
+
+def test_prospective_variant_population_must_add_to_enrollment_and_itt():
+    experiment = _barg_experiment()
+    prospective = _prospective_cohort(experiment)
+    prospective["variants"]["treatment"]["games"] += 1
+    prospective["variants"]["treatment"]["resolved"] += 1
+    experiment["analysis_cohorts"] = {
+        "legacy": {},
+        "prospective": prospective,
+        "outside_confirmation": {},
+    }
+
+    gate = evaluate_gate(experiment)
+
+    assert gate is not None
+    failures = gate["binding_analysis_cohort"]["failures"]
+    assert "prospective variant games do not add to enrolled_games" in failures
+    assert (
+        "prospective treatment bargaining ITT games do not match variant games"
+        in failures
+    )
+    assert not gate["binding_analysis_cohort"]["passed"]
+    assert gate["decision"] == "continue"
+
+
+@pytest.mark.parametrize(
+    ("health_mode", "expected_failure"),
+    [
+        (
+            "zero",
+            "prospective treatment health does not cover variant games",
+        ),
+        ("malformed", "prospective health arms missing or malformed"),
+    ],
+)
+def test_empty_or_malformed_binding_health_cannot_trigger_automatic_decision(
+    health_mode, expected_failure
+):
+    experiment = _barg_experiment()
+    itt_treatment = experiment["itt"]["treatment"]
+    payoff = 0.20
+    itt_treatment["mean_normalized_outcome"] = payoff
+    itt_treatment["normalized_outcome_sum"] = itt_treatment["matured"] * payoff
+    itt_treatment["normalized_outcome_sum_squares"] = (
+        itt_treatment["matured"] * payoff * payoff
+    )
+    for cell in itt_treatment["cells"].values():
+        cell["mean_normalized_outcome"] = payoff
+        cell["normalized_outcome_sum"] = cell["matured"] * payoff
+        cell["normalized_outcome_sum_squares"] = (
+            cell["matured"] * payoff * payoff
+        )
+    prospective = _prospective_cohort(experiment)
+    if health_mode == "malformed":
+        prospective["health"] = []
+    else:
+        for arm in ("treatment", "control"):
+            prospective["health"][arm] = {
+                key: 0 for key in prospective["health"][arm]
+            }
+            prospective["routing"][arm] = {
+                key: 0 for key in prospective["routing"][arm]
+            }
+    experiment["analysis_cohorts"] = {
+        "legacy": {},
+        "prospective": prospective,
+        "outside_confirmation": {},
+    }
+
+    gate = evaluate_gate(experiment)
+
+    assert gate is not None
+    binding = gate["binding_analysis_cohort"]
+    assert expected_failure in binding["failures"]
+    assert not binding["contract_valid"]
+    assert not binding["passed"]
+    assert "scheduled treatment deadline payoff <= 0.27" in gate[
+        "rollback_triggers"
+    ]
+    assert not gate["binding_rollback"]
+    assert not gate["promotion_ready"]
+    assert gate["decision"] == "continue"
+
+
+def test_unapproved_prospective_selection_never_becomes_binding():
+    experiment = _pers_experiment()
+    prospective = _prospective_cohort(experiment)
+    prospective["selection"] = "mixed_or_legacy_rows"
+    experiment["analysis_cohorts"] = {
+        "legacy": {},
+        "prospective": prospective,
+        "outside_confirmation": {},
+    }
+
+    gate = evaluate_gate(experiment)
+
+    assert gate is not None
+    assert not gate["binding_analysis_cohort"]["contract_valid"]
+    assert "prospective cohort selection is not approved confirmation" in gate[
+        "binding_analysis_cohort"
+    ]["failures"]
+    assert not gate["data_integrity"]["passed"]
+    assert gate["decision"] == "continue"
+
+
+def test_missing_prospective_cohort_after_activation_never_falls_back():
+    experiment = _barg_experiment()
+    initial = evaluate_gate(experiment)
+    assert initial is not None
+    experiment["analysis_as_of_ts"] = initial["causal_confirmation"][
+        "expected_contract"
+    ]["activated_at"]
+
+    gate = evaluate_gate(experiment)
+
+    assert gate is not None
+    assert not gate["binding_analysis_cohort"]["passed"]
+    assert gate["binding_analysis_cohort"]["failures"] == [
+        "prospective analysis cohort missing after activation"
+    ]
+    assert not gate["data_integrity"]["passed"]
     assert gate["decision"] == "continue"
 
 

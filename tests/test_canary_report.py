@@ -3,20 +3,28 @@
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
+from pathlib import Path
 
 import pytest
 
+import scripts.canary_gates as canary_gates
+import scripts.canary_report as canary_report
 from scripts.canary_report import (
     EXPERIMENTS,
+    LogSlice,
     NEG_TERMINAL_GATE_DESIGN,
     Experiment,
+    _neg_gate_unsupported_reason,
     _neg_terminal_gate_from_rows,
     build_report,
     discover_log_slices,
     iter_log_records,
     seek_timestamp,
 )
+
+REPOSITORY_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _turn(
@@ -128,6 +136,7 @@ def _gate_row(
     assignment_epoch_id=None,
     first_observed_ts=100.0,
 ):
+    sequence = next(_GATE_ROW_SEQUENCE)
     cell = {
         "role": role,
         "own_value_grid": str(value),
@@ -149,11 +158,13 @@ def _gate_row(
     row = {
         "agent": agent,
         "variant": variant,
-        "game_id": f"{agent}-{value}",
+        "game_id": f"{agent}-{value}-{sequence}",
         "cell": cell,
         "cell_id": cell_id,
         "supported": supported,
-        "unsupported_reason": None if supported else f"role={role}",
+        "unsupported_reason": (
+            None if supported else _neg_gate_unsupported_reason(cell)
+        ),
         "maturity_status": (
             "resolved" if direct is not None else "deadline_censored"
         ),
@@ -188,6 +199,9 @@ def _gate_row(
         row["assignment_epoch_id"] = assignment_epoch_id
         row["assignment_source"] = "synthetic_timestamped_assignment"
     return row
+
+
+_GATE_ROW_SEQUENCE = itertools.count()
 
 
 def _promotable_gate_rows(*, switchback=True):
@@ -289,7 +303,7 @@ def test_strict_enrollment_dedup_latest_terminal_and_health():
             104,
             {"outcome": "agreement", "agreed_round": 1, "player_1_payoff": 20},
         ),
-        # A later reaper terminal supersedes the direct terminal.
+    # A differing later reaper terminal is conflicting causal evidence.
         _result(
             "main",
             "done",
@@ -343,11 +357,12 @@ def test_strict_enrollment_dedup_latest_terminal_and_health():
 
     control = report["metrics"]["control"]
     assert control["affected_games"] == 1
-    assert control["direct_converted"] == 1
-    assert control["direct_resolved"] == 1
-    assert control["mean_normalized_payoff"] == pytest.approx(0.30)
-    assert control["normalized_payoff_sum"] == pytest.approx(0.30)
-    assert control["normalized_payoff_sum_squares"] == pytest.approx(0.09)
+    assert control["direct_converted"] == 0
+    assert control["direct_resolved"] == 0
+    assert control["terminal_conflicts"] == 1
+    assert control["mean_normalized_payoff"] is None
+    assert control["normalized_payoff_sum"] == 0
+    assert control["normalized_payoff_sum_squares"] == 0
     assert control["sample_variance_normalized_payoff"] is None
     assert report["metrics"]["treatment"]["resolved"] == 0
 
@@ -626,10 +641,16 @@ def test_second_treatment_epoch_cannot_confirm_on_four_games():
     assert blocks["runtime:test_b:200"]["direct_trials"] == 4
     assert blocks["runtime:test_b:200"]["sample_pass"] is False
     assert gate["agent_confirmation"]["confirmed"] == 1
+    assert gate["agent_confirmation"]["pass"] is False
     assert gate["promotion"]["status"] == "screen_pass"
-    assert gate["promotion"]["passes"][
+    # The epoch check still fails, but the pinned amendment retired it to a
+    # diagnostic, so it no longer appears in the promotion conjunction.
+    assert gate["agent_confirmation"]["formal_promotion_gate"] is False
+    assert "two_supported_nonnegative_treatment_epochs" not in gate["promotion"]["passes"]
+    assert (
         "two_supported_nonnegative_treatment_epochs"
-    ] is False
+        not in gate["promotion"]["failed_checks"]
+    )
 
 
 def test_payoff_target_artifact_drift_blocks_promotion():
@@ -978,11 +999,15 @@ def test_bargaining_itt_includes_unaffected_games_and_separates_invalid_terminal
             horizon_known=True,
             same_policy=True,
         ),
-        _result(
-            "test_b",
-            "unaffected-valid",
-            102,
-            {"outcome": "agreement", "player_1_payoff": 40},
+            _result(
+                "test_b",
+                "unaffected-valid",
+                102,
+                {
+                    "outcome": "agreement",
+                    "agreed_round": 1,
+                    "player_1_payoff": 40,
+                },
         ),
         _turn(
             "test_b",
@@ -1147,17 +1172,25 @@ def test_conflicting_timely_itt_terminals_are_not_silently_selected():
             action={"alice_gain": 50, "bob_gain": 50},
             money_to_divide=100,
         ),
-        _result(
-            "test_b",
-            "conflicting-itt-terminal",
-            102,
-            {"outcome": "agreement", "player_1_payoff": 40},
+            _result(
+                "test_b",
+                "conflicting-itt-terminal",
+                102,
+                {
+                    "outcome": "agreement",
+                    "agreed_round": 1,
+                    "player_1_payoff": 40,
+                },
         ),
-        _result(
-            "test_b",
-            "conflicting-itt-terminal",
-            103,
-            {"outcome": "agreement", "player_1_payoff": 90},
+            _result(
+                "test_b",
+                "conflicting-itt-terminal",
+                103,
+                {
+                    "outcome": "agreement",
+                    "agreed_round": 1,
+                    "player_1_payoff": 90,
+                },
         ),
         {
             "type": "runtime",
@@ -1440,6 +1473,113 @@ def _prospective_neg_records(agent="main", gid="prospective-neg"):
         reaped=False,
     )
     return [runtime, first, affected, result], arm
+
+
+def _prospective_nonneg_records(family, agent="main", gid="prospective-game"):
+    base, _ = _prospective_neg_records(agent=agent, gid=f"seed-{gid}")
+    runtime = base[0]
+    specifications = {
+        "bargaining": {
+            "rule_id": "barg-anchor-confirm-v2",
+            "knob": "barg_dis_anchor",
+            "control": 0.58,
+            "treatment": 0.5,
+            "probability": 0.25,
+        },
+        "persuasion": {
+            "rule_id": "pers-blind-confirm-v2",
+            "knob": "pers_blind_lie",
+            "control": 1.0,
+            "treatment": 0.4,
+            "probability": 0.5,
+        },
+    }
+    spec = specifications[family]
+    runtime["knobs"] = {spec["knob"]: spec["control"]}
+    digest = hashlib.sha256(
+        b"\0".join(
+            value.encode()
+            for value in (
+                "glee-canary-assignment-v1",
+                _PLAN_SALT,
+                _PLAN_ID,
+                spec["rule_id"],
+                agent,
+                family,
+                gid,
+            )
+        )
+    ).digest()
+    bucket = int.from_bytes(digest[:8], "big")
+    threshold = int(spec["probability"] * (1 << 64))
+    arm = "treatment" if bucket < threshold else "control"
+    metadata = {
+        "status": "assigned",
+        "reason": "eligible",
+        "artifact_sha256": _PLAN_SHA,
+        "plan_id": _PLAN_ID,
+        "rule_id": spec["rule_id"],
+        "family": family,
+        "knob": spec["knob"],
+        "arm": arm,
+        "value": spec[arm],
+        "treatment_probability": spec["probability"],
+        "assignment_algorithm": "sha256-u64-v1",
+        "assignment_sha256": digest.hex(),
+        "assignment_u64": bucket,
+        "treatment_threshold_u64": threshold,
+        "enrollment": "new",
+        "enrolled_at": _PLAN_ACTIVATION + 5.0,
+    }
+    if family == "bargaining":
+        mine = 50 if arm == "treatment" else 58
+        first = _turn(
+            agent,
+            gid,
+            _PLAN_ACTIVATION + 10,
+            action={"alice_gain": mine, "bob_gain": 100 - mine},
+            money_to_divide=100,
+            max_rounds=6,
+            horizon_known=True,
+        )
+        result = _result(
+            agent,
+            gid,
+            _PLAN_ACTIVATION + 100,
+            {
+                "outcome": "agreement",
+                "agreed_round": 1,
+                "player_1_payoff": mine,
+            },
+            result_source="move",
+            reaped=False,
+        )
+    else:
+        decision = "no" if arm == "treatment" else "yes"
+        first = _turn(
+            agent,
+            gid,
+            _PLAN_ACTIVATION + 10,
+            family="persuasion",
+            phase="seller_recommendation",
+            action={"decision": decision},
+            total_rounds=2,
+            product_price=100,
+            p=0.5,
+            is_seller_know_cv=False,
+            current_quality="low",
+            player_1_role="seller",
+        )
+        result = _result(
+            agent,
+            gid,
+            _PLAN_ACTIVATION + 100,
+            {"outcome": "completed", "player_1_payoff": 100},
+            result_source="move",
+            reaped=False,
+        )
+    first["canary_assignment"] = dict(metadata)
+    return [runtime, first, result], arm
 
 
 def test_prospective_negotiation_receipt_is_cryptographically_linked_and_separate():
@@ -2046,13 +2186,19 @@ def test_negotiation_deadline_is_immutable_and_keeps_earliest_timely_terminal():
     )["experiments"][0]["gate"]
     treatment = gate["counts"]["variants"]["control"]["primary"]
 
-    assert treatment["affected"] == 3
-    assert treatment["matured"] == 3
+    assert treatment["affected"] == 2
+    assert treatment["matured"] == 2
     assert treatment["resolved"] == 1
-    assert treatment["censored"] == 2
+    assert treatment["censored"] == 1
     assert treatment["pending_maturation"] == 0
     assert treatment["direct_trials"] == 1
-    assert treatment["late_terminals"] == 3
+    assert treatment["late_terminals"] == 2
+    assert gate["data_integrity"]["pass"] is False
+    assert any(
+        "invalid timely terminal evidence" in failure
+        for failures in gate["data_integrity"]["row_failures"].values()
+        for failure in failures
+    )
 
 
 def test_young_unresolved_negotiation_game_is_pending_not_censored():
@@ -2130,6 +2276,7 @@ def test_bilateral_heavy_negotiation_censoring_rolls_back_at_scheduled_look():
 def test_malformed_row_makes_scheduled_censor_signal_nonbinding():
     rows = _neg_censor_rows(50, 150, 45, 135)
     malformed = dict(rows[0])
+    malformed["game_id"] += "-malformed"
     malformed["malformed_terminal_events"] = 1
     rows.append(malformed)
 
@@ -2209,6 +2356,994 @@ def test_offer_outcomes_use_only_first_exact_divergence_per_game():
     }
 
 
+def test_bargaining_confirmation_scope_includes_test_a():
+    experiment = next(
+        item for item in EXPERIMENTS if item.name == "barg_dis_anchor"
+    )
+    assert set(experiment.agents) == {"main", "test_a", "test_b", "test_c"}
+    assert "test_a" in experiment.control_agents
+
+
+def test_analysis_cohorts_separate_legacy_prospective_and_postexpiry_games():
+    experiment = Experiment(
+        "barg_dis_anchor",
+        "bargaining",
+        100,
+        ("test_b",),
+        ("main",),
+        "barg_dis_anchor",
+        0.50,
+        0.58,
+    )
+    prospective, arm = _prospective_nonneg_records(
+        "bargaining", gid="cohort-prospective"
+    )
+    legacy = [
+        _turn(
+            "test_b",
+            "cohort-legacy",
+            101,
+            action={"alice_gain": 50, "bob_gain": 50},
+            money_to_divide=100,
+        ),
+        _result(
+            "test_b",
+            "cohort-legacy",
+            102,
+            {
+                "outcome": "agreement",
+                "agreed_round": 1,
+                "player_1_payoff": 50,
+            },
+        ),
+    ]
+    outside = _turn(
+        "main",
+        "cohort-outside",
+        _PLAN_EXPIRY + 1,
+        action={"alice_gain": 58, "bob_gain": 42},
+        money_to_divide=100,
+    )
+    outside["canary_assignment"] = {
+        "status": "unassigned",
+        "reason": "plan_expired",
+    }
+
+    report = build_report(
+        [*legacy, *prospective, outside],
+        experiments=(experiment,),
+        replay=_barg_replay,
+    )["experiments"][0]
+    cohorts = report["analysis_cohorts"]
+
+    assert set(cohorts) == {
+        "legacy",
+        "prospective",
+        "outside_confirmation",
+    }
+    assert cohorts["legacy"]["enrolled_games"] == 1
+    assert cohorts["prospective"]["enrolled_games"] == 1
+    assert cohorts["prospective"]["binding_eligible"] is True
+    assert cohorts["outside_confirmation"]["enrolled_games"] == 0
+    assert cohorts["outside_confirmation"]["excluded_games"] == 1
+    assert sum(report["itt"][candidate]["games"] for candidate in ("treatment", "control")) == 2
+    assert sum(
+        cohorts["prospective"]["itt"][candidate]["games"]
+        for candidate in ("treatment", "control")
+    ) == 1
+    assert sum(
+        cohorts["outside_confirmation"]["itt"][candidate]["games"]
+        for candidate in ("treatment", "control")
+    ) == 0
+    confirmation = report["prospective_confirmation"]
+    assert confirmation["linked_itt_rows"][arm] == 1
+    assert confirmation["labels"]["main"][f"{arm}_rows"] == 1
+    assert confirmation["labels"]["main"][f"{arm}_affected_rows"] == 1
+    assert confirmation["contract"]["artifact_sha256"] == _PLAN_SHA
+    assert confirmation["scheduled_look"]["declaration_artifact"] == {
+        "schema_version": 1,
+        "path": "data/canary_analysis_plan.json",
+        "sha256": "39943a3877adafae71f6bdacfab13a02f0065dc1b955ef6184fbb14dfe20e260",
+        "bytes": 5950,
+        "look_id": "final-confirmatory-expiry-plus-persuasion-maturity-v1",
+        "declared_at_ts": 1787689408,
+        "analysis_as_of_ts": 1787952600,
+        "enrollment_cutoff_exclusive": _PLAN_EXPIRY,
+        "prefix_procedure_version": "stable-filtered-jsonl-snapshot-v2",
+        "prefix_capture_not_before": 1787952900,
+        "prefix_output_path_template": (
+            "data/canary-confirmation-prefix/{declaration_sha256}.json"
+        ),
+    }
+    assert confirmation["reporter_verification"] == {
+        "schema_version": 1,
+        "producer": "scripts.canary_report:confirmation-verifier-v1",
+        "prefix_recomputed_from_sources": False,
+        "declaration_recomputed_from_artifact": False,
+        "prefix_sha256": None,
+        "declaration_sha256": "39943a3877adafae71f6bdacfab13a02f0065dc1b955ef6184fbb14dfe20e260",
+    }
+
+
+def test_persuasion_uses_validated_game_arm_not_static_agent_label():
+    records, arm = _prospective_nonneg_records(
+        "persuasion", gid="pers-dynamic-arm"
+    )
+    opposite = "control" if arm == "treatment" else "treatment"
+    experiment = Experiment(
+        "pers_blind_lie",
+        "persuasion",
+        100,
+        ("main",) if opposite == "treatment" else (),
+        ("main",) if opposite == "control" else (),
+        "pers_blind_lie",
+        0.40,
+        1.0,
+    )
+    duplicate = json.loads(json.dumps(records[1]))
+    duplicate["ts"] = _PLAN_ACTIVATION + 20
+    records.insert(2, duplicate)
+
+    def replay(_game, knobs):
+        return {"decision": "yes" if knobs.pers_blind_lie == 1.0 else "no"}
+
+    report = build_report(records, experiments=(experiment,), replay=replay)[
+        "experiments"
+    ][0]
+
+    assert report["variants"][arm]["games"] == 1
+    assert report["variants"][opposite]["games"] == 0
+    assert report["metrics"][arm]["blind_seller_games"] == 1
+    assert report["metrics"][opposite]["blind_seller_games"] == 0
+    assert report["itt"][arm]["by_agent"]["main"]["games"] == 1
+    assert report["analysis_cohorts"]["prospective"]["integrity"]["pass"] is True
+
+
+def test_new_enrollment_after_runtime_restart_fails_closed():
+    experiment = Experiment(
+        "neg_terminal_close",
+        "negotiation",
+        100,
+        ("main", "test_a", "test_b", "test_c"),
+        (),
+        "neg_terminal_close",
+        True,
+        False,
+    )
+    records, _arm = _prospective_neg_records(gid="new-new-restart")
+    restarted = json.loads(json.dumps(records[0]))
+    restarted["ts"] = _PLAN_ACTIVATION + 15
+    restarted["pid"] = 88
+    records.insert(2, restarted)
+
+    report = build_report(
+        records,
+        experiments=(experiment,),
+        replay=lambda _game, _knobs: {"product_price": 60},
+    )["experiments"][0]
+
+    prospective = report["analysis_cohorts"]["prospective"]
+    assert prospective["enrolled_games"] == 0
+    assert prospective["excluded_games"] == 1
+    assert prospective["routing"]["integrity"][
+        "unapproved_prospective_games"
+    ] == 1
+    assert prospective["binding_eligible"] is False
+
+
+def test_wrong_runtime_hash_on_recovered_turn_invalidates_whole_game():
+    experiment = Experiment(
+        "neg_terminal_close",
+        "negotiation",
+        100,
+        ("main", "test_a", "test_b", "test_c"),
+        (),
+        "neg_terminal_close",
+        True,
+        False,
+    )
+    records, _arm = _prospective_neg_records(gid="wrong-recovered-runtime")
+    restarted = json.loads(json.dumps(records[0]))
+    restarted["ts"] = _PLAN_ACTIVATION + 15
+    restarted["pid"] = 88
+    restarted["content_hashes"]["strategy_python"]["aggregate_sha256"] = "f" * 64
+    records[2]["canary_assignment"]["enrollment"] = "recovered"
+    records.insert(2, restarted)
+
+    report = build_report(
+        records,
+        experiments=(experiment,),
+        replay=lambda _game, _knobs: {"product_price": 60},
+    )["experiments"][0]
+
+    assert report["analysis_cohorts"]["prospective"]["enrolled_games"] == 0
+    assert report["arm_health"]["integrity_pass"] is False
+
+
+@pytest.mark.parametrize("identity", ["strategy", "targets"])
+def test_terminal_must_link_to_latest_exact_runtime_identity(identity):
+    records, arm = _prospective_nonneg_records(
+        "bargaining", gid=f"terminal-runtime-{identity}"
+    )
+    experiment = Experiment(
+        "barg_dis_anchor",
+        "bargaining",
+        100,
+        ("main",),
+        (),
+        "barg_dis_anchor",
+        0.50,
+        0.58,
+    )
+    restarted = json.loads(json.dumps(records[0]))
+    restarted["ts"] = _PLAN_ACTIVATION + 50
+    restarted["pid"] = 88
+    if identity == "strategy":
+        restarted["content_hashes"]["strategy_python"][
+            "aggregate_sha256"
+        ] = "f" * 64
+    else:
+        restarted["content_hashes"]["targets"]["data/targets.json"][
+            "sha256"
+        ] = "f" * 64
+    records.insert(2, restarted)
+
+    report = build_report(
+        records, experiments=(experiment,), replay=_barg_replay
+    )["experiments"][0]
+    prospective = report["analysis_cohorts"]["prospective"]
+
+    assert prospective["itt"][arm]["invalid_terminals"] == 1
+    assert prospective["health"][arm]["invalid_results"] == 1
+    assert prospective["integrity"]["pass"] is False
+    assert prospective["binding_eligible"] is False
+
+
+@pytest.mark.parametrize("agreed_round", ["1", True, 0, 7])
+def test_prospective_agreement_round_must_be_literal_int_and_in_bounds(
+    agreed_round,
+):
+    records, arm = _prospective_nonneg_records(
+        "bargaining", gid=f"bad-agreed-round-{agreed_round!r}"
+    )
+    records[-1]["result"]["agreed_round"] = agreed_round
+    experiment = Experiment(
+        "barg_dis_anchor",
+        "bargaining",
+        100,
+        ("main",),
+        (),
+        "barg_dis_anchor",
+        0.50,
+        0.58,
+    )
+
+    prospective = build_report(
+        records, experiments=(experiment,), replay=_barg_replay
+    )["experiments"][0]["analysis_cohorts"]["prospective"]
+
+    assert prospective["itt"][arm]["invalid_terminals"] == 1
+    assert prospective["metrics"][arm]["invalid_terminals"] == 1
+    assert prospective["binding_eligible"] is False
+
+
+def test_terminal_conflict_signature_includes_agreement_round():
+    records, arm = _prospective_nonneg_records(
+        "bargaining", gid="round-conflict"
+    )
+    conflict = json.loads(json.dumps(records[-1]))
+    conflict["ts"] += 1
+    conflict["result"]["agreed_round"] = 2
+    records.append(conflict)
+    experiment = Experiment(
+        "barg_dis_anchor",
+        "bargaining",
+        100,
+        ("main",),
+        (),
+        "barg_dis_anchor",
+        0.50,
+        0.58,
+    )
+
+    prospective = build_report(
+        records, experiments=(experiment,), replay=_barg_replay
+    )["experiments"][0]["analysis_cohorts"]["prospective"]
+
+    assert prospective["itt"][arm]["terminal_conflicts"] == 1
+    assert prospective["metrics"][arm]["terminal_conflicts"] == 1
+    assert prospective["integrity"]["pass"] is False
+
+
+def test_hostile_unhashable_payoff_is_integrity_failure_not_crash():
+    records, arm = _prospective_nonneg_records(
+        "bargaining", gid="hostile-payoff"
+    )
+    records[-1]["result"]["player_1_payoff"] = [50]
+    experiment = Experiment(
+        "barg_dis_anchor",
+        "bargaining",
+        100,
+        ("main",),
+        (),
+        "barg_dis_anchor",
+        0.50,
+        0.58,
+    )
+
+    prospective = build_report(
+        records, experiments=(experiment,), replay=_barg_replay
+    )["experiments"][0]["analysis_cohorts"]["prospective"]
+
+    assert prospective["itt"][arm]["invalid_terminals"] == 1
+    assert prospective["integrity"]["pass"] is False
+
+
+def test_hostile_unhashable_outcome_is_integrity_failure_not_crash():
+    records, arm = _prospective_nonneg_records(
+        "bargaining", gid="hostile-outcome"
+    )
+    records[-1]["result"]["outcome"] = ["agreement"]
+    experiment = Experiment(
+        "barg_dis_anchor",
+        "bargaining",
+        100,
+        ("main",),
+        (),
+        "barg_dis_anchor",
+        0.50,
+        0.58,
+    )
+
+    prospective = build_report(
+        records, experiments=(experiment,), replay=_barg_replay
+    )["experiments"][0]["analysis_cohorts"]["prospective"]
+
+    assert prospective["itt"][arm]["invalid_terminals"] == 1
+    assert prospective["health"][arm]["invalid_results"] == 1
+    assert prospective["integrity"]["pass"] is False
+    assert prospective["binding_eligible"] is False
+
+
+@pytest.mark.parametrize("field", ["player_1_payoff", "agreed_round"])
+def test_gigantic_terminal_integer_fails_closed_without_overflow(field):
+    records, arm = _prospective_nonneg_records(
+        "bargaining", gid=f"gigantic-terminal-{field}"
+    )
+    records[-1]["result"][field] = 10**10000
+    experiment = Experiment(
+        "barg_dis_anchor",
+        "bargaining",
+        100,
+        ("main",),
+        (),
+        "barg_dis_anchor",
+        0.50,
+        0.58,
+    )
+
+    prospective = build_report(
+        records, experiments=(experiment,), replay=_barg_replay
+    )["experiments"][0]["analysis_cohorts"]["prospective"]
+
+    assert prospective["itt"][arm]["invalid_terminals"] == 1
+    assert prospective["health"][arm]["invalid_results"] == 1
+    assert prospective["integrity"]["pass"] is False
+    assert prospective["binding_eligible"] is False
+
+
+def test_prospective_persuasion_missing_visibility_flag_is_out_of_population():
+    records, arm = _prospective_nonneg_records(
+        "persuasion", gid="missing-visibility-flag"
+    )
+    state = records[1]["game"]["game_state"]
+    state.pop("is_seller_know_cv")
+    state["v"] = None
+    experiment = Experiment(
+        "pers_blind_lie",
+        "persuasion",
+        100,
+        ("main",),
+        (),
+        "pers_blind_lie",
+        0.40,
+        1.0,
+    )
+
+    def replay(_game, knobs):
+        return {"decision": "yes" if knobs.pers_blind_lie == 1.0 else "no"}
+
+    report = build_report(
+        records, experiments=(experiment,), replay=replay
+    )["experiments"][0]
+    prospective = report["analysis_cohorts"]["prospective"]
+
+    assert prospective["enrolled_games"] == 1
+    assert sum(
+        prospective["metrics"][candidate]["blind_seller_games"]
+        for candidate in ("treatment", "control")
+    ) == 0
+    assert sum(
+        prospective["itt"][candidate]["games"]
+        for candidate in ("treatment", "control")
+    ) == 0
+    assert report["metrics"][arm]["blind_seller_games"] == 0
+    assert prospective["integrity"]["pass"] is True
+    assert prospective["binding_eligible"] is False
+    assert report["prospective_confirmation"]["prospective_rows"] == 0
+
+
+def test_extreme_neg_probability_receipt_fails_closed_without_overflow():
+    records, _arm = _prospective_neg_records(gid="extreme-probability")
+    for record in records:
+        receipt = record.get("canary_assignment")
+        if isinstance(receipt, dict):
+            receipt["treatment_probability"] = 1e308
+    experiment = Experiment(
+        "neg_terminal_close",
+        "negotiation",
+        100,
+        ("main", "test_a", "test_b", "test_c"),
+        (),
+        "neg_terminal_close",
+        True,
+        False,
+    )
+
+    def replay(game, knobs):
+        if game["game_state"]["round"] == 1:
+            return {"product_price": 60}
+        return {
+            "decision": "RejectOffer",
+            "product_price": 90 if knobs.neg_terminal_close else 85,
+        }
+
+    prospective = build_report(
+        records, experiments=(experiment,), replay=replay
+    )["experiments"][0]["analysis_cohorts"]["prospective"]
+
+    assert prospective["enrolled_games"] == 0
+    assert prospective["excluded_games"] == 1
+    assert prospective["integrity"]["pass"] is False
+    assert prospective["binding_eligible"] is False
+
+
+@pytest.mark.parametrize("family", ["bargaining", "negotiation", "persuasion"])
+def test_gigantic_your_player_fails_closed_for_every_family(family):
+    if family == "negotiation":
+        records, arm = _prospective_neg_records(
+            gid="gigantic-player-negotiation"
+        )
+        experiment = Experiment(
+            "neg_terminal_close",
+            "negotiation",
+            100,
+            ("main", "test_a", "test_b", "test_c"),
+            (),
+            "neg_terminal_close",
+            True,
+            False,
+        )
+
+        def replay(game, knobs):
+            if game["game_state"]["round"] == 1:
+                return {"product_price": 60}
+            return {
+                "decision": "RejectOffer",
+                "product_price": 90 if knobs.neg_terminal_close else 85,
+            }
+
+    else:
+        records, arm = _prospective_nonneg_records(
+            family, gid=f"gigantic-player-{family}"
+        )
+        if family == "bargaining":
+            experiment = Experiment(
+                "barg_dis_anchor",
+                "bargaining",
+                100,
+                ("main",),
+                (),
+                "barg_dis_anchor",
+                0.50,
+                0.58,
+            )
+            replay = _barg_replay
+        else:
+            experiment = Experiment(
+                "pers_blind_lie",
+                "persuasion",
+                100,
+                ("main",),
+                (),
+                "pers_blind_lie",
+                0.40,
+                1.0,
+            )
+
+            def replay(_game, knobs):
+                return {
+                    "decision": (
+                        "yes" if knobs.pers_blind_lie == 1.0 else "no"
+                    )
+                }
+
+    for record in records:
+        if record.get("type") == "turn":
+            record["game"]["your_player"] = 10**10000
+
+    prospective = build_report(
+        records, experiments=(experiment,), replay=replay
+    )["experiments"][0]["analysis_cohorts"]["prospective"]
+
+    assert prospective["enrolled_games"] == 1
+    assert prospective["health"][arm]["invalid_results"] == 1
+    assert prospective["integrity"]["pass"] is False
+    assert prospective["binding_eligible"] is False
+
+
+def test_gigantic_persuasion_message_type_is_normalized_and_blocks_binding():
+    records, arm = _prospective_nonneg_records(
+        "persuasion", gid="gigantic-message-type"
+    )
+    records[1]["game"]["game_state"]["seller_message_type"] = 10**10000
+    experiment = Experiment(
+        "pers_blind_lie",
+        "persuasion",
+        100,
+        ("main",),
+        (),
+        "pers_blind_lie",
+        0.40,
+        1.0,
+    )
+
+    def replay(_game, knobs):
+        return {"decision": "yes" if knobs.pers_blind_lie == 1.0 else "no"}
+
+    prospective = build_report(
+        records, experiments=(experiment,), replay=replay
+    )["experiments"][0]["analysis_cohorts"]["prospective"]
+
+    assert prospective["metrics"][arm]["blind_seller_games"] == 1
+    assert {
+        entry["cell"]["message_type"]
+        for entry in prospective["metrics"][arm]["cells"].values()
+    } == {"unknown"}
+    assert prospective["integrity"]["pass"] is False
+    assert prospective["binding_eligible"] is False
+
+
+def test_legacy_preprovenance_reaper_is_accepted_only_before_activation():
+    experiment = Experiment(
+        "barg_dis_anchor",
+        "bargaining",
+        100,
+        (),
+        ("main",),
+        "barg_dis_anchor",
+        0.50,
+        0.58,
+    )
+    records = []
+    for gid, terminal_ts in (
+        ("legacy-reaper-before", _PLAN_ACTIVATION - 10),
+        ("legacy-reaper-after", _PLAN_ACTIVATION + 10),
+    ):
+        records.extend(
+            [
+                _turn(
+                    "main",
+                    gid,
+                    _PLAN_ACTIVATION - 20,
+                    action={"alice_gain": 58, "bob_gain": 42},
+                    money_to_divide=100,
+                ),
+                _result(
+                    "main",
+                    gid,
+                    terminal_ts,
+                    {
+                        "outcome": "agreement",
+                        "agreed_round": 1,
+                        "player_1_payoff": 58,
+                    },
+                    valid=None,
+                ),
+            ]
+        )
+    records.append(
+        {
+            "type": "runtime",
+            "ts": _PLAN_ACTIVATION + 2000,
+            "_agent": "observer",
+            "agent": "observer",
+            "pid": 1,
+            "knobs": {},
+            "content_hashes": {},
+        }
+    )
+
+    legacy = build_report(
+        records, experiments=(experiment,), replay=_barg_replay
+    )["experiments"][0]["analysis_cohorts"]["legacy"]
+
+    assert legacy["itt"]["control"]["games"] == 2
+    assert legacy["itt"]["control"]["resolved"] == 1
+    assert legacy["itt"]["control"]["invalid_terminals"] == 1
+
+
+def test_move_transport_error_exact_null_envelope_is_health_only():
+    records, arm = _prospective_nonneg_records(
+        "bargaining", gid="transport-null"
+    )
+    records.insert(
+        2,
+        _result(
+            "main",
+            "transport-null",
+            _PLAN_ACTIVATION + 50,
+            None,
+            valid=None,
+            game_over=None,
+            error="HTTP 500",
+            result_source="move_transport_error",
+            reaped=False,
+        ),
+    )
+    records.append(
+        {
+            "type": "runtime",
+            "ts": _PLAN_ACTIVATION + 1300,
+            "_agent": "observer",
+            "agent": "observer",
+            "pid": 1,
+            "knobs": {},
+            "content_hashes": {},
+        }
+    )
+    experiment = Experiment(
+        "barg_dis_anchor",
+        "bargaining",
+        100,
+        ("main",),
+        (),
+        "barg_dis_anchor",
+        0.50,
+        0.58,
+    )
+
+    prospective = build_report(
+        records, experiments=(experiment,), replay=_barg_replay
+    )["experiments"][0]["analysis_cohorts"]["prospective"]
+
+    assert prospective["health"][arm]["result_errors"] == 1
+    assert prospective["health"][arm]["invalid_results"] == 0
+    assert prospective["itt"][arm]["resolved"] == 1
+    assert prospective["integrity"]["pass"] is True
+
+
+@pytest.mark.parametrize("error", [False, 0, [], {}, ""])
+def test_transport_error_requires_literal_nonempty_error_and_stays_visible(error):
+    records, arm = _prospective_nonneg_records(
+        "bargaining", gid=f"transport-falsey-{type(error).__name__}"
+    )
+    records.insert(
+        2,
+        _result(
+            "main",
+            records[1]["game"]["game_id"],
+            _PLAN_ACTIVATION + 50,
+            None,
+            valid=None,
+            game_over=None,
+            error=error,
+            result_source="move_transport_error",
+            reaped=False,
+        ),
+    )
+    experiment = Experiment(
+        "barg_dis_anchor",
+        "bargaining",
+        100,
+        ("main",),
+        (),
+        "barg_dis_anchor",
+        0.50,
+        0.58,
+    )
+
+    prospective = build_report(
+        records, experiments=(experiment,), replay=_barg_replay
+    )["experiments"][0]["analysis_cohorts"]["prospective"]
+
+    assert prospective["health"][arm]["result_errors"] == 1
+    assert prospective["health"][arm]["invalid_results"] == 1
+    assert prospective["integrity"]["pass"] is False
+    assert prospective["binding_eligible"] is False
+
+
+def test_transport_error_with_outcome_payload_poison_is_rejected():
+    records, arm = _prospective_nonneg_records(
+        "bargaining", gid="transport-payload"
+    )
+    records.insert(
+        2,
+        _result(
+            "main",
+            "transport-payload",
+            _PLAN_ACTIVATION + 50,
+            {
+                "outcome": "agreement",
+                "agreed_round": 1,
+                "player_1_payoff": 100,
+            },
+            valid=None,
+            game_over=None,
+            error="HTTP 500",
+            result_source="move_transport_error",
+            reaped=False,
+        ),
+    )
+    experiment = Experiment(
+        "barg_dis_anchor",
+        "bargaining",
+        100,
+        ("main",),
+        (),
+        "barg_dis_anchor",
+        0.50,
+        0.58,
+    )
+
+    prospective = build_report(
+        records, experiments=(experiment,), replay=_barg_replay
+    )["experiments"][0]["analysis_cohorts"]["prospective"]
+
+    assert prospective["health"][arm]["invalid_results"] == 1
+    assert prospective["itt"][arm]["invalid_terminals"] == 1
+    assert prospective["integrity"]["pass"] is False
+
+
+def test_future_skew_and_out_of_range_timestamp_share_fail_closed_clock():
+    records, _arm = _prospective_nonneg_records(
+        "bargaining", gid="future-clock"
+    )
+    records.extend(
+        [
+            {
+                "type": "runtime",
+                "ts": _PLAN_ACTIVATION + 1_000_000,
+                "_agent": "observer",
+                "agent": "observer",
+                "pid": 1,
+                "knobs": {},
+                "content_hashes": {},
+            },
+            {
+                "type": "runtime",
+                "ts": 1e20,
+                "_agent": "observer",
+                "agent": "observer",
+                "pid": 2,
+                "knobs": {},
+                "content_hashes": {},
+            },
+        ]
+    )
+    bargaining = Experiment(
+        "barg_dis_anchor",
+        "bargaining",
+        100,
+        ("main",),
+        (),
+        "barg_dis_anchor",
+        0.50,
+        0.58,
+    )
+    persuasion = Experiment(
+        "pers_blind_lie",
+        "persuasion",
+        100,
+        (),
+        ("main",),
+        "pers_blind_lie",
+        0.40,
+        1.0,
+    )
+
+    report = build_report(
+        records,
+        experiments=(bargaining, persuasion),
+        replay=_barg_replay,
+        wall_clock_ts=_PLAN_ACTIVATION + 200,
+    )
+
+    assert report["analysis_clock"]["valid"] is False
+    assert report["analysis_clock"]["future_skew_events"] == 2
+    assert report["analysis_clock"]["out_of_range_timestamp_events"] == 1
+    assert {
+        item["analysis_as_of_ts"] for item in report["experiments"]
+    } == {_PLAN_ACTIVATION + 100}
+    assert report["experiments"][0]["analysis_cohorts"]["prospective"][
+        "binding_eligible"
+    ] is False
+
+
+def test_nondivergent_negotiation_replay_error_is_attributed_to_assigned_arm():
+    experiment = Experiment(
+        "neg_terminal_close",
+        "negotiation",
+        100,
+        ("main", "test_a", "test_b", "test_c"),
+        (),
+        "neg_terminal_close",
+        True,
+        False,
+    )
+    records, arm = _prospective_neg_records(gid="nondivergent-replay-error")
+
+    def broken_replay(_game, _knobs):
+        raise RuntimeError("synthetic replay failure")
+
+    report = build_report(
+        records, experiments=(experiment,), replay=broken_replay
+    )["experiments"][0]
+
+    assert report["affected_turns"] == []
+    assert report["analysis_cohorts"]["prospective"]["routing"][arm][
+        "replay_errors"
+    ] == 2
+    assert report["gate"]["health"]["by_variant"][arm]["replay_errors"] == 2
+
+
+def test_unprintable_replay_error_is_attributed_without_crashing_report():
+    experiment = Experiment(
+        "neg_terminal_close",
+        "negotiation",
+        100,
+        ("main", "test_a", "test_b", "test_c"),
+        (),
+        "neg_terminal_close",
+        True,
+        False,
+    )
+    records, arm = _prospective_neg_records(gid="unprintable-replay-error")
+
+    def broken_replay(_game, _knobs):
+        raise ValueError(10**10_000)
+
+    report = build_report(
+        records, experiments=(experiment,), replay=broken_replay
+    )["experiments"][0]
+
+    assert report["affected_turns"] == []
+    assert report["analysis_cohorts"]["prospective"]["routing"][arm][
+        "replay_errors"
+    ] == 2
+    assert report["gate"]["health"]["by_variant"][arm]["replay_errors"] == 2
+
+
+def test_lone_surrogate_receipt_identity_fails_closed_without_crashing_report():
+    experiment = Experiment(
+        "barg_dis_anchor",
+        "bargaining",
+        100,
+        ("main", "test_a", "test_b", "test_c"),
+        (),
+        "barg_dis_anchor",
+        0.50,
+        0.58,
+    )
+    records, _arm = _prospective_nonneg_records("bargaining")
+    surrogate_gid = "\ud800"
+    records[1]["game"]["game_id"] = surrogate_gid
+    records[2]["game_id"] = surrogate_gid
+
+    report = build_report(records, experiments=(experiment,), replay=_barg_replay)[
+        "experiments"
+    ][0]
+
+    prospective = report["analysis_cohorts"]["prospective"]
+    assert prospective["binding_eligible"] is False
+    assert prospective["enrolled_games"] == 0
+    assert canary_report.render_text(
+        {"experiments": [report], "gates": {}}
+    ).encode("utf-8")
+
+
+def test_lone_surrogate_inside_receipt_fails_assignment_without_crashing():
+    experiment = Experiment(
+        "barg_dis_anchor",
+        "bargaining",
+        100,
+        ("main", "test_a", "test_b", "test_c"),
+        (),
+        "barg_dis_anchor",
+        0.50,
+        0.58,
+    )
+    records, _arm = _prospective_nonneg_records("bargaining")
+    records[0]["canary_assignment"]["contract"]["assignment_salt"] = "\ud800"
+
+    report = build_report(records, experiments=(experiment,), replay=_barg_replay)[
+        "experiments"
+    ][0]
+
+    prospective = report["analysis_cohorts"]["prospective"]
+    assert prospective["binding_eligible"] is False
+    assert prospective["integrity"]["assignment_failures"] > 0
+
+
+def test_neg_pure_gate_rows_reject_bounds_invalid_duplicates_and_clock_drift():
+    cases = []
+    out_of_bounds = _gate_row("test_a", "treatment", 100, direct=False)
+    out_of_bounds["normalized_payoff"] = -10
+    cases.append(([out_of_bounds], "normalized_payoff must be within [0,1]"))
+
+    invalid_terminal = _gate_row("test_a", "treatment", 100, direct=False)
+    invalid_terminal["invalid_timely_terminals"] = 1
+    cases.append(([invalid_terminal], "invalid timely terminal evidence"))
+
+    unhashable_status = _gate_row(
+        "test_a", "treatment", 100, direct=False
+    )
+    unhashable_status["maturity_status"] = ["deadline_censored"]
+    cases.append(
+        ([unhashable_status], "maturity status/count flags inconsistent")
+    )
+
+    unhashable_cell = _gate_row("test_a", "treatment", 100, direct=False)
+    unhashable_cell["cell"]["own_value_grid"] = ["100"]
+    unhashable_cell["cell_id"] = json.dumps(
+        unhashable_cell["cell"], sort_keys=True, separators=(",", ":")
+    )
+    cases.append(
+        ([unhashable_cell], "cell.own_value_grid must be a literal string")
+    )
+
+    duplicate = _gate_row("test_a", "treatment", 100, direct=False)
+    cases.append(
+        ([duplicate, dict(duplicate)], "duplicate (agent,game_id) observation")
+    )
+
+    first = _gate_row("test_a", "treatment", 100, direct=False)
+    second = _gate_row("main", "control", 100, direct=False)
+    second["analysis_ts"] += 1
+    cases.append(([first, second], "analysis_ts differs from common report prefix"))
+
+    for rows, expected in cases:
+        gate = _neg_terminal_gate_from_rows(rows)
+        assert gate["data_integrity"]["pass"] is False
+        assert any(
+            expected in failure
+            for failures in gate["data_integrity"]["row_failures"].values()
+            for failure in failures
+        )
+        assert gate["promotion"]["binding_rollback"] is False
+
+
+def test_neg_gate_rejects_forged_supported_flag_before_cell_counting():
+    row = _gate_row("test_a", "treatment", 100, direct=False)
+    row["cell"]["own_value_grid"] = "999"
+    row["cell_id"] = json.dumps(
+        row["cell"], sort_keys=True, separators=(",", ":")
+    )
+    row["supported"] = True
+    row["unsupported_reason"] = None
+
+    gate = _neg_terminal_gate_from_rows([row])
+
+    assert gate["data_integrity"]["pass"] is False
+    assert any(
+        "supported flag does not match frozen cell membership" in failure
+        for failures in gate["data_integrity"]["row_failures"].values()
+        for failure in failures
+    )
+    assert gate["counts"]["variants"]["treatment"]["all"]["affected"] == 0
+    assert gate["promotion"]["binding_rollback"] is False
+
+
 def test_seek_and_prefix_scan_only_decode_post_cut(tmp_path):
     experiment = next(exp for exp in EXPERIMENTS if exp.name == "barg_dis_anchor")
     path = tmp_path / "main-20260825.jsonl"
@@ -2234,3 +3369,220 @@ def test_seek_and_prefix_scan_only_decode_post_cut(tmp_path):
     assert ("main", "before") in preexisting
     records = list(iter_log_records(slices))
     assert [record["game"]["game_id"] for record in records] == ["after"]
+
+
+def test_jsonl_iterator_skips_overlong_and_invalid_numeric_lines(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setattr(canary_report, "_MAX_JSONL_LINE_BYTES", 8192)
+    path = tmp_path / "main-hostile.jsonl"
+    overlong = b'{"padding":"' + b"x" * 9000 + b'"}'
+    deeply_nested = (
+        b'{"type":"runtime","ts":1,"nested":'
+        + b"[" * 1500
+        + b"0"
+        + b"]" * 1500
+        + b"}"
+    )
+    huge_integer = (
+        b'{"type":"runtime","ts":1,"value":'
+        + b"9" * 5000
+        + b"}"
+    )
+    exponent_overflow = b'{"type":"runtime","ts":1,"value":1e10000}'
+    nonstandard_infinity = b'{"type":"runtime","ts":1,"value":Infinity}'
+    valid = json.dumps({"type": "runtime", "ts": 2}).encode()
+    path.write_bytes(
+        b"\n".join(
+            (
+                overlong,
+                deeply_nested,
+                huge_integer,
+                exponent_overflow,
+                nonstandard_infinity,
+                valid,
+            )
+        )
+        + b"\n"
+    )
+
+    records = list(iter_log_records((LogSlice("main", path, 0),)))
+
+    # The stdlib decoder safely accepts this depth in the current runtime;
+    # irrelevant nested extension data need not incur a second Python byte
+    # scan.  Decoder recursion failures at greater depth are caught above.
+    assert [record["ts"] for record in records] == [1, 2]
+    assert records[0]["_agent"] == "main"
+    assert records[1] == {"type": "runtime", "ts": 2, "_agent": "main"}
+
+
+def test_amendment_pin_matches_the_on_disk_artifact():
+    """The negotiation deviation is pinned, so the artifact cannot drift."""
+    pin = canary_report._NEG_CONFIRMATION_AMENDMENT
+    raw = (REPOSITORY_ROOT / pin["path"]).read_bytes()
+
+    assert len(raw) == pin["bytes"]
+    assert hashlib.sha256(raw).hexdigest() == pin["sha256"]
+
+    body = json.loads(raw)
+    amendment = body["amendments"][0]
+    assert amendment["amendment_id"] == pin["amendment_id"]
+    assert amendment["amended_at"] == pin["amended_at_ts"]
+    assert amendment["rule_id"] == "neg-terminal-confirm-v2"
+    assert amendment["family"] == "negotiation"
+    assert amendment["pre_registered"] is False
+    assert amendment["declared_before_activation"] is False
+    # The deviation was made after enrollment opened; the record must say so
+    # rather than presenting itself as pre-registered evidence.
+    assert amendment["amended_at"] > amendment["activated_at"]
+    assert amendment["unblinding_disclosure"]["live_outcomes_inspected"] is True
+    assert (
+        amendment["retired_promotion_check"] == pin["retired_promotion_check"]
+    )
+
+    # Every further deviation must be pinned too, so none can be made silently.
+    recorded = [item["amendment_id"] for item in body["amendments"]]
+    assert recorded[0] == pin["amendment_id"]
+    assert tuple(recorded[1:]) == pin["additional_amendment_ids"]
+
+    measurement = body["amendments"][1]
+    assert measurement["kind"] == "post_firing_measurement_correction"
+    assert measurement["made_after_the_trigger_fired"] is True
+    assert measurement["pre_registered"] is False
+    assert measurement["affected_check"] == "treatment_invalid_and_corrections_clean"
+    # Zero tolerance on treatment-caused invalidity must still be claimed and
+    # must still be true in the code the gate actually runs.
+    assert "zero tolerance retained" in measurement["change"]["hard_fail_scope_after"]
+    assert measurement["change"]["new_check"] == "reporter_fault_excess_within_0.01"
+
+
+def test_amendment_leaves_the_frozen_declaration_and_other_families_untouched():
+    """Bargaining and persuasion keep their pre-registered declaration."""
+    declaration_pin = canary_report._CONFIRMATION_DECLARATION_PIN
+    raw = (REPOSITORY_ROOT / declaration_pin["path"]).read_bytes()
+
+    assert len(raw) == declaration_pin["bytes"]
+    assert hashlib.sha256(raw).hexdigest() == declaration_pin["sha256"]
+    assert canary_gates._CONFIRMATION_LOOK_DECLARATION["sha256"] == (
+        declaration_pin["sha256"]
+    )
+
+    body = json.loads(raw)
+    assert body["declaration_id"] == "confirmation-v2-final-look-20260828-2130z-r2"
+    # Declared strictly before activation -- the property the loader enforces
+    # and the reason the deviation could not be folded in here.
+    assert body["declared_at"] < body["assignment"]["activated_at"]
+
+    amendment = json.loads(
+        (REPOSITORY_ROOT / canary_report._NEG_CONFIRMATION_AMENDMENT["path"]).read_bytes()
+    )["amendments"][0]
+    assert amendment["declaration_sha256"] == declaration_pin["sha256"]
+    assert amendment["claim_strength"]["bargaining_and_persuasion_unaffected"] is True
+
+
+def test_retired_epoch_check_is_diagnostic_and_verdicts_carry_the_label():
+    gate = _neg_terminal_gate_from_rows(_promotable_gate_rows())
+    pin = canary_report._NEG_CONFIRMATION_AMENDMENT
+
+    assert gate["agent_confirmation"]["formal_promotion_gate"] is False
+    assert gate["agent_confirmation"]["retired_by_amendment"] == pin["amendment_id"]
+    assert "two_supported_nonnegative_treatment_epochs" not in gate["promotion"]["passes"]
+    assert gate["amendment"] == pin
+
+    # The verdict itself must never be readable as pre-registered evidence.
+    assert gate["promotion"]["pre_registered"] is False
+    assert gate["promotion"]["analysis_label"] == (
+        "amended_analysis_not_fully_pre_registered"
+    )
+    assert gate["promotion"]["amendment_id"] == pin["amendment_id"]
+
+    # The retained per-agent switchback unit still gates promotion.
+    assert "balanced_manifest_switchback" in gate["promotion"]["passes"]
+    assert "approved_prospective_manifest_assignment" in gate["promotion"]["passes"]
+
+
+def test_retiring_the_epoch_check_cannot_promote_a_failing_switchback():
+    """Dropping the unreachable check must not weaken the retained ones."""
+    gate = _neg_terminal_gate_from_rows(_promotable_gate_rows(switchback=False))
+
+    assert gate["switchback_confirmation"]["pass"] is False
+    assert gate["promotion"]["status"] == "screen_pass"
+    assert "balanced_manifest_switchback" in gate["promotion"]["failed_checks"]
+
+
+def _health_from_epoch(*, treatment, control):
+    """Drive the negotiation health check straight from per-arm counters."""
+
+    def leaf(counts):
+        base = {
+            "traffic_events": 20000,
+            "errors": 0,
+            "invalid_results": 0,
+            "invalid_moves": 0,
+            "invalid_terminals": 0,
+            "provenance_faults": 0,
+            "corrections": 0,
+        }
+        base.update(counts)
+        base["invalid_results"] = (
+            base["invalid_moves"]
+            + base["invalid_terminals"]
+            + base["provenance_faults"]
+        )
+        return base
+
+    return canary_report._neg_gate_health(
+        [],
+        None,
+        None,
+        epoch_health={"treatment": leaf(treatment), "control": leaf(control)},
+    )
+
+
+def test_shared_baseline_reporter_faults_do_not_hard_fail():
+    """The live 7-vs-4 split is reporter-side evidence quality, not harm."""
+    health = _health_from_epoch(
+        treatment={"provenance_faults": 7},
+        control={"provenance_faults": 4},
+    )
+
+    assert health["treatment_validity_faults"] == 0
+    assert health["treatment_reported_validity_faults"] == 7
+    assert health["checks"]["treatment_invalid_and_corrections_clean"] is True
+    assert health["checks"]["reporter_fault_excess_within_0.01"] is True
+    assert health["hard_fail"] is False
+    assert health["pass"] is True
+
+
+def test_treatment_caused_invalidity_still_hard_fails_at_zero_tolerance():
+    for counts in ({"invalid_moves": 1}, {"corrections": 1}):
+        health = _health_from_epoch(treatment=counts, control={})
+
+        assert health["treatment_validity_faults"] == 1
+        assert health["checks"]["treatment_invalid_and_corrections_clean"] is False
+        assert health["hard_fail"] is True
+        assert health["pass"] is False
+
+
+def test_treatment_specific_reporter_fault_explosion_hard_fails():
+    """Relaxing zero tolerance must not blind the gate to a real divergence."""
+    health = _health_from_epoch(
+        treatment={"invalid_terminals": 400},
+        control={"invalid_terminals": 4},
+    )
+
+    assert health["reporter_fault_excess"] > 0.010
+    assert health["checks"]["reporter_fault_excess_within_0.01"] is False
+    assert health["hard_fail"] is True
+
+
+def test_invalid_result_components_reconcile_with_the_retained_total():
+    health = _health_from_epoch(
+        treatment={"invalid_moves": 2, "invalid_terminals": 3, "provenance_faults": 5},
+        control={},
+    )
+    treatment = health["by_variant"]["treatment"]
+
+    assert treatment["invalid_results"] == 10
+    assert health["treatment_validity_faults"] == 2
+    assert health["reporter_faults"]["treatment"] == 8
