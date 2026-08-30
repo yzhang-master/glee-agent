@@ -588,6 +588,18 @@ def decide(view: GameView, knobs: Knobs) -> dict:
     # per-opponent shift therefore belongs HERE -- against a name with a
     # measured record of taking more than half from us, demand more before
     # grabbing the sure thing.
+    # Late-game acceptance floor. An accept decision is the one case where the
+    # counterfactual is directly observable -- the offer's discounted value is
+    # known exactly -- so this is measured, not modelled. The measurement has
+    # to be per GAME: a single long game contributes ~6.5 rejection rows, and
+    # per-rejection aggregates flip the sign.
+    if (
+        knobs.barg_late_accept_round > 0
+        and view.round >= knobs.barg_late_accept_round
+        and offered_share >= knobs.barg_late_accept_share
+    ):
+        return {"decision": "accept"}
+
     if offered_share >= knobs.barg_accept_great + _book_accept_shift(view, knobs):
         return {"decision": "accept"}
 

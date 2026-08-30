@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "plan_id": "neg-ii-price-explore-analysis-v1",
+  "status": "pre_registered_before_any_exploration_data_exists",
+  "declared_at_utc": "2026-08-26T21:40:00+00:00",
+  "arm": {
+    "knob": "neg_ii_explore_frac",
+    "ladder": [0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.375, 0.475, 0.60, 0.75],
+    "assignment": "sha256(salt || game_id), deterministic and recomputable from logs alone",
+    "salt": "neg-ii-price-explore-v1",
+    "population": "incomplete-information negotiation games where we make the round-1 opening offer",
+    "default": 0.0
+  },
+  "why_this_arm_exists": "The production policy emits one deterministic price per value cell. Every observational comparison of prices therefore collapses into a comparison of different game cells, and four separate candidate improvements died on exactly that confound. Exploration buys the price variation that makes the demand curve estimable at all; it is not justified by any claimed effect.",
+  "prespecified_analysis": {
+    "primary_estimand": "expected normalized payoff per opening, as a function of demanded markup",
+    "unit_of_analysis": "one game, never one turn and never one rejection",
+    "unit_ration": "Per-rejection aggregation double-counts long games -- a single long bargaining game contributes about 6.5 rejection rows -- and empirically inverts the sign of the effect. Measured 2026-08-26: +0.159 pot per rejection versus -0.012 pot per game for the same rule.",
+    "pooling": "Pool all cells and fit markup as the covariate. Per-cell argmax is FORBIDDEN: simulated at the planned traffic it overstates the acceptance rate by +0.106 (p90 +0.168) even when every rung is truly identical, and the winning rung is uniform over all ten.",
+    "selection_and_estimation_must_be_split": {
+      "rule": "Choose the deployment price on the first half of the exploration window; estimate its value only on the untouched second half.",
+      "rationale": "In-sample argmax reports a phantom gain that barely shrinks with sample size: simulated +0.0325 at 125 draws per rung and still +0.0183 at 800, against a true gain of +0.009. Split-sample recovered +0.0086 to +0.0090 at every size.",
+      "consequence": "More data does not fix in-sample selection. Only the split does."
+    },
+    "monotonicity": "Acceptance is non-increasing in price. Report the isotonic (pool-adjacent-violators) fit alongside the raw rungs so a non-monotone blip is visible as noise rather than read as structure.",
+    "replication_requirement": "The chosen price must win on at least 3 of 4 independent held-out days before deployment. Same-day-only results are not promotable.",
+    "minimum_sample": {"per_rung_pooled": 250, "per_rung_per_cell_for_reporting_only": 30}
+  },
+  "prespecified_null_result": "If the isotonic fit is flat within its confidence band, or the chosen price fails held-out replication, the finding is NO EFFECT and the exploration arm is switched off. A flat curve is a valid and expected outcome, not a reason to slice further.",
+  "forbidden": [
+    "per-cell argmax over the ladder",
+    "reporting an in-sample selected effect size",
+    "aggregating by turn or by rejection instead of by game",
+    "adding cells, splits, or covariates after seeing the curve",
+    "re-running with a different ladder and reporting the better of the two"
+  ],
+  "overfitting_provenance": {
+    "candidates_examined_and_rejected_2026_08_26": [
+      {"name": "neg_never_walk", "killed_by": "78.8-83.9% of walked-from opponents frozen or retreating, replicated across 4 days; only 1.8-2.4% winnable"},
+      {"name": "raise opening markup", "killed_by": "Simpson's paradox -- markup is a deterministic function of own value, so buckets are disjoint cells"},
+      {"name": "price below buyer indifference", "killed_by": "contradicted by outcomes; the value grid was inferred from complete-information games and does not transfer"},
+      {"name": "accept near-even offers", "killed_by": "unit of analysis -- +0.159 per rejection versus -0.012 per game"},
+      {"name": "barg_late_accept_round", "killed_by": "real but redundant with existing round-dependent gates; changes 6-12 games per day fleet-wide, per-change estimate swings +0.12 to +0.50 on n=6-12"}
+    ],
+    "lesson": "Five of five observational candidates evaporated under a correct unit, a confounding check, or held-out replication. The prior on any new observational finding from these logs should be low, and this plan is written to make a null result cheap to accept."
+  }
+}

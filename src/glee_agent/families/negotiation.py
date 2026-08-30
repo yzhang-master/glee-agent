@@ -53,7 +53,9 @@ def _schedule_length(view: GameView, knobs: Knobs) -> int:
     return knobs.neg_max_planned_rounds
 
 
-def _anchor_and_floor(n, knobs: Knobs, ultimatum: bool = False) -> tuple[float, float]:
+def _anchor_and_floor(
+    n, knobs: Knobs, ultimatum: bool = False, game_id: str = ""
+) -> tuple[float, float]:
     """(opening price, worst price I'll concede to) for my role.
 
     `ultimatum` marks a take-it-or-leave-it round (T=1, or the final round of
@@ -81,6 +83,18 @@ def _anchor_and_floor(n, knobs: Knobs, ultimatum: bool = False) -> tuple[float, 
     prior_price = _ii_prior_price(n, knobs)
     if prior_price is not None:
         anchor = prior_price
+
+    # Price exploration overrides the anchor only, never the floor: the
+    # Boulware schedule, reciprocity and every safety clamp below still apply,
+    # so an explored opening can still be conceded away from but never lands
+    # below our own reservation.
+    explore = _ii_explore_markup(game_id, n, knobs)
+    if explore is not None:
+        anchor = (
+            n.my_value * (1.0 + explore)
+            if n.my_role == "seller"
+            else n.my_value * (1.0 - explore)
+        )
 
     # Complete information: an ask above the buyer's value (bid below the
     # seller's) can never be profitably accepted — those offers burn every
@@ -268,8 +282,36 @@ def _ii_prior_price(n, knobs: Knobs) -> float | None:
     return value - frac * surplus if surplus > 0 else None
 
 
+# A fixed ladder, so every rung accumulates a comparable sample and the
+# acceptance curve can be read straight out of the logs.  Rungs bracket the
+# grid boundaries the prior anchor targets (0.20, 0.25, 0.475, 0.50) as well
+# as the region below them that the deterministic policy never visits.
+_II_EXPLORE_LADDER = (0.05, 0.10, 0.15, 0.20, 0.25, 0.30, 0.375, 0.475, 0.60, 0.75)
+_II_EXPLORE_SALT = b"neg-ii-price-explore-v1"
+
+
+def _ii_explore_markup(game_id: str, n, knobs: Knobs) -> float | None:
+    """Deterministic per-game opening jitter for hidden-value games.
+
+    Keyed on the game id so the arm is reproducible from the logs alone and
+    an offer cannot be re-rolled across retries within one game.  Returns
+    None whenever exploration is off, the opponent value is visible, or the
+    game id is missing -- all of which leave the caller's anchor untouched.
+    """
+    frac = knobs.neg_ii_explore_frac
+    if frac <= 0 or n.my_value is None or n.my_value <= 0 or n.opp_value is not None:
+        return None
+    if not game_id:
+        return None
+    digest = hashlib.sha256(_II_EXPLORE_SALT + game_id.encode("utf-8")).digest()
+    draw = int.from_bytes(digest[:8], "big") / 2.0**64
+    if draw >= min(max(frac, 0.0), 1.0):
+        return None
+    return _II_EXPLORE_LADDER[digest[8] % len(_II_EXPLORE_LADDER)]
+
+
 def _target_price(view: GameView, n, knobs: Knobs) -> float:
-    anchor, floor = _anchor_and_floor(n, knobs, ultimatum=_is_ultimatum(view))
+    anchor, floor = _anchor_and_floor(n, knobs, ultimatum=_is_ultimatum(view), game_id=view.game_id)
     # Finite endgame: the schedule only reaches the floor at round T, a round
     # where we may never place an offer (measured live: every T=10 no-deal
     # died with our best ask still >= 1.1x value). With <= 1 round after this
@@ -470,7 +512,7 @@ def _optimized_price(view: GameView, n, knobs: Knobs, target_price: float) -> fl
         cont = 0.0
     else:
         cont = max(_my_payoff(n.my_role, value, target_price), 0.0) * 0.8
-    anchor, floor = _anchor_and_floor(n, knobs, ultimatum=ultimatum)
+    anchor, floor = _anchor_and_floor(n, knobs, ultimatum=ultimatum, game_id=view.game_id)
     lo, hi = (floor, anchor) if floor <= anchor else (anchor, floor)
     best_price = None
     best_ev = -1.0
@@ -552,7 +594,7 @@ def decide(view: GameView, knobs: Knobs) -> dict:
             if direct_ultimatum is not None:
                 price = direct_ultimatum
             else:
-                anchor, floor = _anchor_and_floor(n, knobs, ultimatum=True)
+                anchor, floor = _anchor_and_floor(n, knobs, ultimatum=True, game_id=view.game_id)
                 # Without the dataset CDF, split the difference between a
                 # moderate markup and reservation — closing matters most.
                 price = (anchor + floor) / 2
@@ -564,7 +606,7 @@ def decide(view: GameView, knobs: Knobs) -> dict:
             if optimized is not None:
                 price = optimized
         if view.max_rounds != 1:
-            anchor, floor = _anchor_and_floor(n, knobs, ultimatum=_is_ultimatum(view))
+            anchor, floor = _anchor_and_floor(n, knobs, ultimatum=_is_ultimatum(view), game_id=view.game_id)
             reciprocal = _reciprocal_cap(view, n, knobs, price, anchor, floor)
             price = (
                 _terminal_generosity_guard(n, price, reciprocal)
@@ -665,7 +707,7 @@ def decide(view: GameView, knobs: Knobs) -> dict:
     counter = None if terminal_close else _optimized_price(view, n, knobs, my_next)
     if counter is None:
         counter = my_next
-    anchor, floor = _anchor_and_floor(n, knobs, ultimatum=_is_ultimatum(view))
+    anchor, floor = _anchor_and_floor(n, knobs, ultimatum=_is_ultimatum(view), game_id=view.game_id)
     reciprocal = _reciprocal_cap(view, n, knobs, counter, anchor, floor)
     counter = (
         _terminal_generosity_guard(n, counter, reciprocal)
